@@ -2,6 +2,7 @@ use std::io::Cursor;
 
 use emfsdk_derive::{SdkEnum, SdkObject};
 
+use crate::bitmap::{DeviceIndependentBitmap, DibBitmapInfo, DibColorUsage};
 use crate::common::{Error, Reader, Result, SdkEnumValue, SdkRead, SdkSize, SdkWrite, Writer};
 use crate::string::{SdkEncoding, SdkString};
 use crate::types::{ColorRef, PointL, RectL, SizeL, XForm};
@@ -308,6 +309,8 @@ pub enum EmfRecordData<'a> {
     CreateBrushIndirect(EmrCreateBrushIndirect),
     ExtCreatePen(EmrExtCreatePen),
     ExtCreateFontIndirectW(EmrExtCreateFontIndirectW),
+    CreateMonoBrush(EmrCreateMonoBrush),
+    CreateDibPatternBrushPt(EmrCreateDibPatternBrushPt),
     Polygon(EmrPolyPointsL),
     Polyline(EmrPolyPointsL),
     Polygon16(EmrPolyPointsS),
@@ -355,6 +358,12 @@ impl<'a> EmfRecordData<'a> {
             }
             Some(EmfRecordType::ExtCreateFontIndirectW) => {
                 Self::ExtCreateFontIndirectW(EmrExtCreateFontIndirectW::read_data(data)?)
+            }
+            Some(EmfRecordType::CreateMonoBrush) => {
+                Self::CreateMonoBrush(EmrCreateMonoBrush::read_data(data)?)
+            }
+            Some(EmfRecordType::CreateDibPatternBrushPt) => {
+                Self::CreateDibPatternBrushPt(EmrCreateDibPatternBrushPt::read_data(data)?)
             }
             Some(EmfRecordType::Polygon) => Self::Polygon(EmrPolyPointsL::read_data(data)?),
             Some(EmfRecordType::Polyline) => Self::Polyline(EmrPolyPointsL::read_data(data)?),
@@ -419,6 +428,14 @@ impl<'a> EmfRecordData<'a> {
             )),
             Self::ExtCreateFontIndirectW(value) => Ok(EmfRecord::new(
                 EmfRecordType::ExtCreateFontIndirectW.raw(),
+                value.to_data()?,
+            )),
+            Self::CreateMonoBrush(value) => Ok(EmfRecord::new(
+                EmfRecordType::CreateMonoBrush.raw(),
+                value.to_data()?,
+            )),
+            Self::CreateDibPatternBrushPt(value) => Ok(EmfRecord::new(
+                EmfRecordType::CreateDibPatternBrushPt.raw(),
                 value.to_data()?,
             )),
             Self::Polygon(value) => Ok(EmfRecord::new(
@@ -1017,6 +1034,124 @@ pub struct EmrBitmapBuffer {
     pub bitmap_bits: Vec<u8>,
 }
 
+impl EmrBitmapBuffer {
+    pub fn dib_info(&self) -> Result<DibBitmapInfo> {
+        DibBitmapInfo::read_from_slice(&self.bitmap_info)
+    }
+
+    pub fn device_independent_bitmap(&self) -> Result<DeviceIndependentBitmap> {
+        DeviceIndependentBitmap::from_parts(&self.bitmap_info, &self.bitmap_bits)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EmrCreateMonoBrush {
+    pub brush_index: u32,
+    pub color_usage: u32,
+    pub bitmap: EmrBitmapBuffer,
+}
+
+impl EmrCreateMonoBrush {
+    pub fn color_usage_kind(&self) -> Option<DibColorUsage> {
+        DibColorUsage::from_raw(self.color_usage)
+    }
+
+    pub fn read_data(data: &[u8]) -> Result<Self> {
+        let (brush_index, color_usage, bitmap) = read_dib_brush_data(data)?;
+        Ok(Self {
+            brush_index,
+            color_usage,
+            bitmap,
+        })
+    }
+
+    pub fn to_data(&self) -> Result<Vec<u8>> {
+        write_dib_brush_data(
+            self.brush_index,
+            self.color_usage,
+            &self.bitmap,
+            "EMR_CREATEMONOBRUSH",
+        )
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EmrCreateDibPatternBrushPt {
+    pub brush_index: u32,
+    pub color_usage: u32,
+    pub bitmap: EmrBitmapBuffer,
+}
+
+impl EmrCreateDibPatternBrushPt {
+    pub fn color_usage_kind(&self) -> Option<DibColorUsage> {
+        DibColorUsage::from_raw(self.color_usage)
+    }
+
+    pub fn read_data(data: &[u8]) -> Result<Self> {
+        let (brush_index, color_usage, bitmap) = read_dib_brush_data(data)?;
+        Ok(Self {
+            brush_index,
+            color_usage,
+            bitmap,
+        })
+    }
+
+    pub fn to_data(&self) -> Result<Vec<u8>> {
+        write_dib_brush_data(
+            self.brush_index,
+            self.color_usage,
+            &self.bitmap,
+            "EMR_CREATEDIBPATTERNBRUSHPT",
+        )
+    }
+}
+
+fn read_dib_brush_data(data: &[u8]) -> Result<(u32, u32, EmrBitmapBuffer)> {
+    let mut reader = Reader::new(Cursor::new(data));
+    let brush_index = reader.read_u32()?;
+    let color_usage = reader.read_u32()?;
+    let off_bmi = reader.read_u32()? as usize;
+    let cb_bmi = reader.read_u32()? as usize;
+    let off_bits = reader.read_u32()? as usize;
+    let cb_bits = reader.read_u32()? as usize;
+    Ok((
+        brush_index,
+        color_usage,
+        read_bitmap_buffer(data, off_bmi, cb_bmi, off_bits, cb_bits)?,
+    ))
+}
+
+fn write_dib_brush_data(
+    brush_index: u32,
+    color_usage: u32,
+    bitmap: &EmrBitmapBuffer,
+    record_name: &str,
+) -> Result<Vec<u8>> {
+    let fixed = 24usize;
+    let off_bmi = 8 + fixed;
+    let off_bits = align_to_u32(off_bmi + bitmap.bitmap_info.len());
+    let mut writer = Writer::new(Cursor::new(Vec::with_capacity(
+        fixed + bitmap.bitmap_info.len() + bitmap.bitmap_bits.len() + 4,
+    )));
+    writer.write_u32(brush_index)?;
+    writer.write_u32(color_usage)?;
+    writer.write_u32(usize_to_u32(
+        off_bmi,
+        format!("{record_name} bitmap info offset"),
+    )?)?;
+    writer.write_u32(usize_to_u32(bitmap.bitmap_info.len(), "bitmap info size")?)?;
+    writer.write_u32(usize_to_u32(
+        off_bits,
+        format!("{record_name} bitmap bits offset"),
+    )?)?;
+    writer.write_u32(usize_to_u32(bitmap.bitmap_bits.len(), "bitmap bits size")?)?;
+    writer.write_all(&bitmap.bitmap_info)?;
+    pad_writer_to_record_offset(&mut writer, off_bits)?;
+    writer.write_all(&bitmap.bitmap_bits)?;
+    pad_writer_to_4(&mut writer)?;
+    Ok(writer.into_inner().into_inner())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EmrSetDiBitsToDevice {
     pub bounds: RectL,
@@ -1029,6 +1164,10 @@ pub struct EmrSetDiBitsToDevice {
 }
 
 impl EmrSetDiBitsToDevice {
+    pub fn color_usage_kind(&self) -> Option<DibColorUsage> {
+        DibColorUsage::from_raw(self.color_usage)
+    }
+
     pub fn read_data(data: &[u8]) -> Result<Self> {
         let mut reader = Reader::new(Cursor::new(data));
         let bounds = RectL::read_from(&mut reader)?;
@@ -1101,6 +1240,10 @@ pub struct EmrStretchDiBits {
 }
 
 impl EmrStretchDiBits {
+    pub fn color_usage_kind(&self) -> Option<DibColorUsage> {
+        DibColorUsage::from_raw(self.color_usage)
+    }
+
     pub fn read_data(data: &[u8]) -> Result<Self> {
         let mut reader = Reader::new(Cursor::new(data));
         let bounds = RectL::read_from(&mut reader)?;
@@ -1418,7 +1561,7 @@ fn pad_writer_to_record_offset<W: std::io::Write + std::io::Seek>(
     writer.write_all(&vec![0; record_offset - current_record_offset])
 }
 
-fn usize_to_u32(value: usize, context: &'static str) -> Result<u32> {
+fn usize_to_u32(value: usize, context: impl std::fmt::Display) -> Result<u32> {
     u32::try_from(value).map_err(|_| Error::invalid(0, format!("{context} exceeds u32::MAX")))
 }
 
@@ -1550,14 +1693,126 @@ mod tests {
             raster_operation: 0x00CC_0020,
             dest_size: SizeL { cx: 2, cy: 2 },
             bitmap: EmrBitmapBuffer {
-                bitmap_info: vec![40, 0, 0, 0],
+                bitmap_info: vec![
+                    40, 0, 0, 0, // HeaderSize
+                    2, 0, 0, 0, // Width
+                    0xFE, 0xFF, 0xFF, 0xFF, // Height = -2
+                    1, 0, // Planes
+                    24, 0, // BitCount
+                    0, 0, 0, 0, // BI_RGB
+                    0, 0, 0, 0, // ImageSize
+                    0, 0, 0, 0, // XPelsPerMeter
+                    0, 0, 0, 0, // YPelsPerMeter
+                    0, 0, 0, 0, // ColorUsed
+                    0, 0, 0, 0, // ColorImportant
+                ],
                 bitmap_bits: vec![1, 2, 3, 4],
             },
         });
 
         let record = value.to_record().unwrap();
         assert_eq!(record.record_type, EmfRecordType::StretchDiBits.raw());
-        assert_eq!(record.parse_data().unwrap(), value);
+        let parsed = record.parse_data().unwrap();
+        assert_eq!(parsed, value);
+        let EmfRecordData::StretchDiBits(parsed) = parsed else {
+            unreachable!();
+        };
+        assert_eq!(
+            parsed.color_usage_kind(),
+            Some(crate::bitmap::DibColorUsage::RgbColors)
+        );
+        let info = parsed.bitmap.dib_info().unwrap();
+        assert_eq!(
+            info.compression_kind(),
+            Some(crate::bitmap::BitmapCompression::Rgb)
+        );
+        assert!(info.header.is_top_down());
+    }
+
+    #[test]
+    fn typed_create_dib_pattern_brush_roundtrips() {
+        let bitmap_info = vec![
+            40, 0, 0, 0, // HeaderSize
+            2, 0, 0, 0, // Width
+            2, 0, 0, 0, // Height
+            1, 0, // Planes
+            0, 0, // BitCount
+            5, 0, 0, 0, // BI_PNG
+            4, 0, 0, 0, // ImageSize
+            0, 0, 0, 0, // XPelsPerMeter
+            0, 0, 0, 0, // YPelsPerMeter
+            0, 0, 0, 0, // ColorUsed
+            0, 0, 0, 0, // ColorImportant
+        ];
+        let value = EmfRecordData::CreateDibPatternBrushPt(EmrCreateDibPatternBrushPt {
+            brush_index: 3,
+            color_usage: crate::bitmap::DibColorUsage::RgbColors.raw(),
+            bitmap: EmrBitmapBuffer {
+                bitmap_info,
+                bitmap_bits: vec![0x89, b'P', b'N', b'G'],
+            },
+        });
+
+        let record = value.to_record().unwrap();
+        assert_eq!(
+            record.record_type,
+            EmfRecordType::CreateDibPatternBrushPt.raw()
+        );
+        let parsed = record.parse_data().unwrap();
+        assert_eq!(parsed, value);
+        let EmfRecordData::CreateDibPatternBrushPt(parsed) = parsed else {
+            unreachable!();
+        };
+        assert_eq!(
+            parsed.color_usage_kind(),
+            Some(crate::bitmap::DibColorUsage::RgbColors)
+        );
+        assert_eq!(
+            parsed
+                .bitmap
+                .device_independent_bitmap()
+                .unwrap()
+                .embedded_format(),
+            Some(crate::bitmap::EmbeddedBitmapFormat::Png)
+        );
+    }
+
+    #[test]
+    fn typed_create_mono_brush_roundtrips() {
+        let value = EmfRecordData::CreateMonoBrush(EmrCreateMonoBrush {
+            brush_index: 4,
+            color_usage: crate::bitmap::DibColorUsage::RgbColors.raw(),
+            bitmap: EmrBitmapBuffer {
+                bitmap_info: vec![
+                    40, 0, 0, 0, // HeaderSize
+                    2, 0, 0, 0, // Width
+                    2, 0, 0, 0, // Height
+                    1, 0, // Planes
+                    1, 0, // BitCount
+                    0, 0, 0, 0, // BI_RGB
+                    0, 0, 0, 0, // ImageSize
+                    0, 0, 0, 0, // XPelsPerMeter
+                    0, 0, 0, 0, // YPelsPerMeter
+                    0, 0, 0, 0, // ColorUsed
+                    0, 0, 0, 0, // ColorImportant
+                    0, 0, 0, 0, // RGBQuad black
+                    0xFF, 0xFF, 0xFF, 0, // RGBQuad white
+                ],
+                bitmap_bits: vec![0x80, 0, 0, 0, 0x40, 0, 0, 0],
+            },
+        });
+
+        let record = value.to_record().unwrap();
+        assert_eq!(record.record_type, EmfRecordType::CreateMonoBrush.raw());
+        let parsed = record.parse_data().unwrap();
+        assert_eq!(parsed, value);
+        let EmfRecordData::CreateMonoBrush(parsed) = parsed else {
+            unreachable!();
+        };
+        assert_eq!(
+            parsed.bitmap.dib_info().unwrap().header.bit_count_kind(),
+            Some(crate::bitmap::BitmapBitCount::One)
+        );
     }
 
     #[test]

@@ -1,5 +1,6 @@
 extern crate self as emfsdk;
 
+pub mod bitmap;
 pub mod common;
 pub mod emf;
 pub mod emfplus;
@@ -9,22 +10,30 @@ pub mod wmf;
 
 pub use emfsdk_derive::{SdkEnum, SdkObject};
 
+pub use crate::bitmap::{
+    BITMAP_CORE_HEADER_SIZE, BITMAP_INFO_HEADER_SIZE, BITMAP_V4_HEADER_SIZE, BITMAP_V5_HEADER_SIZE,
+    BitmapBitCount, BitmapCompression, BitmapCoreHeader, BitmapInfoHeader, DeviceIndependentBitmap,
+    DibBitmapInfo, DibColorUsage, DibHeader, EmbeddedBitmapFormat,
+};
 pub use crate::common::{
     Error, Format, Reader, Result, SdkEnumValue, SdkRead, SdkSize, SdkWrite, UnknownRecord, Writer,
 };
 pub use crate::emf::{
     BitmapSourceBounds, EMR_EOF, EMR_HEADER, EmfHeader, EmfMetafile, EmfRecord, EmfRecordData,
-    EmfRecordType, EmrBitmapBuffer, EmrComment, EmrCreateBrushIndirect, EmrCreatePen,
-    EmrDeleteObject, EmrEllipse, EmrExcludeClipRect, EmrExtCreateFontIndirectW, EmrExtCreatePen,
-    EmrExtTextOut, EmrIntersectClipRect, EmrLineTo, EmrModifyWorldTransform, EmrMoveToEx,
-    EmrPolyPointsL, EmrPolyPointsS, EmrPolyPolygonL, EmrPolyPolygonS, EmrRectangle,
-    EmrSelectObject, EmrSetBkColor, EmrSetBrushOrgEx, EmrSetDiBitsToDevice, EmrSetTextColor,
-    EmrSetViewportExtEx, EmrSetViewportOrgEx, EmrSetWindowExtEx, EmrSetWindowOrgEx,
-    EmrSetWorldTransform, EmrStretchDiBits, EmrText, ExtTextOutOptions, LogFontW,
+    EmfRecordType, EmrBitmapBuffer, EmrComment, EmrCreateBrushIndirect, EmrCreateDibPatternBrushPt,
+    EmrCreateMonoBrush, EmrCreatePen, EmrDeleteObject, EmrEllipse, EmrExcludeClipRect,
+    EmrExtCreateFontIndirectW, EmrExtCreatePen, EmrExtTextOut, EmrIntersectClipRect, EmrLineTo,
+    EmrModifyWorldTransform, EmrMoveToEx, EmrPolyPointsL, EmrPolyPointsS, EmrPolyPolygonL,
+    EmrPolyPolygonS, EmrRectangle, EmrSelectObject, EmrSetBkColor, EmrSetBrushOrgEx,
+    EmrSetDiBitsToDevice, EmrSetTextColor, EmrSetViewportExtEx, EmrSetViewportOrgEx,
+    EmrSetWindowExtEx, EmrSetWindowOrgEx, EmrSetWorldTransform, EmrStretchDiBits, EmrText,
+    ExtTextOutOptions, LogFontW,
 };
 pub use crate::emfplus::{
-    EmfPlusGraphicsVersion, EmfPlusGraphicsVersionValue, EmfPlusHeaderData, EmfPlusRecord,
-    EmfPlusRecordType,
+    EmfPlusBrushRef, EmfPlusDrawRectsData, EmfPlusFillRectsData, EmfPlusGraphicsVersion,
+    EmfPlusGraphicsVersionValue, EmfPlusHeaderData, EmfPlusRecord, EmfPlusRecordData,
+    EmfPlusRecordFlags, EmfPlusRecordType, EmfPlusRect, EmfPlusRectS,
+    EmfPlusScaleWorldTransformData, EmfPlusTranslateWorldTransformData,
 };
 pub use crate::string::{SdkEncoding, SdkString};
 pub use crate::types::{
