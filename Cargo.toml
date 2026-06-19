@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/emfsdk", "crates/emfsdk-derive"]
+members = ["crates/emfsdk", "crates/emfsdk-derive", "crates/emfsdk-render"]
 
 [workspace.package]
 version = "0.1.0"

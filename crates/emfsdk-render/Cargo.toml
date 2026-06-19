@@ -1,0 +1,17 @@
+[package]
+name = "emfsdk-render"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+documentation.workspace = true
+description = "Rendering helpers for EMF, EMF+, and WMF metafiles"
+keywords.workspace = true
+categories.workspace = true
+readme.workspace = true
+
+[dependencies]
+emfsdk.workspace = true
+thiserror.workspace = true
