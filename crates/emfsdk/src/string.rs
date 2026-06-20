@@ -182,7 +182,7 @@ fn code_page_encoding(code_page: u16) -> Option<&'static Encoding> {
 
 fn wmf_charset_code_page(charset: u8) -> Option<u16> {
     match charset {
-        0 | 1 | 2 => Some(1252),
+        0..=2 => Some(1252),
         77 => Some(10000),
         128 => Some(932),
         129 | 130 => Some(949),

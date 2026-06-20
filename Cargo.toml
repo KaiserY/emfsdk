@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/emfsdk", "crates/emfsdk-derive", "crates/emfsdk-render"]
+members = ["crates/emfsdk", "crates/emfsdk-derive"]
 
 [workspace.package]
 version = "0.1.0"
@@ -20,6 +20,7 @@ emfsdk = { version = "0.1.0", path = "crates/emfsdk" }
 emfsdk-derive = { version = "0.1.0", path = "crates/emfsdk-derive" }
 bitflags = "2.9.1"
 encoding_rs = "0.8.35"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
 proc-macro2 = "1.0.95"
 quote = "1.0.40"
 syn = { version = "2.0.104", features = ["full"] }

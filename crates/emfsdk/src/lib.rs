@@ -4,6 +4,8 @@ pub mod bitmap;
 pub mod common;
 pub mod emf;
 pub mod emfplus;
+#[cfg(feature = "render")]
+pub mod render;
 pub mod string;
 pub mod types;
 pub mod wmf;

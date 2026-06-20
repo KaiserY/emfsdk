@@ -16,4 +16,9 @@ readme.workspace = true
 bitflags = { workspace = true }
 emfsdk-derive = { workspace = true }
 encoding_rs = { workspace = true }
+image = { workspace = true, optional = true }
 thiserror = { workspace = true }
+
+[features]
+default = []
+render = ["dep:image"]
