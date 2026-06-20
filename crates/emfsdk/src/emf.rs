@@ -290,39 +290,91 @@ impl EmfRecord {
 #[derive(Clone, Debug, PartialEq)]
 pub enum EmfRecordData<'a> {
     Header(EmfHeader),
+    Eof(EmrEof),
+    PolyBezier(EmrPolyPointsL),
     SetWindowExtEx(EmrSetWindowExtEx),
     SetWindowOrgEx(EmrSetWindowOrgEx),
     SetViewportExtEx(EmrSetViewportExtEx),
     SetViewportOrgEx(EmrSetViewportOrgEx),
     SetBrushOrgEx(EmrSetBrushOrgEx),
+    SetPixelV(EmrSetPixelV),
+    SetMapperFlags(EmrSetMapperFlags),
+    SetMapMode(EmrSetMapMode),
+    SetBkMode(EmrSetBkMode),
+    SetPolyFillMode(EmrSetPolyFillMode),
+    SetRop2(EmrSetRop2),
+    SetStretchBltMode(EmrSetStretchBltMode),
+    SetTextAlign(EmrSetTextAlign),
     SetTextColor(EmrSetTextColor),
     SetBkColor(EmrSetBkColor),
+    OffsetClipRgn(EmrOffsetClipRgn),
+    SetMetaRgn,
     ExcludeClipRect(EmrExcludeClipRect),
     IntersectClipRect(EmrIntersectClipRect),
+    ScaleViewportExtEx(EmrScaleViewportExtEx),
+    ScaleWindowExtEx(EmrScaleWindowExtEx),
+    SaveDc,
+    RestoreDc(EmrRestoreDc),
     SetWorldTransform(EmrSetWorldTransform),
     ModifyWorldTransform(EmrModifyWorldTransform),
     SelectObject(EmrSelectObject),
+    SelectPalette(EmrSelectPalette),
+    ResizePalette(EmrResizePalette),
     DeleteObject(EmrDeleteObject),
     MoveToEx(EmrMoveToEx),
     LineTo(EmrLineTo),
+    AngleArc(EmrAngleArc),
+    RoundRect(EmrRoundRect),
+    Arc(EmrArc),
+    ArcTo(EmrArc),
+    Chord(EmrArc),
+    Pie(EmrArc),
+    ExtFloodFill(EmrExtFloodFill),
+    SetArcDirection(EmrSetArcDirection),
+    SetMiterLimit(EmrSetMiterLimit),
+    BeginPath,
+    EndPath,
+    CloseFigure,
+    FillPath(EmrFillPath),
+    StrokeAndFillPath(EmrStrokeAndFillPath),
+    StrokePath(EmrStrokePath),
+    FlattenPath,
+    WidenPath,
+    SelectClipPath(EmrSelectClipPath),
+    AbortPath,
     CreatePen(EmrCreatePen),
     CreateBrushIndirect(EmrCreateBrushIndirect),
+    CreatePalette(EmrCreatePalette),
+    SetPaletteEntries(EmrSetPaletteEntries),
     ExtCreatePen(EmrExtCreatePen),
     ExtCreateFontIndirectW(EmrExtCreateFontIndirectW),
     CreateMonoBrush(EmrCreateMonoBrush),
     CreateDibPatternBrushPt(EmrCreateDibPatternBrushPt),
     Polygon(EmrPolyPointsL),
     Polyline(EmrPolyPointsL),
+    PolyBezierTo(EmrPolyPointsL),
+    PolylineTo(EmrPolyPointsL),
     Polygon16(EmrPolyPointsS),
     Polyline16(EmrPolyPointsS),
+    PolyBezier16(EmrPolyPointsS),
+    PolyBezierTo16(EmrPolyPointsS),
+    PolylineTo16(EmrPolyPointsS),
+    PolyPolyline(EmrPolyPolygonL),
     PolyPolygon(EmrPolyPolygonL),
+    PolyPolyline16(EmrPolyPolygonS),
     PolyPolygon16(EmrPolyPolygonS),
     Rectangle(EmrRectangle),
     Ellipse(EmrEllipse),
+    RealizePalette,
     ExtTextOutA(EmrExtTextOut),
     ExtTextOutW(EmrExtTextOut),
     SetDiBitsToDevice(EmrSetDiBitsToDevice),
     StretchDiBits(EmrStretchDiBits),
+    SetIcmMode(EmrSetIcmMode),
+    SetColorSpace(EmrSetColorSpace),
+    DeleteColorSpace(EmrDeleteColorSpace),
+    SetLayout(EmrSetLayout),
+    SetTextJustification(EmrSetTextJustification),
     Comment(EmrComment),
     Unknown(&'a EmfRecord),
 }
@@ -332,26 +384,93 @@ impl<'a> EmfRecordData<'a> {
         let data = record.data.as_slice();
         Ok(match record.record_kind() {
             Some(EmfRecordType::Header) => Self::Header(EmfHeader::from_record_data(data)?),
+            Some(EmfRecordType::Eof) => Self::Eof(EmrEof::read_data(data)?),
+            Some(EmfRecordType::PolyBezier) => Self::PolyBezier(EmrPolyPointsL::read_data(data)?),
             Some(EmfRecordType::SetWindowExtEx) => Self::SetWindowExtEx(read_object(data)?),
             Some(EmfRecordType::SetWindowOrgEx) => Self::SetWindowOrgEx(read_object(data)?),
             Some(EmfRecordType::SetViewportExtEx) => Self::SetViewportExtEx(read_object(data)?),
             Some(EmfRecordType::SetViewportOrgEx) => Self::SetViewportOrgEx(read_object(data)?),
             Some(EmfRecordType::SetBrushOrgEx) => Self::SetBrushOrgEx(read_object(data)?),
+            Some(EmfRecordType::SetPixelV) => Self::SetPixelV(read_object(data)?),
+            Some(EmfRecordType::SetMapperFlags) => Self::SetMapperFlags(read_object(data)?),
+            Some(EmfRecordType::SetMapMode) => Self::SetMapMode(read_object(data)?),
+            Some(EmfRecordType::SetBkMode) => Self::SetBkMode(read_object(data)?),
+            Some(EmfRecordType::SetPolyfillMode) => Self::SetPolyFillMode(read_object(data)?),
+            Some(EmfRecordType::SetRop2) => Self::SetRop2(read_object(data)?),
+            Some(EmfRecordType::SetStretchBltMode) => Self::SetStretchBltMode(read_object(data)?),
+            Some(EmfRecordType::SetTextAlign) => Self::SetTextAlign(read_object(data)?),
             Some(EmfRecordType::SetTextColor) => Self::SetTextColor(read_object(data)?),
             Some(EmfRecordType::SetBkColor) => Self::SetBkColor(read_object(data)?),
+            Some(EmfRecordType::OffsetClipRgn) => Self::OffsetClipRgn(read_object(data)?),
+            Some(EmfRecordType::SetMetaRgn) => {
+                ensure_no_data(data, "EMR_SETMETARGN")?;
+                Self::SetMetaRgn
+            }
             Some(EmfRecordType::ExcludeClipRect) => Self::ExcludeClipRect(read_object(data)?),
             Some(EmfRecordType::IntersectClipRect) => Self::IntersectClipRect(read_object(data)?),
+            Some(EmfRecordType::ScaleViewportExtEx) => Self::ScaleViewportExtEx(read_object(data)?),
+            Some(EmfRecordType::ScaleWindowExtEx) => Self::ScaleWindowExtEx(read_object(data)?),
+            Some(EmfRecordType::SaveDc) => {
+                ensure_no_data(data, "EMR_SAVEDC")?;
+                Self::SaveDc
+            }
+            Some(EmfRecordType::RestoreDc) => Self::RestoreDc(read_object(data)?),
             Some(EmfRecordType::SetWorldTransform) => Self::SetWorldTransform(read_object(data)?),
             Some(EmfRecordType::ModifyWorldTransform) => {
                 Self::ModifyWorldTransform(read_object(data)?)
             }
             Some(EmfRecordType::SelectObject) => Self::SelectObject(read_object(data)?),
+            Some(EmfRecordType::SelectPalette) => Self::SelectPalette(read_object(data)?),
+            Some(EmfRecordType::ResizePalette) => Self::ResizePalette(read_object(data)?),
             Some(EmfRecordType::DeleteObject) => Self::DeleteObject(read_object(data)?),
             Some(EmfRecordType::MoveToEx) => Self::MoveToEx(read_object(data)?),
             Some(EmfRecordType::LineTo) => Self::LineTo(read_object(data)?),
+            Some(EmfRecordType::AngleArc) => Self::AngleArc(read_object(data)?),
+            Some(EmfRecordType::RoundRect) => Self::RoundRect(read_object(data)?),
+            Some(EmfRecordType::Arc) => Self::Arc(read_object(data)?),
+            Some(EmfRecordType::ArcTo) => Self::ArcTo(read_object(data)?),
+            Some(EmfRecordType::Chord) => Self::Chord(read_object(data)?),
+            Some(EmfRecordType::Pie) => Self::Pie(read_object(data)?),
+            Some(EmfRecordType::ExtFloodFill) => Self::ExtFloodFill(read_object(data)?),
+            Some(EmfRecordType::SetArcDirection) => Self::SetArcDirection(read_object(data)?),
+            Some(EmfRecordType::SetMiterLimit) => Self::SetMiterLimit(read_object(data)?),
+            Some(EmfRecordType::BeginPath) => {
+                ensure_no_data(data, "EMR_BEGINPATH")?;
+                Self::BeginPath
+            }
+            Some(EmfRecordType::EndPath) => {
+                ensure_no_data(data, "EMR_ENDPATH")?;
+                Self::EndPath
+            }
+            Some(EmfRecordType::CloseFigure) => {
+                ensure_no_data(data, "EMR_CLOSEFIGURE")?;
+                Self::CloseFigure
+            }
+            Some(EmfRecordType::FillPath) => Self::FillPath(read_object(data)?),
+            Some(EmfRecordType::StrokeAndFillPath) => Self::StrokeAndFillPath(read_object(data)?),
+            Some(EmfRecordType::StrokePath) => Self::StrokePath(read_object(data)?),
+            Some(EmfRecordType::FlattenPath) => {
+                ensure_no_data(data, "EMR_FLATTENPATH")?;
+                Self::FlattenPath
+            }
+            Some(EmfRecordType::WidenPath) => {
+                ensure_no_data(data, "EMR_WIDENPATH")?;
+                Self::WidenPath
+            }
+            Some(EmfRecordType::SelectClipPath) => Self::SelectClipPath(read_object(data)?),
+            Some(EmfRecordType::AbortPath) => {
+                ensure_no_data(data, "EMR_ABORTPATH")?;
+                Self::AbortPath
+            }
             Some(EmfRecordType::CreatePen) => Self::CreatePen(read_object(data)?),
             Some(EmfRecordType::CreateBrushIndirect) => {
                 Self::CreateBrushIndirect(read_object(data)?)
+            }
+            Some(EmfRecordType::CreatePalette) => {
+                Self::CreatePalette(EmrCreatePalette::read_data(data)?)
+            }
+            Some(EmfRecordType::SetPaletteEntries) => {
+                Self::SetPaletteEntries(EmrSetPaletteEntries::read_data(data)?)
             }
             Some(EmfRecordType::ExtCreatePen) => {
                 Self::ExtCreatePen(EmrExtCreatePen::read_data(data)?)
@@ -367,16 +486,39 @@ impl<'a> EmfRecordData<'a> {
             }
             Some(EmfRecordType::Polygon) => Self::Polygon(EmrPolyPointsL::read_data(data)?),
             Some(EmfRecordType::Polyline) => Self::Polyline(EmrPolyPointsL::read_data(data)?),
+            Some(EmfRecordType::PolyBezierTo) => {
+                Self::PolyBezierTo(EmrPolyPointsL::read_data(data)?)
+            }
+            Some(EmfRecordType::PolylineTo) => Self::PolylineTo(EmrPolyPointsL::read_data(data)?),
+            Some(EmfRecordType::PolyPolyline) => {
+                Self::PolyPolyline(EmrPolyPolygonL::read_data(data)?)
+            }
+            Some(EmfRecordType::PolyBezier16) => {
+                Self::PolyBezier16(EmrPolyPointsS::read_data(data)?)
+            }
             Some(EmfRecordType::Polygon16) => Self::Polygon16(EmrPolyPointsS::read_data(data)?),
             Some(EmfRecordType::Polyline16) => Self::Polyline16(EmrPolyPointsS::read_data(data)?),
+            Some(EmfRecordType::PolyBezierTo16) => {
+                Self::PolyBezierTo16(EmrPolyPointsS::read_data(data)?)
+            }
+            Some(EmfRecordType::PolylineTo16) => {
+                Self::PolylineTo16(EmrPolyPointsS::read_data(data)?)
+            }
             Some(EmfRecordType::PolyPolygon) => {
                 Self::PolyPolygon(EmrPolyPolygonL::read_data(data)?)
+            }
+            Some(EmfRecordType::PolyPolyline16) => {
+                Self::PolyPolyline16(EmrPolyPolygonS::read_data(data)?)
             }
             Some(EmfRecordType::PolyPolygon16) => {
                 Self::PolyPolygon16(EmrPolyPolygonS::read_data(data)?)
             }
             Some(EmfRecordType::Rectangle) => Self::Rectangle(read_object(data)?),
             Some(EmfRecordType::Ellipse) => Self::Ellipse(read_object(data)?),
+            Some(EmfRecordType::RealizePalette) => {
+                ensure_no_data(data, "EMR_REALIZEPALETTE")?;
+                Self::RealizePalette
+            }
             Some(EmfRecordType::ExtTextOutA) => {
                 Self::ExtTextOutA(EmrExtTextOut::read_data(data, false)?)
             }
@@ -389,6 +531,13 @@ impl<'a> EmfRecordData<'a> {
             Some(EmfRecordType::StretchDiBits) => {
                 Self::StretchDiBits(EmrStretchDiBits::read_data(data)?)
             }
+            Some(EmfRecordType::SetIcmMode) => Self::SetIcmMode(read_object(data)?),
+            Some(EmfRecordType::SetColorSpace) => Self::SetColorSpace(read_object(data)?),
+            Some(EmfRecordType::DeleteColorSpace) => Self::DeleteColorSpace(read_object(data)?),
+            Some(EmfRecordType::SetLayout) => Self::SetLayout(read_object(data)?),
+            Some(EmfRecordType::SetTextJustification) => {
+                Self::SetTextJustification(read_object(data)?)
+            }
             Some(EmfRecordType::Comment) => Self::Comment(EmrComment::read_data(data)?),
             _ => Self::Unknown(record),
         })
@@ -397,17 +546,40 @@ impl<'a> EmfRecordData<'a> {
     pub fn to_record(&self) -> Result<EmfRecord> {
         match self {
             Self::Header(value) => Ok(EmfRecord::new(EMR_HEADER, value.to_record_data()?)),
+            Self::Eof(value) => Ok(EmfRecord::new(EMR_EOF, value.to_data()?)),
+            Self::PolyBezier(value) => Ok(EmfRecord::new(
+                EmfRecordType::PolyBezier.raw(),
+                value.to_data()?,
+            )),
             Self::SetWindowExtEx(value) => object_record(EmfRecordType::SetWindowExtEx, value),
             Self::SetWindowOrgEx(value) => object_record(EmfRecordType::SetWindowOrgEx, value),
             Self::SetViewportExtEx(value) => object_record(EmfRecordType::SetViewportExtEx, value),
             Self::SetViewportOrgEx(value) => object_record(EmfRecordType::SetViewportOrgEx, value),
             Self::SetBrushOrgEx(value) => object_record(EmfRecordType::SetBrushOrgEx, value),
+            Self::SetPixelV(value) => object_record(EmfRecordType::SetPixelV, value),
+            Self::SetMapperFlags(value) => object_record(EmfRecordType::SetMapperFlags, value),
+            Self::SetMapMode(value) => object_record(EmfRecordType::SetMapMode, value),
+            Self::SetBkMode(value) => object_record(EmfRecordType::SetBkMode, value),
+            Self::SetPolyFillMode(value) => object_record(EmfRecordType::SetPolyfillMode, value),
+            Self::SetRop2(value) => object_record(EmfRecordType::SetRop2, value),
+            Self::SetStretchBltMode(value) => {
+                object_record(EmfRecordType::SetStretchBltMode, value)
+            }
+            Self::SetTextAlign(value) => object_record(EmfRecordType::SetTextAlign, value),
             Self::SetTextColor(value) => object_record(EmfRecordType::SetTextColor, value),
             Self::SetBkColor(value) => object_record(EmfRecordType::SetBkColor, value),
+            Self::OffsetClipRgn(value) => object_record(EmfRecordType::OffsetClipRgn, value),
+            Self::SetMetaRgn => Ok(no_data_record(EmfRecordType::SetMetaRgn)),
             Self::ExcludeClipRect(value) => object_record(EmfRecordType::ExcludeClipRect, value),
             Self::IntersectClipRect(value) => {
                 object_record(EmfRecordType::IntersectClipRect, value)
             }
+            Self::ScaleViewportExtEx(value) => {
+                object_record(EmfRecordType::ScaleViewportExtEx, value)
+            }
+            Self::ScaleWindowExtEx(value) => object_record(EmfRecordType::ScaleWindowExtEx, value),
+            Self::SaveDc => Ok(no_data_record(EmfRecordType::SaveDc)),
+            Self::RestoreDc(value) => object_record(EmfRecordType::RestoreDc, value),
             Self::SetWorldTransform(value) => {
                 object_record(EmfRecordType::SetWorldTransform, value)
             }
@@ -415,13 +587,44 @@ impl<'a> EmfRecordData<'a> {
                 object_record(EmfRecordType::ModifyWorldTransform, value)
             }
             Self::SelectObject(value) => object_record(EmfRecordType::SelectObject, value),
+            Self::SelectPalette(value) => object_record(EmfRecordType::SelectPalette, value),
+            Self::ResizePalette(value) => object_record(EmfRecordType::ResizePalette, value),
             Self::DeleteObject(value) => object_record(EmfRecordType::DeleteObject, value),
             Self::MoveToEx(value) => object_record(EmfRecordType::MoveToEx, value),
             Self::LineTo(value) => object_record(EmfRecordType::LineTo, value),
+            Self::AngleArc(value) => object_record(EmfRecordType::AngleArc, value),
+            Self::RoundRect(value) => object_record(EmfRecordType::RoundRect, value),
+            Self::Arc(value) => object_record(EmfRecordType::Arc, value),
+            Self::ArcTo(value) => object_record(EmfRecordType::ArcTo, value),
+            Self::Chord(value) => object_record(EmfRecordType::Chord, value),
+            Self::Pie(value) => object_record(EmfRecordType::Pie, value),
+            Self::ExtFloodFill(value) => object_record(EmfRecordType::ExtFloodFill, value),
+            Self::SetArcDirection(value) => object_record(EmfRecordType::SetArcDirection, value),
+            Self::SetMiterLimit(value) => object_record(EmfRecordType::SetMiterLimit, value),
+            Self::BeginPath => Ok(no_data_record(EmfRecordType::BeginPath)),
+            Self::EndPath => Ok(no_data_record(EmfRecordType::EndPath)),
+            Self::CloseFigure => Ok(no_data_record(EmfRecordType::CloseFigure)),
+            Self::FillPath(value) => object_record(EmfRecordType::FillPath, value),
+            Self::StrokeAndFillPath(value) => {
+                object_record(EmfRecordType::StrokeAndFillPath, value)
+            }
+            Self::StrokePath(value) => object_record(EmfRecordType::StrokePath, value),
+            Self::FlattenPath => Ok(no_data_record(EmfRecordType::FlattenPath)),
+            Self::WidenPath => Ok(no_data_record(EmfRecordType::WidenPath)),
+            Self::SelectClipPath(value) => object_record(EmfRecordType::SelectClipPath, value),
+            Self::AbortPath => Ok(no_data_record(EmfRecordType::AbortPath)),
             Self::CreatePen(value) => object_record(EmfRecordType::CreatePen, value),
             Self::CreateBrushIndirect(value) => {
                 object_record(EmfRecordType::CreateBrushIndirect, value)
             }
+            Self::CreatePalette(value) => Ok(EmfRecord::new(
+                EmfRecordType::CreatePalette.raw(),
+                value.to_data()?,
+            )),
+            Self::SetPaletteEntries(value) => Ok(EmfRecord::new(
+                EmfRecordType::SetPaletteEntries.raw(),
+                value.to_data()?,
+            )),
             Self::ExtCreatePen(value) => Ok(EmfRecord::new(
                 EmfRecordType::ExtCreatePen.raw(),
                 value.to_data()?,
@@ -446,6 +649,14 @@ impl<'a> EmfRecordData<'a> {
                 EmfRecordType::Polyline.raw(),
                 value.to_data()?,
             )),
+            Self::PolyBezierTo(value) => Ok(EmfRecord::new(
+                EmfRecordType::PolyBezierTo.raw(),
+                value.to_data()?,
+            )),
+            Self::PolylineTo(value) => Ok(EmfRecord::new(
+                EmfRecordType::PolylineTo.raw(),
+                value.to_data()?,
+            )),
             Self::Polygon16(value) => Ok(EmfRecord::new(
                 EmfRecordType::Polygon16.raw(),
                 value.to_data()?,
@@ -454,8 +665,28 @@ impl<'a> EmfRecordData<'a> {
                 EmfRecordType::Polyline16.raw(),
                 value.to_data()?,
             )),
+            Self::PolyBezier16(value) => Ok(EmfRecord::new(
+                EmfRecordType::PolyBezier16.raw(),
+                value.to_data()?,
+            )),
+            Self::PolyBezierTo16(value) => Ok(EmfRecord::new(
+                EmfRecordType::PolyBezierTo16.raw(),
+                value.to_data()?,
+            )),
+            Self::PolylineTo16(value) => Ok(EmfRecord::new(
+                EmfRecordType::PolylineTo16.raw(),
+                value.to_data()?,
+            )),
+            Self::PolyPolyline(value) => Ok(EmfRecord::new(
+                EmfRecordType::PolyPolyline.raw(),
+                value.to_data()?,
+            )),
             Self::PolyPolygon(value) => Ok(EmfRecord::new(
                 EmfRecordType::PolyPolygon.raw(),
+                value.to_data()?,
+            )),
+            Self::PolyPolyline16(value) => Ok(EmfRecord::new(
+                EmfRecordType::PolyPolyline16.raw(),
                 value.to_data()?,
             )),
             Self::PolyPolygon16(value) => Ok(EmfRecord::new(
@@ -464,6 +695,7 @@ impl<'a> EmfRecordData<'a> {
             )),
             Self::Rectangle(value) => object_record(EmfRecordType::Rectangle, value),
             Self::Ellipse(value) => object_record(EmfRecordType::Ellipse, value),
+            Self::RealizePalette => Ok(no_data_record(EmfRecordType::RealizePalette)),
             Self::ExtTextOutA(value) => Ok(EmfRecord::new(
                 EmfRecordType::ExtTextOutA.raw(),
                 value.to_data(false)?,
@@ -480,12 +712,236 @@ impl<'a> EmfRecordData<'a> {
                 EmfRecordType::StretchDiBits.raw(),
                 value.to_data()?,
             )),
+            Self::SetIcmMode(value) => object_record(EmfRecordType::SetIcmMode, value),
+            Self::SetColorSpace(value) => object_record(EmfRecordType::SetColorSpace, value),
+            Self::DeleteColorSpace(value) => object_record(EmfRecordType::DeleteColorSpace, value),
+            Self::SetLayout(value) => object_record(EmfRecordType::SetLayout, value),
+            Self::SetTextJustification(value) => {
+                object_record(EmfRecordType::SetTextJustification, value)
+            }
             Self::Comment(value) => Ok(EmfRecord::new(
                 EmfRecordType::Comment.raw(),
                 value.to_data()?,
             )),
             Self::Unknown(record) => Ok((*record).clone()),
         }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+pub struct LogPaletteEntry {
+    pub reserved: u8,
+    pub blue: u8,
+    pub green: u8,
+    pub red: u8,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogPalette {
+    pub version: u16,
+    pub entries: Vec<LogPaletteEntry>,
+}
+
+impl LogPalette {
+    pub fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
+        let version = reader.read_u16()?;
+        let entry_count = reader.read_u16()? as usize;
+        let mut entries = Vec::with_capacity(entry_count);
+        for _ in 0..entry_count {
+            entries.push(LogPaletteEntry::read_from(reader)?);
+        }
+        Ok(Self { version, entries })
+    }
+
+    pub fn write_to<W: std::io::Write + std::io::Seek>(
+        &self,
+        writer: &mut Writer<W>,
+    ) -> Result<()> {
+        writer.write_u16(self.version)?;
+        writer.write_u16(
+            u16::try_from(self.entries.len())
+                .map_err(|_| Error::invalid(0, "LogPalette entry count exceeds u16::MAX"))?,
+        )?;
+        for entry in &self.entries {
+            entry.write_to(writer)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EmrEof {
+    pub palette_entries_offset: u32,
+    pub palette_prefix: Vec<u8>,
+    pub palette_entries: Vec<LogPaletteEntry>,
+    pub palette_suffix: Vec<u8>,
+    pub size_last: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EmrCreatePalette {
+    pub palette_index: u32,
+    pub log_palette: LogPalette,
+}
+
+impl EmrCreatePalette {
+    pub fn read_data(data: &[u8]) -> Result<Self> {
+        let mut reader = Reader::new(Cursor::new(data));
+        Ok(Self {
+            palette_index: reader.read_u32()?,
+            log_palette: LogPalette::read_from(&mut reader)?,
+        })
+    }
+
+    pub fn to_data(&self) -> Result<Vec<u8>> {
+        let mut writer = Writer::new(Cursor::new(Vec::with_capacity(
+            8 + self.log_palette.entries.len() * 4,
+        )));
+        writer.write_u32(self.palette_index)?;
+        self.log_palette.write_to(&mut writer)?;
+        Ok(writer.into_inner().into_inner())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EmrSetPaletteEntries {
+    pub palette_index: u32,
+    pub start: u32,
+    pub entries: Vec<LogPaletteEntry>,
+}
+
+impl EmrSetPaletteEntries {
+    pub fn read_data(data: &[u8]) -> Result<Self> {
+        let mut reader = Reader::new(Cursor::new(data));
+        let palette_index = reader.read_u32()?;
+        let start = reader.read_u32()?;
+        let entry_count = reader.read_u32()? as usize;
+        let mut entries = Vec::with_capacity(entry_count);
+        for _ in 0..entry_count {
+            entries.push(LogPaletteEntry::read_from(&mut reader)?);
+        }
+        Ok(Self {
+            palette_index,
+            start,
+            entries,
+        })
+    }
+
+    pub fn to_data(&self) -> Result<Vec<u8>> {
+        let mut writer = Writer::new(Cursor::new(Vec::with_capacity(12 + self.entries.len() * 4)));
+        writer.write_u32(self.palette_index)?;
+        writer.write_u32(self.start)?;
+        writer.write_u32(usize_to_u32(
+            self.entries.len(),
+            "EMR_SETPALETTEENTRIES entry count",
+        )?)?;
+        for entry in &self.entries {
+            entry.write_to(&mut writer)?;
+        }
+        Ok(writer.into_inner().into_inner())
+    }
+}
+
+impl EmrEof {
+    pub fn read_data(data: &[u8]) -> Result<Self> {
+        if data.len() < 12 {
+            return Err(Error::invalid(8, "EMR_EOF record data is too small"));
+        }
+        let mut reader = Reader::new(Cursor::new(data));
+        let palette_entry_count = reader.read_u32()? as usize;
+        let palette_entries_offset = reader.read_u32()?;
+        let size_last_start = data
+            .len()
+            .checked_sub(4)
+            .ok_or_else(|| Error::invalid(8, "EMR_EOF record data is too small"))?;
+        let size_last = u32::from_le_bytes(
+            data[size_last_start..]
+                .try_into()
+                .expect("slice length checked"),
+        );
+
+        if palette_entry_count == 0 {
+            return Ok(Self {
+                palette_entries_offset,
+                palette_prefix: data[8..size_last_start].to_vec(),
+                palette_entries: Vec::new(),
+                palette_suffix: Vec::new(),
+                size_last,
+            });
+        }
+
+        let entries_start = record_relative_data_offset(palette_entries_offset as usize)?;
+        if entries_start < 8 {
+            return Err(Error::invalid(
+                8,
+                "EMR_EOF palette entries overlap fixed fields",
+            ));
+        }
+        let entries_len = palette_entry_count
+            .checked_mul(4)
+            .ok_or_else(|| Error::invalid(8, "EMR_EOF palette entry size overflows"))?;
+        let entries_end = entries_start
+            .checked_add(entries_len)
+            .ok_or_else(|| Error::invalid(8, "EMR_EOF palette entry range overflows"))?;
+        if entries_end > size_last_start {
+            return Err(Error::invalid(
+                8,
+                "EMR_EOF palette entries exceed record payload",
+            ));
+        }
+
+        let mut entries_reader = Reader::new(Cursor::new(&data[entries_start..entries_end]));
+        let mut palette_entries = Vec::with_capacity(palette_entry_count);
+        for _ in 0..palette_entry_count {
+            palette_entries.push(LogPaletteEntry::read_from(&mut entries_reader)?);
+        }
+
+        Ok(Self {
+            palette_entries_offset,
+            palette_prefix: data[8..entries_start].to_vec(),
+            palette_entries,
+            palette_suffix: data[entries_end..size_last_start].to_vec(),
+            size_last,
+        })
+    }
+
+    pub fn to_data(&self) -> Result<Vec<u8>> {
+        let mut writer = Writer::new(Cursor::new(Vec::with_capacity(
+            12 + self.palette_prefix.len() + self.palette_entries.len() * 4,
+        )));
+        writer.write_u32(usize_to_u32(
+            self.palette_entries.len(),
+            "EMR_EOF palette entry count",
+        )?)?;
+        writer.write_u32(self.palette_entries_offset)?;
+
+        if self.palette_entries.is_empty() {
+            writer.write_all(&self.palette_prefix)?;
+        } else {
+            let entries_start = record_relative_data_offset(self.palette_entries_offset as usize)?;
+            if entries_start < 8 {
+                return Err(Error::invalid(
+                    8,
+                    "EMR_EOF palette entries overlap fixed fields",
+                ));
+            }
+            let prefix_target_len = entries_start - 8;
+            if self.palette_prefix.len() > prefix_target_len {
+                return Err(Error::invalid(
+                    8,
+                    "EMR_EOF palette prefix exceeds palette entry offset",
+                ));
+            }
+            writer.write_all(&self.palette_prefix)?;
+            writer.write_all(&vec![0; prefix_target_len - self.palette_prefix.len()])?;
+            for entry in &self.palette_entries {
+                entry.write_to(&mut writer)?;
+            }
+        }
+
+        writer.write_all(&self.palette_suffix)?;
+        writer.write_u32(self.size_last)?;
+        Ok(writer.into_inner().into_inner())
     }
 }
 
@@ -515,6 +971,47 @@ pub struct EmrSetBrushOrgEx {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+pub struct EmrSetPixelV {
+    pub pixel: PointL,
+    pub color: ColorRef,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+pub struct EmrSetMapperFlags {
+    pub flags: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+pub struct EmrSetMapMode {
+    pub map_mode: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+pub struct EmrSetBkMode {
+    pub background_mode: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+pub struct EmrSetPolyFillMode {
+    pub polygon_fill_mode: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+pub struct EmrSetRop2 {
+    pub rop2_mode: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+pub struct EmrSetStretchBltMode {
+    pub stretch_mode: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+pub struct EmrSetTextAlign {
+    pub text_alignment_mode: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
 pub struct EmrSetTextColor {
     pub color: ColorRef,
 }
@@ -525,6 +1022,11 @@ pub struct EmrSetBkColor {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+pub struct EmrOffsetClipRgn {
+    pub offset: PointL,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
 pub struct EmrExcludeClipRect {
     pub rect: RectL,
 }
@@ -532,6 +1034,27 @@ pub struct EmrExcludeClipRect {
 #[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
 pub struct EmrIntersectClipRect {
     pub rect: RectL,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+pub struct EmrScaleViewportExtEx {
+    pub x_num: i32,
+    pub x_denom: i32,
+    pub y_num: i32,
+    pub y_denom: i32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+pub struct EmrScaleWindowExtEx {
+    pub x_num: i32,
+    pub x_denom: i32,
+    pub y_num: i32,
+    pub y_denom: i32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+pub struct EmrRestoreDc {
+    pub saved_dc: i32,
 }
 
 #[derive(Clone, Debug, PartialEq, SdkObject)]
@@ -551,6 +1074,17 @@ pub struct EmrSelectObject {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+pub struct EmrSelectPalette {
+    pub palette_index: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+pub struct EmrResizePalette {
+    pub palette_index: u32,
+    pub number_of_entries: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
 pub struct EmrDeleteObject {
     pub object_index: u32,
 }
@@ -563,6 +1097,64 @@ pub struct EmrLineTo {
 #[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
 pub struct EmrMoveToEx {
     pub point: PointL,
+}
+
+#[derive(Clone, Debug, PartialEq, SdkObject)]
+pub struct EmrAngleArc {
+    pub center: PointL,
+    pub radius: u32,
+    pub start_angle: f32,
+    pub sweep_angle: f32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+pub struct EmrRoundRect {
+    pub bounds: RectL,
+    pub corner: SizeL,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+pub struct EmrArc {
+    pub box_bounds: RectL,
+    pub start: PointL,
+    pub end: PointL,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+pub struct EmrExtFloodFill {
+    pub start: PointL,
+    pub color: ColorRef,
+    pub flood_fill_mode: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+pub struct EmrSetArcDirection {
+    pub arc_direction: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+pub struct EmrSetMiterLimit {
+    pub miter_limit: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+pub struct EmrSelectClipPath {
+    pub region_mode: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+pub struct EmrFillPath {
+    pub bounds: RectL,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+pub struct EmrStrokeAndFillPath {
+    pub bounds: RectL,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+pub struct EmrStrokePath {
+    pub bounds: RectL,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
@@ -1313,6 +1905,32 @@ pub struct BitmapSourceBounds {
     pub height: i32,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+pub struct EmrSetIcmMode {
+    pub icm_mode: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+pub struct EmrSetColorSpace {
+    pub color_space_index: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+pub struct EmrDeleteColorSpace {
+    pub color_space_index: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+pub struct EmrSetLayout {
+    pub layout_mode: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+pub struct EmrSetTextJustification {
+    pub break_extra: i32,
+    pub break_count: i32,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EmrComment {
     EmfPlus {
@@ -1485,6 +2103,21 @@ fn object_record<T: SdkWrite>(record_type: EmfRecordType, value: &T) -> Result<E
     ))
 }
 
+fn no_data_record(record_type: EmfRecordType) -> EmfRecord {
+    EmfRecord::new(record_type.raw(), Vec::new())
+}
+
+fn ensure_no_data(data: &[u8], record_name: &str) -> Result<()> {
+    if data.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::invalid(
+            8,
+            format!("{record_name} record data must be empty"),
+        ))
+    }
+}
+
 fn write_fixed_bytes<W: std::io::Write + std::io::Seek>(
     writer: &mut Writer<W>,
     bytes: &[u8],
@@ -1653,6 +2286,252 @@ mod tests {
         let record = value.to_record().unwrap();
         assert_eq!(record.record_type, EmfRecordType::Polygon.raw());
         assert_eq!(record.parse_data().unwrap(), value);
+    }
+
+    #[test]
+    fn typed_simple_state_records_roundtrip() {
+        let values = [
+            EmfRecordData::SetMapMode(EmrSetMapMode { map_mode: 8 }),
+            EmfRecordData::SetBkMode(EmrSetBkMode { background_mode: 2 }),
+            EmfRecordData::SetRop2(EmrSetRop2 { rop2_mode: 13 }),
+            EmfRecordData::SetArcDirection(EmrSetArcDirection { arc_direction: 2 }),
+            EmfRecordData::SetIcmMode(EmrSetIcmMode { icm_mode: 1 }),
+            EmfRecordData::SetLayout(EmrSetLayout { layout_mode: 9 }),
+        ];
+
+        for value in values {
+            let record = value.to_record().unwrap();
+            assert_eq!(record.data.len(), 4);
+            assert_eq!(record.parse_data().unwrap(), value);
+        }
+    }
+
+    #[test]
+    fn typed_eof_record_preserves_palette_spacing() {
+        let value = EmfRecordData::Eof(EmrEof {
+            palette_entries_offset: 20,
+            palette_prefix: vec![0xAA, 0xBB, 0xCC, 0xDD],
+            palette_entries: vec![LogPaletteEntry {
+                reserved: 1,
+                blue: 2,
+                green: 3,
+                red: 4,
+            }],
+            palette_suffix: vec![0xEE, 0xFF, 0x11, 0x22],
+            size_last: 32,
+        });
+
+        let record = value.to_record().unwrap();
+        assert_eq!(record.record_type, EMR_EOF);
+        assert_eq!(
+            record.data,
+            vec![
+                1, 0, 0, 0, // nPalEntries
+                20, 0, 0, 0, // offPalEntries
+                0xAA, 0xBB, 0xCC, 0xDD, // UndefinedSpace1
+                1, 2, 3, 4, // LogPaletteEntry
+                0xEE, 0xFF, 0x11, 0x22, // UndefinedSpace2
+                32, 0, 0, 0, // SizeLast
+            ]
+        );
+        assert_eq!(record.parse_data().unwrap(), value);
+    }
+
+    #[test]
+    fn typed_palette_object_records_roundtrip() {
+        let select = EmfRecordData::SelectPalette(EmrSelectPalette { palette_index: 2 });
+        let record = select.to_record().unwrap();
+        assert_eq!(record.record_type, EmfRecordType::SelectPalette.raw());
+        assert_eq!(record.parse_data().unwrap(), select);
+
+        let resize = EmfRecordData::ResizePalette(EmrResizePalette {
+            palette_index: 2,
+            number_of_entries: 256,
+        });
+        let record = resize.to_record().unwrap();
+        assert_eq!(record.record_type, EmfRecordType::ResizePalette.raw());
+        assert_eq!(record.parse_data().unwrap(), resize);
+    }
+
+    #[test]
+    fn typed_palette_entry_records_roundtrip() {
+        let entries = vec![
+            LogPaletteEntry {
+                reserved: 0,
+                blue: 10,
+                green: 20,
+                red: 30,
+            },
+            LogPaletteEntry {
+                reserved: 1,
+                blue: 40,
+                green: 50,
+                red: 60,
+            },
+        ];
+
+        let create = EmfRecordData::CreatePalette(EmrCreatePalette {
+            palette_index: 3,
+            log_palette: LogPalette {
+                version: 0x0300,
+                entries: entries.clone(),
+            },
+        });
+        let record = create.to_record().unwrap();
+        assert_eq!(record.record_type, EmfRecordType::CreatePalette.raw());
+        assert_eq!(record.parse_data().unwrap(), create);
+
+        let set_entries = EmfRecordData::SetPaletteEntries(EmrSetPaletteEntries {
+            palette_index: 3,
+            start: 4,
+            entries,
+        });
+        let record = set_entries.to_record().unwrap();
+        assert_eq!(record.record_type, EmfRecordType::SetPaletteEntries.raw());
+        assert_eq!(record.parse_data().unwrap(), set_entries);
+    }
+
+    #[test]
+    fn typed_scale_and_text_justification_records_roundtrip() {
+        let scale = EmfRecordData::ScaleViewportExtEx(EmrScaleViewportExtEx {
+            x_num: 2,
+            x_denom: 3,
+            y_num: -4,
+            y_denom: 5,
+        });
+        let record = scale.to_record().unwrap();
+        assert_eq!(record.record_type, EmfRecordType::ScaleViewportExtEx.raw());
+        assert_eq!(record.parse_data().unwrap(), scale);
+
+        let justification = EmfRecordData::SetTextJustification(EmrSetTextJustification {
+            break_extra: -12,
+            break_count: 4,
+        });
+        let record = justification.to_record().unwrap();
+        assert_eq!(
+            record.record_type,
+            EmfRecordType::SetTextJustification.raw()
+        );
+        assert_eq!(record.parse_data().unwrap(), justification);
+    }
+
+    #[test]
+    fn typed_no_parameter_records_roundtrip() {
+        let values = [
+            EmfRecordData::SaveDc,
+            EmfRecordData::RealizePalette,
+            EmfRecordData::BeginPath,
+            EmfRecordData::EndPath,
+            EmfRecordData::CloseFigure,
+            EmfRecordData::FlattenPath,
+            EmfRecordData::WidenPath,
+            EmfRecordData::AbortPath,
+        ];
+
+        for value in values {
+            let record = value.to_record().unwrap();
+            assert!(record.data.is_empty());
+            assert_eq!(record.parse_data().unwrap(), value);
+        }
+    }
+
+    #[test]
+    fn typed_poly_polyline16_record_roundtrips() {
+        let value = EmfRecordData::PolyPolyline16(EmrPolyPolygonS {
+            bounds: RectL {
+                left: 0,
+                top: 0,
+                right: 10,
+                bottom: 10,
+            },
+            counts: vec![2, 3],
+            points: vec![
+                crate::types::PointS { x: 1, y: 2 },
+                crate::types::PointS { x: 3, y: 4 },
+                crate::types::PointS { x: 5, y: 6 },
+                crate::types::PointS { x: 7, y: 8 },
+                crate::types::PointS { x: 9, y: 10 },
+            ],
+        });
+
+        let record = value.to_record().unwrap();
+        assert_eq!(record.record_type, EmfRecordType::PolyPolyline16.raw());
+        assert_eq!(record.parse_data().unwrap(), value);
+    }
+
+    #[test]
+    fn typed_fixed_drawing_records_roundtrip() {
+        let arc = EmfRecordData::Arc(EmrArc {
+            box_bounds: RectL {
+                left: 1,
+                top: 2,
+                right: 30,
+                bottom: 40,
+            },
+            start: PointL { x: 5, y: 6 },
+            end: PointL { x: 7, y: 8 },
+        });
+        let record = arc.to_record().unwrap();
+        assert_eq!(record.record_type, EmfRecordType::Arc.raw());
+        assert_eq!(record.parse_data().unwrap(), arc);
+
+        let angle_arc = EmfRecordData::AngleArc(EmrAngleArc {
+            center: PointL { x: 10, y: 11 },
+            radius: 12,
+            start_angle: 45.0,
+            sweep_angle: 90.0,
+        });
+        let record = angle_arc.to_record().unwrap();
+        assert_eq!(record.record_type, EmfRecordType::AngleArc.raw());
+        assert_eq!(record.parse_data().unwrap(), angle_arc);
+
+        let round_rect = EmfRecordData::RoundRect(EmrRoundRect {
+            bounds: RectL {
+                left: 0,
+                top: 0,
+                right: 100,
+                bottom: 50,
+            },
+            corner: SizeL { cx: 8, cy: 10 },
+        });
+        let record = round_rect.to_record().unwrap();
+        assert_eq!(record.record_type, EmfRecordType::RoundRect.raw());
+        assert_eq!(record.parse_data().unwrap(), round_rect);
+    }
+
+    #[test]
+    fn typed_path_bounds_and_flood_fill_records_roundtrip() {
+        let bounds = RectL {
+            left: -1,
+            top: -2,
+            right: 20,
+            bottom: 30,
+        };
+        let values = [
+            EmfRecordData::FillPath(EmrFillPath { bounds }),
+            EmfRecordData::StrokeAndFillPath(EmrStrokeAndFillPath { bounds }),
+            EmfRecordData::StrokePath(EmrStrokePath { bounds }),
+        ];
+
+        for value in values {
+            let record = value.to_record().unwrap();
+            assert_eq!(record.data.len(), 16);
+            assert_eq!(record.parse_data().unwrap(), value);
+        }
+
+        let flood_fill = EmfRecordData::ExtFloodFill(EmrExtFloodFill {
+            start: PointL { x: 3, y: 4 },
+            color: ColorRef {
+                red: 10,
+                green: 20,
+                blue: 30,
+                reserved: 0,
+            },
+            flood_fill_mode: 1,
+        });
+        let record = flood_fill.to_record().unwrap();
+        assert_eq!(record.record_type, EmfRecordType::ExtFloodFill.raw());
+        assert_eq!(record.parse_data().unwrap(), flood_fill);
     }
 
     #[test]
