@@ -15,7 +15,7 @@ pub use emfsdk_derive::{SdkEnum, SdkObject};
 pub use crate::bitmap::{
     BITMAP_CORE_HEADER_SIZE, BITMAP_INFO_HEADER_SIZE, BITMAP_V4_HEADER_SIZE, BITMAP_V5_HEADER_SIZE,
     BitmapBitCount, BitmapCompression, BitmapCoreHeader, BitmapInfoHeader, DeviceIndependentBitmap,
-    DibBitmapInfo, DibColorUsage, DibHeader, EmbeddedBitmapFormat,
+    DibBitmapInfo, DibColorTable, DibColorUsage, DibHeader, EmbeddedBitmapFormat, RgbQuad,
 };
 pub use crate::common::{
     Error, Format, Reader, Result, SdkEnumValue, SdkRead, SdkSize, SdkWrite, UnknownRecord, Writer,

@@ -1,5 +1,7 @@
 use emfsdk_derive::SdkObject;
 
+use crate::common::{Error, Reader, Result, SdkRead, SdkSize, SdkWrite, Writer};
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, SdkObject)]
 #[sdk(format = "shared")]
 pub struct PointL {
@@ -46,13 +48,55 @@ pub struct RectS {
     pub bottom: i16,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, SdkObject)]
-#[sdk(format = "shared")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ColorRef {
     pub red: u8,
     pub green: u8,
     pub blue: u8,
     pub reserved: u8,
+}
+
+impl ColorRef {
+    pub const fn is_reserved_zero(self) -> bool {
+        self.reserved == 0
+    }
+}
+
+impl SdkRead for ColorRef {
+    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
+        let value = Self {
+            red: reader.read_u8()?,
+            green: reader.read_u8()?,
+            blue: reader.read_u8()?,
+            reserved: reader.read_u8()?,
+        };
+        validate_color_ref(value)?;
+        Ok(value)
+    }
+}
+
+impl SdkWrite for ColorRef {
+    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+        validate_color_ref(*self)?;
+        writer.write_u8(self.red)?;
+        writer.write_u8(self.green)?;
+        writer.write_u8(self.blue)?;
+        writer.write_u8(self.reserved)
+    }
+}
+
+impl SdkSize for ColorRef {
+    fn sdk_size(&self) -> u64 {
+        4
+    }
+}
+
+fn validate_color_ref(value: ColorRef) -> Result<()> {
+    if value.is_reserved_zero() {
+        Ok(())
+    } else {
+        Err(Error::invalid(0, "ColorRef Reserved must be 0"))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, SdkObject)]
@@ -107,4 +151,40 @@ pub struct TriVertex {
     pub green: u16,
     pub blue: u16,
     pub alpha: u16,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use super::*;
+
+    #[test]
+    fn color_ref_reserved_byte_must_be_zero() {
+        let valid = ColorRef {
+            red: 1,
+            green: 2,
+            blue: 3,
+            reserved: 0,
+        };
+        let mut bytes = Vec::new();
+        valid
+            .write_to(&mut Writer::new(Cursor::new(&mut bytes)))
+            .unwrap();
+        assert_eq!(bytes, [1, 2, 3, 0]);
+
+        let parsed = ColorRef::read_from(&mut Reader::new(Cursor::new(bytes))).unwrap();
+        assert_eq!(parsed, valid);
+
+        let invalid = [1, 2, 3, 4];
+        assert!(ColorRef::read_from(&mut Reader::new(Cursor::new(invalid))).is_err());
+        assert!(
+            ColorRef {
+                reserved: 4,
+                ..valid
+            }
+            .write_to(&mut Writer::new(Cursor::new(Vec::new())))
+            .is_err()
+        );
+    }
 }

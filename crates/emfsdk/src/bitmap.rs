@@ -62,6 +62,10 @@ impl BitmapCompression {
             _ => None,
         }
     }
+
+    pub fn is_top_down_allowed(self) -> bool {
+        matches!(self, Self::Rgb | Self::Bitfields)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, SdkEnum)]
@@ -74,6 +78,39 @@ pub enum BitmapBitCount {
     Sixteen = 0x0010,
     TwentyFour = 0x0018,
     ThirtyTwo = 0x0020,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, SdkEnum)]
+#[sdk(repr = "u32")]
+pub enum BitmapLogicalColorSpace {
+    CalibratedRgb = 0x0000_0000,
+    SRgb = 0x7352_4742,
+    WindowsColorSpace = 0x5769_6E20,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, SdkEnum)]
+#[sdk(repr = "u32")]
+pub enum BitmapLogicalColorSpaceV5 {
+    ProfileLinked = 0x4C49_4E4B,
+    ProfileEmbedded = 0x4D42_4544,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, SdkEnum)]
+#[sdk(repr = "u32")]
+pub enum BitmapGamutMappingIntent {
+    Business = 0x0000_0001,
+    Graphics = 0x0000_0002,
+    Images = 0x0000_0004,
+    AbsoluteColorimetric = 0x0000_0008,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, SdkObject)]
+#[sdk(format = "wmf")]
+pub struct RgbQuad {
+    pub blue: u8,
+    pub green: u8,
+    pub red: u8,
+    pub reserved: u8,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
@@ -126,6 +163,95 @@ impl BitmapInfoHeader {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+#[sdk(format = "wmf")]
+pub struct BitmapCieXyz {
+    pub x: i32,
+    pub y: i32,
+    pub z: i32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+#[sdk(format = "wmf")]
+pub struct BitmapCieXyzTriple {
+    pub red: BitmapCieXyz,
+    pub green: BitmapCieXyz,
+    pub blue: BitmapCieXyz,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+#[sdk(format = "wmf")]
+pub struct BitmapV4Header {
+    pub base: BitmapInfoHeader,
+    pub red_mask: u32,
+    pub green_mask: u32,
+    pub blue_mask: u32,
+    pub alpha_mask: u32,
+    pub color_space_type: u32,
+    pub endpoints: BitmapCieXyzTriple,
+    pub gamma_red: u32,
+    pub gamma_green: u32,
+    pub gamma_blue: u32,
+}
+
+impl BitmapV4Header {
+    pub fn color_space_kind(&self) -> Option<BitmapLogicalColorSpace> {
+        BitmapLogicalColorSpace::from_raw(self.color_space_type)
+    }
+
+    pub fn color_space_v5_kind(&self) -> Option<BitmapLogicalColorSpaceV5> {
+        BitmapLogicalColorSpaceV5::from_raw(self.color_space_type)
+    }
+
+    pub fn compression_kind(&self) -> Option<BitmapCompression> {
+        self.base.compression_kind()
+    }
+
+    pub fn bit_count_kind(&self) -> Option<BitmapBitCount> {
+        self.base.bit_count_kind()
+    }
+
+    pub fn is_top_down(&self) -> bool {
+        self.base.is_top_down()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+#[sdk(format = "wmf")]
+pub struct BitmapV5Header {
+    pub v4: BitmapV4Header,
+    pub intent: u32,
+    pub profile_data: u32,
+    pub profile_size: u32,
+    pub reserved: u32,
+}
+
+impl BitmapV5Header {
+    pub fn intent_kind(&self) -> Option<BitmapGamutMappingIntent> {
+        BitmapGamutMappingIntent::from_raw(self.intent)
+    }
+
+    pub fn color_space_kind(&self) -> Option<BitmapLogicalColorSpace> {
+        self.v4.color_space_kind()
+    }
+
+    pub fn color_space_v5_kind(&self) -> Option<BitmapLogicalColorSpaceV5> {
+        self.v4.color_space_v5_kind()
+    }
+
+    pub fn compression_kind(&self) -> Option<BitmapCompression> {
+        self.v4.compression_kind()
+    }
+
+    pub fn bit_count_kind(&self) -> Option<BitmapBitCount> {
+        self.v4.bit_count_kind()
+    }
+
+    pub fn is_top_down(&self) -> bool {
+        self.v4.is_top_down()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DibHeader {
     Core(BitmapCoreHeader),
@@ -133,6 +259,8 @@ pub enum DibHeader {
         base: BitmapInfoHeader,
         extension: Vec<u8>,
     },
+    V4(BitmapV4Header),
+    V5(BitmapV5Header),
 }
 
 impl DibHeader {
@@ -140,6 +268,8 @@ impl DibHeader {
         match self {
             Self::Core(value) => value.header_size,
             Self::Info { base, .. } => base.header_size,
+            Self::V4(value) => value.base.header_size,
+            Self::V5(value) => value.v4.base.header_size,
         }
     }
 
@@ -147,6 +277,8 @@ impl DibHeader {
         match self {
             Self::Core(value) => i32::from(value.width),
             Self::Info { base, .. } => base.width,
+            Self::V4(value) => value.base.width,
+            Self::V5(value) => value.v4.base.width,
         }
     }
 
@@ -154,6 +286,8 @@ impl DibHeader {
         match self {
             Self::Core(value) => i32::from(value.height),
             Self::Info { base, .. } => base.height,
+            Self::V4(value) => value.base.height,
+            Self::V5(value) => value.v4.base.height,
         }
     }
 
@@ -161,6 +295,8 @@ impl DibHeader {
         match self {
             Self::Core(value) => value.bit_count,
             Self::Info { base, .. } => base.bit_count,
+            Self::V4(value) => value.base.bit_count,
+            Self::V5(value) => value.v4.base.bit_count,
         }
     }
 
@@ -168,15 +304,40 @@ impl DibHeader {
         BitmapBitCount::from_raw(self.bit_count())
     }
 
+    pub fn color_used(&self) -> u32 {
+        match self {
+            Self::Core(_) => 0,
+            Self::Info { base, .. } => base.color_used,
+            Self::V4(value) => value.base.color_used,
+            Self::V5(value) => value.v4.base.color_used,
+        }
+    }
+
+    pub fn image_size(&self) -> u32 {
+        match self {
+            Self::Core(_) => 0,
+            Self::Info { base, .. } => base.image_size,
+            Self::V4(value) => value.base.image_size,
+            Self::V5(value) => value.v4.base.image_size,
+        }
+    }
+
     pub fn compression_kind(&self) -> Option<BitmapCompression> {
         match self {
             Self::Core(_) => Some(BitmapCompression::Rgb),
             Self::Info { base, .. } => base.compression_kind(),
+            Self::V4(value) => value.compression_kind(),
+            Self::V5(value) => value.compression_kind(),
         }
     }
 
     pub fn is_top_down(&self) -> bool {
-        matches!(self, Self::Info { base, .. } if base.is_top_down())
+        match self {
+            Self::Core(_) => false,
+            Self::Info { base, .. } => base.is_top_down(),
+            Self::V4(value) => value.is_top_down(),
+            Self::V5(value) => value.is_top_down(),
+        }
     }
 
     pub fn write_to<W: std::io::Write + std::io::Seek>(
@@ -189,6 +350,8 @@ impl DibHeader {
                 base.write_to(writer)?;
                 writer.write_all(extension)
             }
+            Self::V4(value) => value.write_to(writer),
+            Self::V5(value) => value.write_to(writer),
         }
     }
 }
@@ -198,6 +361,8 @@ impl SdkSize for DibHeader {
         match self {
             Self::Core(value) => value.sdk_size(),
             Self::Info { base, extension } => base.sdk_size() + extension.len() as u64,
+            Self::V4(value) => value.sdk_size(),
+            Self::V5(value) => value.sdk_size(),
         }
     }
 }
@@ -208,43 +373,53 @@ pub struct DibBitmapInfo {
     pub color_table: Vec<u8>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DibColorTable {
+    RgbQuads {
+        entries: Vec<RgbQuad>,
+        trailing_data: Vec<u8>,
+    },
+    PaletteIndices {
+        entries: Vec<u16>,
+        trailing_data: Vec<u8>,
+    },
+    None {
+        trailing_data: Vec<u8>,
+    },
+}
+
+impl DibColorTable {
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        let mut writer = Writer::new(std::io::Cursor::new(Vec::new()));
+        match self {
+            Self::RgbQuads {
+                entries,
+                trailing_data,
+            } => {
+                for entry in entries {
+                    validate_rgb_quad(entry)?;
+                    entry.write_to(&mut writer)?;
+                }
+                writer.write_all(trailing_data)?;
+            }
+            Self::PaletteIndices {
+                entries,
+                trailing_data,
+            } => {
+                for entry in entries {
+                    writer.write_u16(*entry)?;
+                }
+                writer.write_all(trailing_data)?;
+            }
+            Self::None { trailing_data } => writer.write_all(trailing_data)?,
+        }
+        Ok(writer.into_inner().into_inner())
+    }
+}
+
 impl DibBitmapInfo {
     pub fn read_from_slice(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() < 4 {
-            return Err(Error::invalid(
-                0,
-                "DIB bitmap info is smaller than HeaderSize",
-            ));
-        }
-
-        let mut reader = Reader::new(std::io::Cursor::new(bytes));
-        let header_size = reader.read_u32()?;
-        reader.seek(0)?;
-
-        let header = match header_size {
-            BITMAP_CORE_HEADER_SIZE => {
-                if bytes.len() < BITMAP_CORE_HEADER_SIZE as usize {
-                    return Err(Error::invalid(0, "BitmapCoreHeader is truncated"));
-                }
-                DibHeader::Core(BitmapCoreHeader::read_from(&mut reader)?)
-            }
-            size if size >= BITMAP_INFO_HEADER_SIZE => {
-                if bytes.len() < size as usize {
-                    return Err(Error::invalid(0, "BitmapInfoHeader extension is truncated"));
-                }
-                let base = BitmapInfoHeader::read_from(&mut reader)?;
-                let extension_size = size as usize - BITMAP_INFO_HEADER_SIZE as usize;
-                let extension = reader.read_vec(extension_size)?;
-                DibHeader::Info { base, extension }
-            }
-            _ => {
-                return Err(Error::invalid(
-                    0,
-                    format!("unsupported DIB header size {header_size}"),
-                ));
-            }
-        };
-
+        let header = read_dib_header_from_slice(bytes)?;
         let header_size = header.header_size() as usize;
         Ok(Self {
             header,
@@ -252,10 +427,30 @@ impl DibBitmapInfo {
         })
     }
 
+    pub fn read_packed_prefix_from_slice(
+        bytes: &[u8],
+        color_usage: DibColorUsage,
+    ) -> Result<(Self, usize)> {
+        let header = read_dib_header_from_slice(bytes)?;
+        let prefix_len = packed_dib_info_len(&header, color_usage)?;
+        if bytes.len() < prefix_len {
+            return Err(Error::invalid(0, "packed DIB bitmap info is truncated"));
+        }
+        let header_size = header.header_size() as usize;
+        Ok((
+            Self {
+                header,
+                color_table: bytes[header_size..prefix_len].to_vec(),
+            },
+            prefix_len,
+        ))
+    }
+
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         let mut writer = Writer::new(std::io::Cursor::new(Vec::with_capacity(
             self.header.sdk_size() as usize + self.color_table.len(),
         )));
+        validate_dib_header(&self.header)?;
         self.header.write_to(&mut writer)?;
         writer.write_all(&self.color_table)?;
         Ok(writer.into_inner().into_inner())
@@ -268,6 +463,160 @@ impl DibBitmapInfo {
     pub fn embedded_format(&self) -> Option<EmbeddedBitmapFormat> {
         self.compression_kind()?.embedded_format()
     }
+
+    pub fn parse_color_table(&self, color_usage: DibColorUsage) -> Result<DibColorTable> {
+        let entry_count = dib_color_table_entry_count(&self.header, color_usage)?;
+        match color_usage {
+            DibColorUsage::RgbColors => {
+                let (table, trailing_data) =
+                    split_color_table_bytes(&self.color_table, entry_count, 4)?;
+                let mut entries = Vec::with_capacity(entry_count);
+                for chunk in table.chunks_exact(4) {
+                    let entry = RgbQuad {
+                        blue: chunk[0],
+                        green: chunk[1],
+                        red: chunk[2],
+                        reserved: chunk[3],
+                    };
+                    validate_rgb_quad(&entry)?;
+                    entries.push(entry);
+                }
+                Ok(DibColorTable::RgbQuads {
+                    entries,
+                    trailing_data: trailing_data.to_vec(),
+                })
+            }
+            DibColorUsage::PalColors => {
+                let (table, trailing_data) =
+                    split_color_table_bytes(&self.color_table, entry_count, 2)?;
+                let entries = table
+                    .chunks_exact(2)
+                    .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+                    .collect();
+                Ok(DibColorTable::PaletteIndices {
+                    entries,
+                    trailing_data: trailing_data.to_vec(),
+                })
+            }
+            DibColorUsage::PalIndices => Ok(DibColorTable::None {
+                trailing_data: self.color_table.clone(),
+            }),
+        }
+    }
+}
+
+fn read_dib_header_from_slice(bytes: &[u8]) -> Result<DibHeader> {
+    if bytes.len() < 4 {
+        return Err(Error::invalid(
+            0,
+            "DIB bitmap info is smaller than HeaderSize",
+        ));
+    }
+
+    let mut reader = Reader::new(std::io::Cursor::new(bytes));
+    let header_size = reader.read_u32()?;
+    reader.seek(0)?;
+
+    let header = match header_size {
+        BITMAP_CORE_HEADER_SIZE => {
+            if bytes.len() < BITMAP_CORE_HEADER_SIZE as usize {
+                return Err(Error::invalid(0, "BitmapCoreHeader is truncated"));
+            }
+            let value = BitmapCoreHeader::read_from(&mut reader)?;
+            validate_bitmap_core_header(&value)?;
+            DibHeader::Core(value)
+        }
+        BITMAP_V4_HEADER_SIZE => {
+            if bytes.len() < BITMAP_V4_HEADER_SIZE as usize {
+                return Err(Error::invalid(0, "BitmapV4Header is truncated"));
+            }
+            let value = BitmapV4Header::read_from(&mut reader)?;
+            validate_bitmap_v4_header(&value)?;
+            DibHeader::V4(value)
+        }
+        BITMAP_V5_HEADER_SIZE => {
+            if bytes.len() < BITMAP_V5_HEADER_SIZE as usize {
+                return Err(Error::invalid(0, "BitmapV5Header is truncated"));
+            }
+            let value = BitmapV5Header::read_from(&mut reader)?;
+            validate_bitmap_v5_header(&value)?;
+            DibHeader::V5(value)
+        }
+        size if size >= BITMAP_INFO_HEADER_SIZE => {
+            if bytes.len() < size as usize {
+                return Err(Error::invalid(0, "BitmapInfoHeader extension is truncated"));
+            }
+            let base = BitmapInfoHeader::read_from(&mut reader)?;
+            validate_bitmap_info_header(&base)?;
+            let extension_size = size as usize - BITMAP_INFO_HEADER_SIZE as usize;
+            let extension = reader.read_vec(extension_size)?;
+            DibHeader::Info { base, extension }
+        }
+        _ => {
+            return Err(Error::invalid(
+                0,
+                format!("unsupported DIB header size {header_size}"),
+            ));
+        }
+    };
+
+    Ok(header)
+}
+
+fn packed_dib_info_len(header: &DibHeader, color_usage: DibColorUsage) -> Result<usize> {
+    let header_size = usize::try_from(header.header_size())
+        .map_err(|_| Error::invalid(0, "DIB header size overflows usize"))?;
+    let bitfields_bytes = if header.header_size() == BITMAP_INFO_HEADER_SIZE
+        && header.compression_kind() == Some(BitmapCompression::Bitfields)
+    {
+        12usize
+    } else {
+        0usize
+    };
+    let entry_count = dib_color_table_entry_count(header, color_usage)?;
+    let entry_size = match color_usage {
+        DibColorUsage::RgbColors => 4usize,
+        DibColorUsage::PalColors => 2usize,
+        DibColorUsage::PalIndices => 0usize,
+    };
+    let color_table_bytes = entry_count
+        .checked_mul(entry_size)
+        .ok_or_else(|| Error::invalid(0, "DIB color table size overflows"))?;
+    header_size
+        .checked_add(bitfields_bytes)
+        .and_then(|value| value.checked_add(color_table_bytes))
+        .ok_or_else(|| Error::invalid(0, "DIB bitmap info size overflows"))
+}
+
+fn dib_color_table_entry_count(header: &DibHeader, color_usage: DibColorUsage) -> Result<usize> {
+    if color_usage == DibColorUsage::PalIndices {
+        return Ok(0);
+    }
+
+    if header.color_used() != 0 {
+        return usize::try_from(header.color_used())
+            .map_err(|_| Error::invalid(0, "DIB color table count overflows usize"));
+    }
+
+    let bit_count = header.bit_count();
+    match bit_count {
+        1 | 4 | 8 => Ok(1usize << bit_count),
+        _ => Ok(0),
+    }
+}
+
+fn split_color_table_bytes(
+    bytes: &[u8],
+    entry_count: usize,
+    entry_size: usize,
+) -> Result<(&[u8], &[u8])> {
+    let color_table_len = entry_count
+        .checked_mul(entry_size)
+        .ok_or_else(|| Error::invalid(0, "DIB color table size overflows"))?;
+    if bytes.len() < color_table_len {
+        return Err(Error::invalid(0, "DIB color table is truncated"));
+    }
+    Ok(bytes.split_at(color_table_len))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -278,13 +627,26 @@ pub struct DeviceIndependentBitmap {
 
 impl DeviceIndependentBitmap {
     pub fn from_parts(bitmap_info: &[u8], bitmap_bits: &[u8]) -> Result<Self> {
-        Ok(Self {
+        let value = Self {
             info: DibBitmapInfo::read_from_slice(bitmap_info)?,
             bits: bitmap_bits.to_vec(),
-        })
+        };
+        validate_device_independent_bitmap(&value)?;
+        Ok(value)
+    }
+
+    pub fn from_packed_slice(bytes: &[u8], color_usage: DibColorUsage) -> Result<Self> {
+        let (info, bits_offset) = DibBitmapInfo::read_packed_prefix_from_slice(bytes, color_usage)?;
+        let value = Self {
+            info,
+            bits: bytes[bits_offset..].to_vec(),
+        };
+        validate_device_independent_bitmap(&value)?;
+        Ok(value)
     }
 
     pub fn to_packed_bytes(&self) -> Result<Vec<u8>> {
+        validate_device_independent_bitmap(self)?;
         let info = self.info.to_bytes()?;
         let mut bytes = Vec::with_capacity(info.len() + self.bits.len());
         bytes.extend_from_slice(&info);
@@ -295,6 +657,161 @@ impl DeviceIndependentBitmap {
     pub fn embedded_format(&self) -> Option<EmbeddedBitmapFormat> {
         self.info.embedded_format()
     }
+}
+
+fn validate_device_independent_bitmap(value: &DeviceIndependentBitmap) -> Result<()> {
+    if value.info.embedded_format().is_some() {
+        let image_size = usize::try_from(value.info.header.image_size())
+            .map_err(|_| Error::invalid(0, "DIB ImageSize overflows usize"))?;
+        if image_size != value.bits.len() {
+            return Err(Error::invalid(
+                0,
+                "DIB JPEG/PNG ImageSize must match bitmap buffer size",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_dib_header(value: &DibHeader) -> Result<()> {
+    match value {
+        DibHeader::Core(value) => validate_bitmap_core_header(value),
+        DibHeader::Info { base, .. } => validate_bitmap_info_header(base),
+        DibHeader::V4(value) => validate_bitmap_v4_header(value),
+        DibHeader::V5(value) => validate_bitmap_v5_header(value),
+    }
+}
+
+fn validate_bitmap_core_header(value: &BitmapCoreHeader) -> Result<()> {
+    if value.header_size != BITMAP_CORE_HEADER_SIZE {
+        return Err(Error::invalid(0, "BitmapCoreHeader HeaderSize must be 12"));
+    }
+    if value.planes != 1 {
+        return Err(Error::invalid(0, "BitmapCoreHeader Planes must be 1"));
+    }
+    if value.bit_count_kind().is_none() {
+        return Err(Error::invalid(0, "BitmapCoreHeader BitCount is invalid"));
+    }
+    Ok(())
+}
+
+fn validate_rgb_quad(value: &RgbQuad) -> Result<()> {
+    if value.reserved != 0 {
+        return Err(Error::invalid(0, "RGBQuad Reserved must be 0"));
+    }
+    Ok(())
+}
+
+fn validate_bitmap_info_header(value: &BitmapInfoHeader) -> Result<()> {
+    if value.header_size < BITMAP_INFO_HEADER_SIZE {
+        return Err(Error::invalid(
+            0,
+            "BitmapInfoHeader HeaderSize must be at least 40",
+        ));
+    }
+    if value.width <= 0 {
+        return Err(Error::invalid(0, "BitmapInfoHeader Width must be positive"));
+    }
+    if value.height == 0 {
+        return Err(Error::invalid(
+            0,
+            "BitmapInfoHeader Height must not be zero",
+        ));
+    }
+    if value.planes != 1 {
+        return Err(Error::invalid(0, "BitmapInfoHeader Planes must be 1"));
+    }
+    if value.bit_count_kind().is_none() {
+        return Err(Error::invalid(0, "BitmapInfoHeader BitCount is invalid"));
+    }
+    if value.compression_kind().is_none() {
+        return Err(Error::invalid(0, "BitmapInfoHeader Compression is invalid"));
+    }
+    if value.is_top_down() && !value.compression_kind().unwrap().is_top_down_allowed() {
+        return Err(Error::invalid(
+            0,
+            "BitmapInfoHeader top-down DIB must not use a compressed format",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_bitmap_v4_header(value: &BitmapV4Header) -> Result<()> {
+    if value.base.header_size != BITMAP_V4_HEADER_SIZE {
+        return Err(Error::invalid(0, "BitmapV4Header HeaderSize must be 108"));
+    }
+    validate_bitmap_info_header(&value.base)?;
+    if value.color_space_kind().is_none() {
+        return Err(Error::invalid(
+            0,
+            "BitmapV4Header ColorSpaceType is invalid",
+        ));
+    }
+    if value.compression_kind() == Some(BitmapCompression::Bitfields) {
+        validate_bitfield_masks(
+            &[
+                value.red_mask,
+                value.green_mask,
+                value.blue_mask,
+                value.alpha_mask,
+            ],
+            "BitmapV4Header",
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_bitmap_v5_header(value: &BitmapV5Header) -> Result<()> {
+    if value.v4.base.header_size != BITMAP_V5_HEADER_SIZE {
+        return Err(Error::invalid(0, "BitmapV5Header HeaderSize must be 124"));
+    }
+    validate_bitmap_info_header(&value.v4.base)?;
+    if value.color_space_kind().is_none() && value.color_space_v5_kind().is_none() {
+        return Err(Error::invalid(
+            0,
+            "BitmapV5Header ColorSpaceType is invalid",
+        ));
+    }
+    if value.intent_kind().is_none() {
+        return Err(Error::invalid(0, "BitmapV5Header Intent is invalid"));
+    }
+    if value.compression_kind() == Some(BitmapCompression::Bitfields) {
+        validate_bitfield_masks(
+            &[
+                value.v4.red_mask,
+                value.v4.green_mask,
+                value.v4.blue_mask,
+                value.v4.alpha_mask,
+            ],
+            "BitmapV5Header",
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_bitfield_masks(masks: &[u32], name: &str) -> Result<()> {
+    let mut used_bits = 0u32;
+    for mask in masks.iter().copied().filter(|mask| *mask != 0) {
+        if !is_contiguous_bit_mask(mask) {
+            return Err(Error::invalid(
+                0,
+                format!("{name} BI_BITFIELDS mask bits must be contiguous"),
+            ));
+        }
+        if used_bits & mask != 0 {
+            return Err(Error::invalid(
+                0,
+                format!("{name} BI_BITFIELDS masks must not overlap"),
+            ));
+        }
+        used_bits |= mask;
+    }
+    Ok(())
+}
+
+fn is_contiguous_bit_mask(mask: u32) -> bool {
+    let shifted = mask >> mask.trailing_zeros();
+    shifted & (shifted + 1) == 0
 }
 
 #[cfg(test)]
@@ -309,8 +826,8 @@ mod tests {
             0xFC, 0xFF, 0xFF, 0xFF, // Height = -4
             1, 0, // Planes
             32, 0, // BitCount
-            5, 0, 0, 0, // BI_PNG
-            9, 0, 0, 0, // ImageSize
+            0, 0, 0, 0, // BI_RGB
+            0, 0, 0, 0, // ImageSize
             0, 0, 0, 0, // XPelsPerMeter
             0, 0, 0, 0, // YPelsPerMeter
             0, 0, 0, 0, // ColorUsed
@@ -324,7 +841,7 @@ mod tests {
         assert_eq!(base.width, 3);
         assert_eq!(base.height, -4);
         assert_eq!(base.bit_count_kind(), Some(BitmapBitCount::ThirtyTwo));
-        assert_eq!(base.compression_kind(), Some(BitmapCompression::Png));
+        assert_eq!(base.compression_kind(), Some(BitmapCompression::Rgb));
         assert!(base.is_top_down());
         assert!(extension.is_empty());
         assert_eq!(info.to_bytes().unwrap(), bytes);
@@ -333,7 +850,7 @@ mod tests {
     #[test]
     fn dib_info_preserves_header_extension_and_color_table() {
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(&BITMAP_V4_HEADER_SIZE.to_le_bytes());
+        bytes.extend_from_slice(&44u32.to_le_bytes());
         bytes.extend_from_slice(&1i32.to_le_bytes());
         bytes.extend_from_slice(&2i32.to_le_bytes());
         bytes.extend_from_slice(&1u16.to_le_bytes());
@@ -344,17 +861,281 @@ mod tests {
         bytes.extend_from_slice(&0i32.to_le_bytes());
         bytes.extend_from_slice(&0u32.to_le_bytes());
         bytes.extend_from_slice(&0u32.to_le_bytes());
-        bytes.extend(std::iter::repeat_n(0xAB, 68));
+        bytes.extend(std::iter::repeat_n(0xAB, 4));
         bytes.extend_from_slice(&[0x01, 0x02, 0x03, 0x04]);
 
         let info = DibBitmapInfo::read_from_slice(&bytes).unwrap();
         let DibHeader::Info { base, extension } = &info.header else {
             unreachable!();
         };
-        assert_eq!(base.header_size, BITMAP_V4_HEADER_SIZE);
-        assert_eq!(extension.len(), 68);
+        assert_eq!(base.header_size, 44);
+        assert_eq!(extension, &[0xAB; 4]);
         assert_eq!(info.color_table, [0x01, 0x02, 0x03, 0x04]);
         assert_eq!(info.to_bytes().unwrap(), bytes);
+    }
+
+    #[test]
+    fn dib_color_table_parses_rgbquads_and_palette_indices() {
+        let mut rgb_bytes = Vec::new();
+        rgb_bytes.extend_from_slice(&BITMAP_INFO_HEADER_SIZE.to_le_bytes());
+        rgb_bytes.extend_from_slice(&2i32.to_le_bytes());
+        rgb_bytes.extend_from_slice(&2i32.to_le_bytes());
+        rgb_bytes.extend_from_slice(&1u16.to_le_bytes());
+        rgb_bytes.extend_from_slice(&8u16.to_le_bytes());
+        rgb_bytes.extend_from_slice(&(BitmapCompression::Rgb.raw()).to_le_bytes());
+        rgb_bytes.extend_from_slice(&0u32.to_le_bytes());
+        rgb_bytes.extend_from_slice(&0i32.to_le_bytes());
+        rgb_bytes.extend_from_slice(&0i32.to_le_bytes());
+        rgb_bytes.extend_from_slice(&2u32.to_le_bytes());
+        rgb_bytes.extend_from_slice(&0u32.to_le_bytes());
+        rgb_bytes.extend_from_slice(&[0x10, 0x20, 0x30, 0x00]);
+        rgb_bytes.extend_from_slice(&[0x40, 0x50, 0x60, 0x00]);
+        rgb_bytes.extend_from_slice(&[0xAA, 0xBB]);
+
+        let info = DibBitmapInfo::read_from_slice(&rgb_bytes).unwrap();
+        let table = info.parse_color_table(DibColorUsage::RgbColors).unwrap();
+        let DibColorTable::RgbQuads {
+            entries,
+            trailing_data,
+        } = &table
+        else {
+            panic!("expected RGBQuad color table");
+        };
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].red, 0x30);
+        assert_eq!(entries[1].blue, 0x40);
+        assert_eq!(trailing_data, &[0xAA, 0xBB]);
+        assert_eq!(table.to_bytes().unwrap(), info.color_table);
+
+        let mut invalid_reserved = rgb_bytes;
+        invalid_reserved[43] = 0x7F;
+        let info = DibBitmapInfo::read_from_slice(&invalid_reserved).unwrap();
+        assert!(info.parse_color_table(DibColorUsage::RgbColors).is_err());
+        assert!(
+            DibColorTable::RgbQuads {
+                entries: vec![RgbQuad {
+                    blue: 1,
+                    green: 2,
+                    red: 3,
+                    reserved: 4,
+                }],
+                trailing_data: Vec::new(),
+            }
+            .to_bytes()
+            .is_err()
+        );
+
+        let pal_info = DibBitmapInfo {
+            header: DibHeader::Info {
+                base: BitmapInfoHeader {
+                    header_size: BITMAP_INFO_HEADER_SIZE,
+                    width: 2,
+                    height: 2,
+                    planes: 1,
+                    bit_count: BitmapBitCount::Eight.raw(),
+                    compression: BitmapCompression::Rgb.raw(),
+                    image_size: 0,
+                    x_pels_per_meter: 0,
+                    y_pels_per_meter: 0,
+                    color_used: 2,
+                    color_important: 0,
+                },
+                extension: Vec::new(),
+            },
+            color_table: vec![0x34, 0x12, 0x78, 0x56, 0xFE],
+        };
+        let table = pal_info
+            .parse_color_table(DibColorUsage::PalColors)
+            .unwrap();
+        let DibColorTable::PaletteIndices {
+            entries,
+            trailing_data,
+        } = &table
+        else {
+            panic!("expected palette index color table");
+        };
+        assert_eq!(entries, &[0x1234, 0x5678]);
+        assert_eq!(trailing_data, &[0xFE]);
+        assert_eq!(table.to_bytes().unwrap(), pal_info.color_table);
+    }
+
+    #[test]
+    fn dib_pal_indices_has_no_color_table() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&BITMAP_INFO_HEADER_SIZE.to_le_bytes());
+        bytes.extend_from_slice(&1i32.to_le_bytes());
+        bytes.extend_from_slice(&1i32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&(BitmapCompression::Rgb.raw()).to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&[0x80]);
+
+        let (info, bits_offset) =
+            DibBitmapInfo::read_packed_prefix_from_slice(&bytes, DibColorUsage::PalIndices)
+                .unwrap();
+        assert_eq!(bits_offset, BITMAP_INFO_HEADER_SIZE as usize);
+        assert!(info.color_table.is_empty());
+
+        let raw_info = DibBitmapInfo::read_from_slice(&bytes).unwrap();
+        let table = raw_info
+            .parse_color_table(DibColorUsage::PalIndices)
+            .unwrap();
+        assert_eq!(
+            table,
+            DibColorTable::None {
+                trailing_data: vec![0x80],
+            }
+        );
+        assert_eq!(table.to_bytes().unwrap(), [0x80]);
+    }
+
+    #[test]
+    fn bitmap_headers_validate_spec_fields() {
+        let base_info = [
+            40, 0, 0, 0, // HeaderSize
+            3, 0, 0, 0, // Width
+            4, 0, 0, 0, // Height
+            1, 0, // Planes
+            32, 0, // BitCount
+            0, 0, 0, 0, // BI_RGB
+            0, 0, 0, 0, // ImageSize
+            0, 0, 0, 0, // XPelsPerMeter
+            0, 0, 0, 0, // YPelsPerMeter
+            0, 0, 0, 0, // ColorUsed
+            0, 0, 0, 0, // ColorImportant
+        ];
+
+        let mut invalid_width = base_info;
+        invalid_width[4..8].copy_from_slice(&0i32.to_le_bytes());
+        assert!(DibBitmapInfo::read_from_slice(&invalid_width).is_err());
+
+        let mut invalid_height = base_info;
+        invalid_height[8..12].copy_from_slice(&0i32.to_le_bytes());
+        assert!(DibBitmapInfo::read_from_slice(&invalid_height).is_err());
+
+        let mut invalid_planes = base_info;
+        invalid_planes[12..14].copy_from_slice(&2u16.to_le_bytes());
+        assert!(DibBitmapInfo::read_from_slice(&invalid_planes).is_err());
+
+        let mut invalid_bit_count = base_info;
+        invalid_bit_count[14..16].copy_from_slice(&3u16.to_le_bytes());
+        assert!(DibBitmapInfo::read_from_slice(&invalid_bit_count).is_err());
+
+        let mut invalid_compression = base_info;
+        invalid_compression[16..20].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        assert!(DibBitmapInfo::read_from_slice(&invalid_compression).is_err());
+
+        let mut invalid_top_down_compressed = base_info;
+        invalid_top_down_compressed[8..12].copy_from_slice(&(-4i32).to_le_bytes());
+        invalid_top_down_compressed[16..20]
+            .copy_from_slice(&(BitmapCompression::Png.raw()).to_le_bytes());
+        assert!(DibBitmapInfo::read_from_slice(&invalid_top_down_compressed).is_err());
+
+        let info = DibBitmapInfo::read_from_slice(&base_info).unwrap();
+        let DibHeader::Info {
+            mut base,
+            extension,
+        } = info.header
+        else {
+            panic!("expected BitmapInfoHeader");
+        };
+        base.planes = 2;
+        assert!(
+            DibBitmapInfo {
+                header: DibHeader::Info { base, extension },
+                color_table: Vec::new(),
+            }
+            .to_bytes()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn bitmap_v4_and_v5_headers_parse_typed_fields() {
+        let mut v4 = Vec::new();
+        v4.extend_from_slice(&BITMAP_V4_HEADER_SIZE.to_le_bytes());
+        v4.extend_from_slice(&1i32.to_le_bytes());
+        v4.extend_from_slice(&(-2i32).to_le_bytes());
+        v4.extend_from_slice(&1u16.to_le_bytes());
+        v4.extend_from_slice(&32u16.to_le_bytes());
+        v4.extend_from_slice(&(BitmapCompression::Bitfields.raw()).to_le_bytes());
+        v4.extend_from_slice(&0u32.to_le_bytes());
+        v4.extend_from_slice(&0i32.to_le_bytes());
+        v4.extend_from_slice(&0i32.to_le_bytes());
+        v4.extend_from_slice(&0u32.to_le_bytes());
+        v4.extend_from_slice(&0u32.to_le_bytes());
+        v4.extend_from_slice(&0x00FF_0000u32.to_le_bytes());
+        v4.extend_from_slice(&0x0000_FF00u32.to_le_bytes());
+        v4.extend_from_slice(&0x0000_00FFu32.to_le_bytes());
+        v4.extend_from_slice(&0xFF00_0000u32.to_le_bytes());
+        v4.extend_from_slice(&(BitmapLogicalColorSpace::SRgb.raw()).to_le_bytes());
+        for value in 1i32..=9 {
+            v4.extend_from_slice(&value.to_le_bytes());
+        }
+        v4.extend_from_slice(&0x0001_0000u32.to_le_bytes());
+        v4.extend_from_slice(&0x0002_0000u32.to_le_bytes());
+        v4.extend_from_slice(&0x0003_0000u32.to_le_bytes());
+        v4.extend_from_slice(&[0xAA, 0xBB]);
+
+        let info = DibBitmapInfo::read_from_slice(&v4).unwrap();
+        let DibHeader::V4(header) = &info.header else {
+            panic!("expected BitmapV4Header");
+        };
+        assert_eq!(header.bit_count_kind(), Some(BitmapBitCount::ThirtyTwo));
+        assert_eq!(
+            header.compression_kind(),
+            Some(BitmapCompression::Bitfields)
+        );
+        assert_eq!(
+            header.color_space_kind(),
+            Some(BitmapLogicalColorSpace::SRgb)
+        );
+        assert!(header.is_top_down());
+        assert_eq!(header.red_mask, 0x00FF_0000);
+        assert_eq!(header.endpoints.red.x, 1);
+        assert_eq!(info.color_table, [0xAA, 0xBB]);
+        assert_eq!(info.to_bytes().unwrap(), v4);
+
+        let mut non_contiguous_mask = v4.clone();
+        non_contiguous_mask[40..44].copy_from_slice(&0x00F0_00F0u32.to_le_bytes());
+        assert!(DibBitmapInfo::read_from_slice(&non_contiguous_mask).is_err());
+
+        let mut overlapping_mask = v4.clone();
+        overlapping_mask[44..48].copy_from_slice(&0x00FF_0000u32.to_le_bytes());
+        assert!(DibBitmapInfo::read_from_slice(&overlapping_mask).is_err());
+
+        let mut v5 = v4[..BITMAP_V4_HEADER_SIZE as usize].to_vec();
+        v5[0..4].copy_from_slice(&BITMAP_V5_HEADER_SIZE.to_le_bytes());
+        let color_space_offset = 40 + 16;
+        v5[color_space_offset..color_space_offset + 4].copy_from_slice(
+            &BitmapLogicalColorSpaceV5::ProfileEmbedded
+                .raw()
+                .to_le_bytes(),
+        );
+        v5.extend_from_slice(&(BitmapGamutMappingIntent::Images.raw()).to_le_bytes());
+        v5.extend_from_slice(&124u32.to_le_bytes());
+        v5.extend_from_slice(&4u32.to_le_bytes());
+        v5.extend_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+        v5.extend_from_slice(&[1, 2, 3, 4]);
+
+        let info = DibBitmapInfo::read_from_slice(&v5).unwrap();
+        let DibHeader::V5(header) = &info.header else {
+            panic!("expected BitmapV5Header");
+        };
+        assert_eq!(
+            header.color_space_v5_kind(),
+            Some(BitmapLogicalColorSpaceV5::ProfileEmbedded)
+        );
+        assert_eq!(header.intent_kind(), Some(BitmapGamutMappingIntent::Images));
+        assert_eq!(header.profile_data, 124);
+        assert_eq!(header.profile_size, 4);
+        assert_eq!(info.color_table, [1, 2, 3, 4]);
+        assert_eq!(info.to_bytes().unwrap(), v5);
     }
 
     #[test]
@@ -380,5 +1161,16 @@ mod tests {
         let packed = dib.to_packed_bytes().unwrap();
         assert_eq!(&packed[..bitmap_info.len()], bitmap_info);
         assert_eq!(&packed[bitmap_info.len()..], bitmap_bits);
+
+        let mut invalid_size = bitmap_info;
+        invalid_size[20..24].copy_from_slice(&5u32.to_le_bytes());
+        assert!(DeviceIndependentBitmap::from_parts(&invalid_size, &bitmap_bits).is_err());
+
+        let mut invalid_dib = dib;
+        let DibHeader::Info { base, .. } = &mut invalid_dib.info.header else {
+            panic!("expected BitmapInfoHeader");
+        };
+        base.image_size = 5;
+        assert!(invalid_dib.to_packed_bytes().is_err());
     }
 }
