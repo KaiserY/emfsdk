@@ -2,7 +2,7 @@ use bitflags::bitflags;
 use emfsdk_derive::{SdkEnum, SdkObject};
 
 use crate::common::{Error, Reader, Result, SdkEnumValue, SdkRead, SdkSize, SdkWrite, Writer};
-use crate::types::{EmfPlusArgb, RectF, XForm};
+use crate::types::{EmfPlusArgb, PointL, RectF, XForm};
 
 pub const EMFPLUS_METAFILE_SIGNATURE: u32 = 0xDBC01;
 
@@ -163,6 +163,39 @@ pub struct EmfPlusDrawRectsData {
     pub rects: Vec<EmfPlusRect>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct EmfPlusDrawRectShapeData {
+    pub pen_id: u8,
+    pub rect: EmfPlusRect,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct EmfPlusFillRectShapeData {
+    pub brush: EmfPlusBrushRef,
+    pub rect: EmfPlusRect,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct EmfPlusDrawArcData {
+    pub pen_id: u8,
+    pub start_angle: f32,
+    pub sweep_angle: f32,
+    pub rect: EmfPlusRect,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct EmfPlusFillPieData {
+    pub brush: EmfPlusBrushRef,
+    pub start_angle: f32,
+    pub sweep_angle: f32,
+    pub rect: EmfPlusRect,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EmfPlusBrushObjectData {
+    pub brush: EmfPlusBrushRef,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, SdkObject)]
 #[sdk(format = "emfplus")]
 pub struct EmfPlusTranslateWorldTransformData {
@@ -177,16 +210,86 @@ pub struct EmfPlusScaleWorldTransformData {
     pub sy: f32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, SdkObject)]
+#[sdk(format = "emfplus")]
+pub struct EmfPlusRotateWorldTransformData {
+    pub angle: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, SdkObject)]
+#[sdk(format = "emfplus")]
+pub struct EmfPlusSetPageTransformData {
+    pub page_scale: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, SdkObject)]
+#[sdk(format = "emfplus")]
+pub struct EmfPlusSetClipRectData {
+    pub clip_rect: RectF,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, SdkObject)]
+#[sdk(format = "emfplus")]
+pub struct EmfPlusClearData {
+    pub color: EmfPlusArgb,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, SdkObject)]
+#[sdk(format = "emfplus")]
+pub struct EmfPlusStackIndexData {
+    pub stack_index: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, SdkObject)]
+#[sdk(format = "emfplus")]
+pub struct EmfPlusBeginContainerData {
+    pub dest_rect: RectF,
+    pub src_rect: RectF,
+    pub stack_index: u32,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum EmfPlusRecordData<'a> {
     Header(EmfPlusHeaderData),
+    Eof,
+    Comment(Vec<u8>),
+    GetDc,
+    Clear(EmfPlusClearData),
     FillRects(EmfPlusFillRectsData),
     DrawRects(EmfPlusDrawRectsData),
+    FillEllipse(EmfPlusFillRectShapeData),
+    DrawEllipse(EmfPlusDrawRectShapeData),
+    FillPie(EmfPlusFillPieData),
+    DrawPie(EmfPlusDrawArcData),
+    DrawArc(EmfPlusDrawArcData),
+    FillRegion(EmfPlusBrushObjectData),
+    FillPath(EmfPlusBrushObjectData),
+    DrawPath,
+    ResetClip,
+    SetClipRect(EmfPlusSetClipRectData),
+    SetClipPath,
+    SetClipRegion,
+    OffsetClip(EmfPlusTranslateWorldTransformData),
+    SetRenderingOrigin(PointL),
+    SetAntiAliasMode,
+    SetTextRenderingHint,
+    SetTextContrast,
+    SetInterpolationMode,
+    SetPixelOffsetMode,
+    SetCompositingMode,
+    SetCompositingQuality,
+    Save(EmfPlusStackIndexData),
+    Restore(EmfPlusStackIndexData),
+    BeginContainer(EmfPlusBeginContainerData),
+    BeginContainerNoParams(EmfPlusStackIndexData),
+    EndContainer(EmfPlusStackIndexData),
     SetWorldTransform(XForm),
     ResetWorldTransform,
     MultiplyWorldTransform(XForm),
     TranslateWorldTransform(EmfPlusTranslateWorldTransformData),
     ScaleWorldTransform(EmfPlusScaleWorldTransformData),
+    RotateWorldTransform(EmfPlusRotateWorldTransformData),
+    SetPageTransform(EmfPlusSetPageTransformData),
     Unknown(&'a EmfPlusRecord),
 }
 
@@ -215,6 +318,18 @@ impl EmfPlusRecord {
             Some(EmfPlusRecordType::Header) if self.data.len() >= 16 => {
                 EmfPlusRecordData::Header(EmfPlusHeaderData::read_from(&mut reader)?)
             }
+            Some(EmfPlusRecordType::Eof) => {
+                ensure_empty_data(&self.data, "EmfPlusEndOfFile")?;
+                EmfPlusRecordData::Eof
+            }
+            Some(EmfPlusRecordType::Comment) => EmfPlusRecordData::Comment(self.data.clone()),
+            Some(EmfPlusRecordType::GetDc) => {
+                ensure_empty_data(&self.data, "EmfPlusGetDC")?;
+                EmfPlusRecordData::GetDc
+            }
+            Some(EmfPlusRecordType::Clear) => {
+                EmfPlusRecordData::Clear(read_exact_object(&self.data, "EmfPlusClear")?)
+            }
             Some(EmfPlusRecordType::FillRects) if self.data.len() >= 8 => {
                 let brush = if flags.contains(EmfPlusRecordFlags::SOLID_COLOR) {
                     EmfPlusBrushRef::Color(EmfPlusArgb::read_from(&mut reader)?)
@@ -233,6 +348,133 @@ impl EmfPlusRecord {
                     rects,
                 })
             }
+            Some(EmfPlusRecordType::FillEllipse) if self.data.len() >= 12 => {
+                let brush = read_brush_ref(&mut reader, flags)?;
+                let rect = read_single_rect(&mut reader, flags, self.data.len() as u64)?;
+                EmfPlusRecordData::FillEllipse(EmfPlusFillRectShapeData { brush, rect })
+            }
+            Some(EmfPlusRecordType::DrawEllipse) if self.data.len() >= 8 => {
+                let rect = read_single_rect(&mut reader, flags, self.data.len() as u64)?;
+                EmfPlusRecordData::DrawEllipse(EmfPlusDrawRectShapeData {
+                    pen_id: flags.object_id(),
+                    rect,
+                })
+            }
+            Some(EmfPlusRecordType::FillPie) if self.data.len() >= 20 => {
+                let brush = read_brush_ref(&mut reader, flags)?;
+                let start_angle = reader.read_f32()?;
+                let sweep_angle = reader.read_f32()?;
+                let rect = read_single_rect(&mut reader, flags, self.data.len() as u64)?;
+                EmfPlusRecordData::FillPie(EmfPlusFillPieData {
+                    brush,
+                    start_angle,
+                    sweep_angle,
+                    rect,
+                })
+            }
+            Some(EmfPlusRecordType::DrawPie) if self.data.len() >= 16 => {
+                let start_angle = reader.read_f32()?;
+                let sweep_angle = reader.read_f32()?;
+                let rect = read_single_rect(&mut reader, flags, self.data.len() as u64)?;
+                EmfPlusRecordData::DrawPie(EmfPlusDrawArcData {
+                    pen_id: flags.object_id(),
+                    start_angle,
+                    sweep_angle,
+                    rect,
+                })
+            }
+            Some(EmfPlusRecordType::DrawArc) if self.data.len() >= 16 => {
+                let start_angle = reader.read_f32()?;
+                let sweep_angle = reader.read_f32()?;
+                let rect = read_single_rect(&mut reader, flags, self.data.len() as u64)?;
+                EmfPlusRecordData::DrawArc(EmfPlusDrawArcData {
+                    pen_id: flags.object_id(),
+                    start_angle,
+                    sweep_angle,
+                    rect,
+                })
+            }
+            Some(EmfPlusRecordType::FillRegion) if self.data.len() == 4 => {
+                EmfPlusRecordData::FillRegion(EmfPlusBrushObjectData {
+                    brush: read_brush_ref(&mut reader, flags)?,
+                })
+            }
+            Some(EmfPlusRecordType::FillPath) if self.data.len() == 4 => {
+                EmfPlusRecordData::FillPath(EmfPlusBrushObjectData {
+                    brush: read_brush_ref(&mut reader, flags)?,
+                })
+            }
+            Some(EmfPlusRecordType::DrawPath) => {
+                ensure_empty_data(&self.data, "EmfPlusDrawPath")?;
+                EmfPlusRecordData::DrawPath
+            }
+            Some(EmfPlusRecordType::ResetClip) => {
+                ensure_empty_data(&self.data, "EmfPlusResetClip")?;
+                EmfPlusRecordData::ResetClip
+            }
+            Some(EmfPlusRecordType::SetClipRect) => {
+                EmfPlusRecordData::SetClipRect(read_exact_object(&self.data, "EmfPlusSetClipRect")?)
+            }
+            Some(EmfPlusRecordType::SetClipPath) => {
+                ensure_empty_data(&self.data, "EmfPlusSetClipPath")?;
+                EmfPlusRecordData::SetClipPath
+            }
+            Some(EmfPlusRecordType::SetClipRegion) => {
+                ensure_empty_data(&self.data, "EmfPlusSetClipRegion")?;
+                EmfPlusRecordData::SetClipRegion
+            }
+            Some(EmfPlusRecordType::OffsetClip) => {
+                EmfPlusRecordData::OffsetClip(read_exact_object(&self.data, "EmfPlusOffsetClip")?)
+            }
+            Some(EmfPlusRecordType::SetRenderingOrigin) => EmfPlusRecordData::SetRenderingOrigin(
+                read_exact_object(&self.data, "EmfPlusSetRenderingOrigin")?,
+            ),
+            Some(EmfPlusRecordType::SetAntiAliasMode) => {
+                ensure_empty_data(&self.data, "EmfPlusSetAntiAliasMode")?;
+                EmfPlusRecordData::SetAntiAliasMode
+            }
+            Some(EmfPlusRecordType::SetTextRenderingHint) => {
+                ensure_empty_data(&self.data, "EmfPlusSetTextRenderingHint")?;
+                EmfPlusRecordData::SetTextRenderingHint
+            }
+            Some(EmfPlusRecordType::SetTextContrast) => {
+                ensure_empty_data(&self.data, "EmfPlusSetTextContrast")?;
+                EmfPlusRecordData::SetTextContrast
+            }
+            Some(EmfPlusRecordType::SetInterpolationMode) => {
+                ensure_empty_data(&self.data, "EmfPlusSetInterpolationMode")?;
+                EmfPlusRecordData::SetInterpolationMode
+            }
+            Some(EmfPlusRecordType::SetPixelOffsetMode) => {
+                ensure_empty_data(&self.data, "EmfPlusSetPixelOffsetMode")?;
+                EmfPlusRecordData::SetPixelOffsetMode
+            }
+            Some(EmfPlusRecordType::SetCompositingMode) => {
+                ensure_empty_data(&self.data, "EmfPlusSetCompositingMode")?;
+                EmfPlusRecordData::SetCompositingMode
+            }
+            Some(EmfPlusRecordType::SetCompositingQuality) => {
+                ensure_empty_data(&self.data, "EmfPlusSetCompositingQuality")?;
+                EmfPlusRecordData::SetCompositingQuality
+            }
+            Some(EmfPlusRecordType::Save) => {
+                EmfPlusRecordData::Save(read_exact_object(&self.data, "EmfPlusSave")?)
+            }
+            Some(EmfPlusRecordType::Restore) => {
+                EmfPlusRecordData::Restore(read_exact_object(&self.data, "EmfPlusRestore")?)
+            }
+            Some(EmfPlusRecordType::BeginContainer) => EmfPlusRecordData::BeginContainer(
+                read_exact_object(&self.data, "EmfPlusBeginContainer")?,
+            ),
+            Some(EmfPlusRecordType::BeginContainerNoParams) => {
+                EmfPlusRecordData::BeginContainerNoParams(read_exact_object(
+                    &self.data,
+                    "EmfPlusBeginContainerNoParams",
+                )?)
+            }
+            Some(EmfPlusRecordType::EndContainer) => EmfPlusRecordData::EndContainer(
+                read_exact_object(&self.data, "EmfPlusEndContainer")?,
+            ),
             Some(EmfPlusRecordType::SetWorldTransform) if self.data.len() >= 24 => {
                 EmfPlusRecordData::SetWorldTransform(XForm::read_from(&mut reader)?)
             }
@@ -250,6 +492,15 @@ impl EmfPlusRecord {
                     &mut reader,
                 )?)
             }
+            Some(EmfPlusRecordType::RotateWorldTransform) => {
+                EmfPlusRecordData::RotateWorldTransform(read_exact_object(
+                    &self.data,
+                    "EmfPlusRotateWorldTransform",
+                )?)
+            }
+            Some(EmfPlusRecordType::SetPageTransform) => EmfPlusRecordData::SetPageTransform(
+                read_exact_object(&self.data, "EmfPlusSetPageTransform")?,
+            ),
             _ => EmfPlusRecordData::Unknown(self),
         };
 
@@ -262,6 +513,10 @@ impl EmfPlusRecord {
             let mut writer = Writer::new(std::io::Cursor::new(&mut record_data));
             match data {
                 EmfPlusRecordData::Header(value) => value.write_to(&mut writer)?,
+                EmfPlusRecordData::Eof => {}
+                EmfPlusRecordData::Comment(value) => writer.write_all(value)?,
+                EmfPlusRecordData::GetDc => {}
+                EmfPlusRecordData::Clear(value) => value.write_to(&mut writer)?,
                 EmfPlusRecordData::FillRects(value) => {
                     write_brush_ref(&mut writer, value.brush)?;
                     writer.write_u32(len_to_u32(value.rects.len(), "EMF+ rect count")?)?;
@@ -271,11 +526,53 @@ impl EmfPlusRecord {
                     writer.write_u32(len_to_u32(value.rects.len(), "EMF+ rect count")?)?;
                     write_rects(&mut writer, &value.rects)?;
                 }
+                EmfPlusRecordData::FillEllipse(value) => {
+                    write_brush_ref(&mut writer, value.brush)?;
+                    write_rects(&mut writer, std::slice::from_ref(&value.rect))?;
+                }
+                EmfPlusRecordData::DrawEllipse(value) => {
+                    write_rects(&mut writer, std::slice::from_ref(&value.rect))?;
+                }
+                EmfPlusRecordData::FillPie(value) => {
+                    write_brush_ref(&mut writer, value.brush)?;
+                    writer.write_f32(value.start_angle)?;
+                    writer.write_f32(value.sweep_angle)?;
+                    write_rects(&mut writer, std::slice::from_ref(&value.rect))?;
+                }
+                EmfPlusRecordData::DrawPie(value) | EmfPlusRecordData::DrawArc(value) => {
+                    writer.write_f32(value.start_angle)?;
+                    writer.write_f32(value.sweep_angle)?;
+                    write_rects(&mut writer, std::slice::from_ref(&value.rect))?;
+                }
+                EmfPlusRecordData::FillRegion(value) | EmfPlusRecordData::FillPath(value) => {
+                    write_brush_ref(&mut writer, value.brush)?;
+                }
+                EmfPlusRecordData::DrawPath => {}
+                EmfPlusRecordData::ResetClip => {}
+                EmfPlusRecordData::SetClipRect(value) => value.write_to(&mut writer)?,
+                EmfPlusRecordData::SetClipPath => {}
+                EmfPlusRecordData::SetClipRegion => {}
+                EmfPlusRecordData::OffsetClip(value) => value.write_to(&mut writer)?,
+                EmfPlusRecordData::SetRenderingOrigin(value) => value.write_to(&mut writer)?,
+                EmfPlusRecordData::SetAntiAliasMode
+                | EmfPlusRecordData::SetTextRenderingHint
+                | EmfPlusRecordData::SetTextContrast
+                | EmfPlusRecordData::SetInterpolationMode
+                | EmfPlusRecordData::SetPixelOffsetMode
+                | EmfPlusRecordData::SetCompositingMode
+                | EmfPlusRecordData::SetCompositingQuality => {}
+                EmfPlusRecordData::Save(value)
+                | EmfPlusRecordData::Restore(value)
+                | EmfPlusRecordData::BeginContainerNoParams(value)
+                | EmfPlusRecordData::EndContainer(value) => value.write_to(&mut writer)?,
+                EmfPlusRecordData::BeginContainer(value) => value.write_to(&mut writer)?,
                 EmfPlusRecordData::SetWorldTransform(value) => value.write_to(&mut writer)?,
                 EmfPlusRecordData::ResetWorldTransform => {}
                 EmfPlusRecordData::MultiplyWorldTransform(value) => value.write_to(&mut writer)?,
                 EmfPlusRecordData::TranslateWorldTransform(value) => value.write_to(&mut writer)?,
                 EmfPlusRecordData::ScaleWorldTransform(value) => value.write_to(&mut writer)?,
+                EmfPlusRecordData::RotateWorldTransform(value) => value.write_to(&mut writer)?,
+                EmfPlusRecordData::SetPageTransform(value) => value.write_to(&mut writer)?,
                 EmfPlusRecordData::Unknown(record) => {
                     return Ok((*record).clone());
                 }
@@ -367,13 +664,45 @@ impl EmfPlusRecordData<'_> {
     pub fn record_type(&self) -> u16 {
         match self {
             Self::Header(_) => EmfPlusRecordType::Header.raw(),
+            Self::Eof => EmfPlusRecordType::Eof.raw(),
+            Self::Comment(_) => EmfPlusRecordType::Comment.raw(),
+            Self::GetDc => EmfPlusRecordType::GetDc.raw(),
+            Self::Clear(_) => EmfPlusRecordType::Clear.raw(),
             Self::FillRects(_) => EmfPlusRecordType::FillRects.raw(),
             Self::DrawRects(_) => EmfPlusRecordType::DrawRects.raw(),
+            Self::FillEllipse(_) => EmfPlusRecordType::FillEllipse.raw(),
+            Self::DrawEllipse(_) => EmfPlusRecordType::DrawEllipse.raw(),
+            Self::FillPie(_) => EmfPlusRecordType::FillPie.raw(),
+            Self::DrawPie(_) => EmfPlusRecordType::DrawPie.raw(),
+            Self::DrawArc(_) => EmfPlusRecordType::DrawArc.raw(),
+            Self::FillRegion(_) => EmfPlusRecordType::FillRegion.raw(),
+            Self::FillPath(_) => EmfPlusRecordType::FillPath.raw(),
+            Self::DrawPath => EmfPlusRecordType::DrawPath.raw(),
+            Self::ResetClip => EmfPlusRecordType::ResetClip.raw(),
+            Self::SetClipRect(_) => EmfPlusRecordType::SetClipRect.raw(),
+            Self::SetClipPath => EmfPlusRecordType::SetClipPath.raw(),
+            Self::SetClipRegion => EmfPlusRecordType::SetClipRegion.raw(),
+            Self::OffsetClip(_) => EmfPlusRecordType::OffsetClip.raw(),
+            Self::SetRenderingOrigin(_) => EmfPlusRecordType::SetRenderingOrigin.raw(),
+            Self::SetAntiAliasMode => EmfPlusRecordType::SetAntiAliasMode.raw(),
+            Self::SetTextRenderingHint => EmfPlusRecordType::SetTextRenderingHint.raw(),
+            Self::SetTextContrast => EmfPlusRecordType::SetTextContrast.raw(),
+            Self::SetInterpolationMode => EmfPlusRecordType::SetInterpolationMode.raw(),
+            Self::SetPixelOffsetMode => EmfPlusRecordType::SetPixelOffsetMode.raw(),
+            Self::SetCompositingMode => EmfPlusRecordType::SetCompositingMode.raw(),
+            Self::SetCompositingQuality => EmfPlusRecordType::SetCompositingQuality.raw(),
+            Self::Save(_) => EmfPlusRecordType::Save.raw(),
+            Self::Restore(_) => EmfPlusRecordType::Restore.raw(),
+            Self::BeginContainer(_) => EmfPlusRecordType::BeginContainer.raw(),
+            Self::BeginContainerNoParams(_) => EmfPlusRecordType::BeginContainerNoParams.raw(),
+            Self::EndContainer(_) => EmfPlusRecordType::EndContainer.raw(),
             Self::SetWorldTransform(_) => EmfPlusRecordType::SetWorldTransform.raw(),
             Self::ResetWorldTransform => EmfPlusRecordType::ResetWorldTransform.raw(),
             Self::MultiplyWorldTransform(_) => EmfPlusRecordType::MultiplyWorldTransform.raw(),
             Self::TranslateWorldTransform(_) => EmfPlusRecordType::TranslateWorldTransform.raw(),
             Self::ScaleWorldTransform(_) => EmfPlusRecordType::ScaleWorldTransform.raw(),
+            Self::RotateWorldTransform(_) => EmfPlusRecordType::RotateWorldTransform.raw(),
+            Self::SetPageTransform(_) => EmfPlusRecordType::SetPageTransform.raw(),
             Self::Unknown(record) => record.record_type,
         }
     }
@@ -381,13 +710,45 @@ impl EmfPlusRecordData<'_> {
     pub fn record_kind(&self) -> Option<EmfPlusRecordType> {
         match self {
             Self::Header(_) => Some(EmfPlusRecordType::Header),
+            Self::Eof => Some(EmfPlusRecordType::Eof),
+            Self::Comment(_) => Some(EmfPlusRecordType::Comment),
+            Self::GetDc => Some(EmfPlusRecordType::GetDc),
+            Self::Clear(_) => Some(EmfPlusRecordType::Clear),
             Self::FillRects(_) => Some(EmfPlusRecordType::FillRects),
             Self::DrawRects(_) => Some(EmfPlusRecordType::DrawRects),
+            Self::FillEllipse(_) => Some(EmfPlusRecordType::FillEllipse),
+            Self::DrawEllipse(_) => Some(EmfPlusRecordType::DrawEllipse),
+            Self::FillPie(_) => Some(EmfPlusRecordType::FillPie),
+            Self::DrawPie(_) => Some(EmfPlusRecordType::DrawPie),
+            Self::DrawArc(_) => Some(EmfPlusRecordType::DrawArc),
+            Self::FillRegion(_) => Some(EmfPlusRecordType::FillRegion),
+            Self::FillPath(_) => Some(EmfPlusRecordType::FillPath),
+            Self::DrawPath => Some(EmfPlusRecordType::DrawPath),
+            Self::ResetClip => Some(EmfPlusRecordType::ResetClip),
+            Self::SetClipRect(_) => Some(EmfPlusRecordType::SetClipRect),
+            Self::SetClipPath => Some(EmfPlusRecordType::SetClipPath),
+            Self::SetClipRegion => Some(EmfPlusRecordType::SetClipRegion),
+            Self::OffsetClip(_) => Some(EmfPlusRecordType::OffsetClip),
+            Self::SetRenderingOrigin(_) => Some(EmfPlusRecordType::SetRenderingOrigin),
+            Self::SetAntiAliasMode => Some(EmfPlusRecordType::SetAntiAliasMode),
+            Self::SetTextRenderingHint => Some(EmfPlusRecordType::SetTextRenderingHint),
+            Self::SetTextContrast => Some(EmfPlusRecordType::SetTextContrast),
+            Self::SetInterpolationMode => Some(EmfPlusRecordType::SetInterpolationMode),
+            Self::SetPixelOffsetMode => Some(EmfPlusRecordType::SetPixelOffsetMode),
+            Self::SetCompositingMode => Some(EmfPlusRecordType::SetCompositingMode),
+            Self::SetCompositingQuality => Some(EmfPlusRecordType::SetCompositingQuality),
+            Self::Save(_) => Some(EmfPlusRecordType::Save),
+            Self::Restore(_) => Some(EmfPlusRecordType::Restore),
+            Self::BeginContainer(_) => Some(EmfPlusRecordType::BeginContainer),
+            Self::BeginContainerNoParams(_) => Some(EmfPlusRecordType::BeginContainerNoParams),
+            Self::EndContainer(_) => Some(EmfPlusRecordType::EndContainer),
             Self::SetWorldTransform(_) => Some(EmfPlusRecordType::SetWorldTransform),
             Self::ResetWorldTransform => Some(EmfPlusRecordType::ResetWorldTransform),
             Self::MultiplyWorldTransform(_) => Some(EmfPlusRecordType::MultiplyWorldTransform),
             Self::TranslateWorldTransform(_) => Some(EmfPlusRecordType::TranslateWorldTransform),
             Self::ScaleWorldTransform(_) => Some(EmfPlusRecordType::ScaleWorldTransform),
+            Self::RotateWorldTransform(_) => Some(EmfPlusRecordType::RotateWorldTransform),
+            Self::SetPageTransform(_) => Some(EmfPlusRecordType::SetPageTransform),
             Self::Unknown(record) => record.record_kind(),
         }
     }
@@ -395,18 +756,45 @@ impl EmfPlusRecordData<'_> {
     pub fn sdk_size(&self) -> u64 {
         match self {
             Self::Header(value) => value.sdk_size(),
+            Self::Eof | Self::GetDc => 0,
+            Self::Comment(value) => value.len() as u64,
+            Self::Clear(value) => value.sdk_size(),
             Self::FillRects(value) => {
                 8 + value.rects.iter().map(EmfPlusRect::sdk_size).sum::<u64>()
             }
             Self::DrawRects(value) => {
                 4 + value.rects.iter().map(EmfPlusRect::sdk_size).sum::<u64>()
             }
+            Self::FillEllipse(value) => 4 + value.rect.sdk_size(),
+            Self::DrawEllipse(value) => value.rect.sdk_size(),
+            Self::FillPie(value) => 12 + value.rect.sdk_size(),
+            Self::DrawPie(value) | Self::DrawArc(value) => 8 + value.rect.sdk_size(),
+            Self::FillRegion(_) | Self::FillPath(_) => 4,
+            Self::DrawPath => 0,
+            Self::ResetClip | Self::SetClipPath | Self::SetClipRegion => 0,
+            Self::SetClipRect(value) => value.sdk_size(),
+            Self::OffsetClip(value) => value.sdk_size(),
+            Self::SetRenderingOrigin(value) => value.sdk_size(),
+            Self::SetAntiAliasMode
+            | Self::SetTextRenderingHint
+            | Self::SetTextContrast
+            | Self::SetInterpolationMode
+            | Self::SetPixelOffsetMode
+            | Self::SetCompositingMode
+            | Self::SetCompositingQuality => 0,
+            Self::Save(value)
+            | Self::Restore(value)
+            | Self::BeginContainerNoParams(value)
+            | Self::EndContainer(value) => value.sdk_size(),
+            Self::BeginContainer(value) => value.sdk_size(),
             Self::SetWorldTransform(value) | Self::MultiplyWorldTransform(value) => {
                 value.sdk_size()
             }
             Self::ResetWorldTransform => 0,
             Self::TranslateWorldTransform(value) => value.sdk_size(),
             Self::ScaleWorldTransform(value) => value.sdk_size(),
+            Self::RotateWorldTransform(value) => value.sdk_size(),
+            Self::SetPageTransform(value) => value.sdk_size(),
             Self::Unknown(record) => record.data.len() as u64,
         }
     }
@@ -428,9 +816,57 @@ impl EmfPlusRecordData<'_> {
                 );
                 set_rect_flags(next, &value.rects)
             }
+            Self::FillEllipse(value) => set_brush_and_rect_flags(flags, value.brush, &value.rect),
+            Self::DrawEllipse(value) => {
+                let next = EmfPlusRecordFlags::from_bits_retain(
+                    (flags.bits() & !EmfPlusRecordFlags::OBJECT_ID_MASK.bits())
+                        | u16::from(value.pen_id),
+                );
+                set_rect_flags(next, std::slice::from_ref(&value.rect))
+            }
+            Self::FillPie(value) => set_brush_and_rect_flags(flags, value.brush, &value.rect),
+            Self::DrawPie(value) | Self::DrawArc(value) => {
+                let next = EmfPlusRecordFlags::from_bits_retain(
+                    (flags.bits() & !EmfPlusRecordFlags::OBJECT_ID_MASK.bits())
+                        | u16::from(value.pen_id),
+                );
+                set_rect_flags(next, std::slice::from_ref(&value.rect))
+            }
+            Self::FillRegion(value) | Self::FillPath(value) => {
+                let mut next = flags;
+                next.set(
+                    EmfPlusRecordFlags::SOLID_COLOR,
+                    matches!(value.brush, EmfPlusBrushRef::Color(_)),
+                );
+                next
+            }
             _ => flags,
         }
     }
+}
+
+fn ensure_empty_data(data: &[u8], name: &str) -> Result<()> {
+    if data.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::invalid(
+            0,
+            format!("{name} record has unexpected payload"),
+        ))
+    }
+}
+
+fn read_exact_object<T: SdkRead>(data: &[u8], name: &str) -> Result<T> {
+    let mut reader = Reader::new(std::io::Cursor::new(data));
+    let value = T::read_from(&mut reader)?;
+    let position = reader.position()?;
+    if position != data.len() as u64 {
+        return Err(Error::invalid(
+            position,
+            format!("{name} record has trailing data"),
+        ));
+    }
+    Ok(value)
 }
 
 fn read_rects<R: std::io::Read + std::io::Seek>(
@@ -467,6 +903,26 @@ fn read_rects<R: std::io::Read + std::io::Seek>(
         });
     }
     Ok(rects)
+}
+
+fn read_single_rect<R: std::io::Read + std::io::Seek>(
+    reader: &mut Reader<R>,
+    flags: EmfPlusRecordFlags,
+    data_len: u64,
+) -> Result<EmfPlusRect> {
+    let mut rects = read_rects(reader, 1, flags, data_len)?;
+    Ok(rects.remove(0))
+}
+
+fn read_brush_ref<R: std::io::Read + std::io::Seek>(
+    reader: &mut Reader<R>,
+    flags: EmfPlusRecordFlags,
+) -> Result<EmfPlusBrushRef> {
+    if flags.contains(EmfPlusRecordFlags::SOLID_COLOR) {
+        Ok(EmfPlusBrushRef::Color(EmfPlusArgb::read_from(reader)?))
+    } else {
+        Ok(EmfPlusBrushRef::ObjectId(reader.read_u32()?))
+    }
 }
 
 fn write_brush_ref<W: std::io::Write + std::io::Seek>(
@@ -517,6 +973,19 @@ fn set_rect_flags(flags: EmfPlusRecordFlags, rects: &[EmfPlusRect]) -> EmfPlusRe
     let mut next = flags;
     next.set(EmfPlusRecordFlags::COMPRESSED, compressed);
     next
+}
+
+fn set_brush_and_rect_flags(
+    flags: EmfPlusRecordFlags,
+    brush: EmfPlusBrushRef,
+    rect: &EmfPlusRect,
+) -> EmfPlusRecordFlags {
+    let mut next = flags;
+    next.set(
+        EmfPlusRecordFlags::SOLID_COLOR,
+        matches!(brush, EmfPlusBrushRef::Color(_)),
+    );
+    set_rect_flags(next, std::slice::from_ref(rect))
 }
 
 fn len_to_u32(len: usize, name: &str) -> Result<u32> {
@@ -665,5 +1134,198 @@ mod tests {
         );
         assert!(record.flags().contains(EmfPlusRecordFlags::POST_MULTIPLY));
         assert_eq!(record.parse_data().unwrap(), data);
+    }
+
+    fn assert_emf_plus_data_roundtrip(data: EmfPlusRecordData<'_>, flags: EmfPlusRecordFlags) {
+        let record = EmfPlusRecord::from_data(&data, flags).unwrap();
+        assert_eq!(record.parse_data().unwrap(), data);
+        assert_eq!(record.data.len() as u64, data.sdk_size());
+    }
+
+    #[test]
+    fn emf_plus_control_comment_and_clear_records_roundtrip() {
+        assert_emf_plus_data_roundtrip(EmfPlusRecordData::Eof, EmfPlusRecordFlags::empty());
+        assert_emf_plus_data_roundtrip(EmfPlusRecordData::GetDc, EmfPlusRecordFlags::empty());
+        assert_emf_plus_data_roundtrip(
+            EmfPlusRecordData::Comment(vec![1, 2, 3, 4]),
+            EmfPlusRecordFlags::empty(),
+        );
+        assert_emf_plus_data_roundtrip(
+            EmfPlusRecordData::Clear(EmfPlusClearData {
+                color: EmfPlusArgb {
+                    blue: 1,
+                    green: 2,
+                    red: 3,
+                    alpha: 4,
+                },
+            }),
+            EmfPlusRecordFlags::empty(),
+        );
+    }
+
+    #[test]
+    fn emf_plus_clip_and_property_records_roundtrip() {
+        assert_emf_plus_data_roundtrip(EmfPlusRecordData::ResetClip, EmfPlusRecordFlags::empty());
+        assert_emf_plus_data_roundtrip(
+            EmfPlusRecordData::SetClipRect(EmfPlusSetClipRectData {
+                clip_rect: RectF {
+                    x: 1.0,
+                    y: 2.0,
+                    width: 3.0,
+                    height: 4.0,
+                },
+            }),
+            EmfPlusRecordFlags::from_bits_retain(0x0002),
+        );
+        assert_emf_plus_data_roundtrip(
+            EmfPlusRecordData::SetClipPath,
+            EmfPlusRecordFlags::from_bits_retain(0x0100),
+        );
+        assert_emf_plus_data_roundtrip(
+            EmfPlusRecordData::SetClipRegion,
+            EmfPlusRecordFlags::from_bits_retain(0x0200),
+        );
+        assert_emf_plus_data_roundtrip(
+            EmfPlusRecordData::OffsetClip(EmfPlusTranslateWorldTransformData { dx: 5.0, dy: 6.0 }),
+            EmfPlusRecordFlags::empty(),
+        );
+        assert_emf_plus_data_roundtrip(
+            EmfPlusRecordData::SetAntiAliasMode,
+            EmfPlusRecordFlags::from_bits_retain(0x0108),
+        );
+        assert_emf_plus_data_roundtrip(
+            EmfPlusRecordData::SetRenderingOrigin(PointL { x: 10, y: -20 }),
+            EmfPlusRecordFlags::empty(),
+        );
+    }
+
+    #[test]
+    fn emf_plus_state_and_transform_records_roundtrip() {
+        assert_emf_plus_data_roundtrip(
+            EmfPlusRecordData::Save(EmfPlusStackIndexData { stack_index: 7 }),
+            EmfPlusRecordFlags::empty(),
+        );
+        assert_emf_plus_data_roundtrip(
+            EmfPlusRecordData::Restore(EmfPlusStackIndexData { stack_index: 7 }),
+            EmfPlusRecordFlags::empty(),
+        );
+        assert_emf_plus_data_roundtrip(
+            EmfPlusRecordData::BeginContainerNoParams(EmfPlusStackIndexData { stack_index: 9 }),
+            EmfPlusRecordFlags::empty(),
+        );
+        assert_emf_plus_data_roundtrip(
+            EmfPlusRecordData::BeginContainer(EmfPlusBeginContainerData {
+                dest_rect: RectF {
+                    x: 0.0,
+                    y: 1.0,
+                    width: 2.0,
+                    height: 3.0,
+                },
+                src_rect: RectF {
+                    x: 4.0,
+                    y: 5.0,
+                    width: 6.0,
+                    height: 7.0,
+                },
+                stack_index: 11,
+            }),
+            EmfPlusRecordFlags::from_bits_retain(0x0002),
+        );
+        assert_emf_plus_data_roundtrip(
+            EmfPlusRecordData::EndContainer(EmfPlusStackIndexData { stack_index: 11 }),
+            EmfPlusRecordFlags::empty(),
+        );
+        assert_emf_plus_data_roundtrip(
+            EmfPlusRecordData::RotateWorldTransform(EmfPlusRotateWorldTransformData {
+                angle: 45.0,
+            }),
+            EmfPlusRecordFlags::POST_MULTIPLY,
+        );
+        assert_emf_plus_data_roundtrip(
+            EmfPlusRecordData::SetPageTransform(EmfPlusSetPageTransformData { page_scale: 1.5 }),
+            EmfPlusRecordFlags::from_bits_retain(0x0002),
+        );
+    }
+
+    #[test]
+    fn emf_plus_fixed_drawing_records_roundtrip() {
+        assert_emf_plus_data_roundtrip(
+            EmfPlusRecordData::FillEllipse(EmfPlusFillRectShapeData {
+                brush: EmfPlusBrushRef::Color(EmfPlusArgb {
+                    blue: 10,
+                    green: 20,
+                    red: 30,
+                    alpha: 255,
+                }),
+                rect: EmfPlusRect::Compressed(EmfPlusRectS {
+                    x: 1,
+                    y: 2,
+                    width: 3,
+                    height: 4,
+                }),
+            }),
+            EmfPlusRecordFlags::empty(),
+        );
+        assert_emf_plus_data_roundtrip(
+            EmfPlusRecordData::DrawEllipse(EmfPlusDrawRectShapeData {
+                pen_id: 6,
+                rect: EmfPlusRect::Float(RectF {
+                    x: 1.0,
+                    y: 2.0,
+                    width: 3.0,
+                    height: 4.0,
+                }),
+            }),
+            EmfPlusRecordFlags::empty(),
+        );
+        assert_emf_plus_data_roundtrip(
+            EmfPlusRecordData::FillPie(EmfPlusFillPieData {
+                brush: EmfPlusBrushRef::ObjectId(3),
+                start_angle: 45.0,
+                sweep_angle: 90.0,
+                rect: EmfPlusRect::Compressed(EmfPlusRectS {
+                    x: 5,
+                    y: 6,
+                    width: 7,
+                    height: 8,
+                }),
+            }),
+            EmfPlusRecordFlags::empty(),
+        );
+        assert_emf_plus_data_roundtrip(
+            EmfPlusRecordData::DrawArc(EmfPlusDrawArcData {
+                pen_id: 4,
+                start_angle: 10.0,
+                sweep_angle: -20.0,
+                rect: EmfPlusRect::Compressed(EmfPlusRectS {
+                    x: 9,
+                    y: 10,
+                    width: 11,
+                    height: 12,
+                }),
+            }),
+            EmfPlusRecordFlags::empty(),
+        );
+        assert_emf_plus_data_roundtrip(
+            EmfPlusRecordData::FillPath(EmfPlusBrushObjectData {
+                brush: EmfPlusBrushRef::ObjectId(2),
+            }),
+            EmfPlusRecordFlags::from_bits_retain(0x0300),
+        );
+        assert_emf_plus_data_roundtrip(
+            EmfPlusRecordData::FillRegion(EmfPlusBrushObjectData {
+                brush: EmfPlusBrushRef::Color(EmfPlusArgb {
+                    blue: 1,
+                    green: 2,
+                    red: 3,
+                    alpha: 4,
+                }),
+            }),
+            EmfPlusRecordFlags::from_bits_retain(0x0500),
+        );
+        assert_emf_plus_data_roundtrip(
+            EmfPlusRecordData::DrawPath,
+            EmfPlusRecordFlags::from_bits_retain(0x0500),
+        );
     }
 }
