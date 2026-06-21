@@ -797,7 +797,8 @@ pub enum EmfPlusWrapMode {
     Clamp = 0x0000_0004,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+#[sdk(validate = "validate_emf_plus_graphics_version")]
 pub struct EmfPlusGraphicsVersion {
     pub value: u32,
 }
@@ -844,30 +845,8 @@ impl EmfPlusGraphicsVersion {
     }
 }
 
-impl SdkRead for EmfPlusGraphicsVersion {
-    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
-        let value = Self {
-            value: reader.read_u32()?,
-        };
-        validate_graphics_version(&value, "EmfPlusGraphicsVersion")?;
-        Ok(value)
-    }
-}
-
-impl SdkWrite for EmfPlusGraphicsVersion {
-    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
-        validate_graphics_version(self, "EmfPlusGraphicsVersion")?;
-        writer.write_u32(self.value)
-    }
-}
-
-impl SdkSize for EmfPlusGraphicsVersion {
-    fn sdk_size(&self) -> u64 {
-        4
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+#[sdk(validate = "validate_emf_plus_header_data")]
 pub struct EmfPlusHeaderData {
     pub graphics_version: EmfPlusGraphicsVersion,
     pub emf_plus_flags: u32,
@@ -882,35 +861,6 @@ impl EmfPlusHeaderData {
 
     pub fn emf_plus_reserved_flags(&self) -> u32 {
         self.emf_plus_flags & !0x0000_0001
-    }
-}
-
-impl SdkRead for EmfPlusHeaderData {
-    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
-        let value = Self {
-            graphics_version: EmfPlusGraphicsVersion::read_from(reader)?,
-            emf_plus_flags: reader.read_u32()?,
-            logical_dpi_x: reader.read_u32()?,
-            logical_dpi_y: reader.read_u32()?,
-        };
-        validate_header_data(&value, EmfPlusRecordFlags::empty())?;
-        Ok(value)
-    }
-}
-
-impl SdkWrite for EmfPlusHeaderData {
-    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
-        validate_header_data(self, EmfPlusRecordFlags::empty())?;
-        self.graphics_version.write_to(writer)?;
-        writer.write_u32(self.emf_plus_flags)?;
-        writer.write_u32(self.logical_dpi_x)?;
-        writer.write_u32(self.logical_dpi_y)
-    }
-}
-
-impl SdkSize for EmfPlusHeaderData {
-    fn sdk_size(&self) -> u64 {
-        16
     }
 }
 
@@ -8006,6 +7956,10 @@ fn validate_graphics_version(value: &EmfPlusGraphicsVersion, name: &str) -> Resu
     Ok(())
 }
 
+fn validate_emf_plus_graphics_version(value: &EmfPlusGraphicsVersion) -> Result<()> {
+    validate_graphics_version(value, "EmfPlusGraphicsVersion")
+}
+
 fn require_count_at_least(count: usize, min: usize, name: &str) -> Result<()> {
     if count < min {
         return Err(Error::invalid(
@@ -8887,6 +8841,10 @@ fn validate_page_unit_flags(flags: EmfPlusRecordFlags, name: &str) -> Result<()>
 fn validate_header_data(value: &EmfPlusHeaderData, _flags: EmfPlusRecordFlags) -> Result<()> {
     validate_graphics_version(&value.graphics_version, "EmfPlusHeader")?;
     Ok(())
+}
+
+fn validate_emf_plus_header_data(value: &EmfPlusHeaderData) -> Result<()> {
+    validate_header_data(value, EmfPlusRecordFlags::empty())
 }
 
 fn validate_draw_image_src_unit(value: i32, name: &str) -> Result<()> {

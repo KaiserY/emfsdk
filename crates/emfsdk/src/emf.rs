@@ -2419,7 +2419,8 @@ pub struct EmrIntersectClipRect {
     pub rect: RectL,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+#[sdk(validate = "validate_emr_scale_viewport_ext_ex")]
 pub struct EmrScaleViewportExtEx {
     pub x_num: i32,
     pub x_denom: i32,
@@ -2427,94 +2428,13 @@ pub struct EmrScaleViewportExtEx {
     pub y_denom: i32,
 }
 
-impl SdkRead for EmrScaleViewportExtEx {
-    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
-        let value = Self {
-            x_num: reader.read_i32()?,
-            x_denom: reader.read_i32()?,
-            y_num: reader.read_i32()?,
-            y_denom: reader.read_i32()?,
-        };
-        validate_emr_scale_ext(
-            value.x_num,
-            value.x_denom,
-            value.y_num,
-            value.y_denom,
-            "EMR_SCALEVIEWPORTEXTEX",
-        )?;
-        Ok(value)
-    }
-}
-
-impl SdkWrite for EmrScaleViewportExtEx {
-    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
-        validate_emr_scale_ext(
-            self.x_num,
-            self.x_denom,
-            self.y_num,
-            self.y_denom,
-            "EMR_SCALEVIEWPORTEXTEX",
-        )?;
-        writer.write_i32(self.x_num)?;
-        writer.write_i32(self.x_denom)?;
-        writer.write_i32(self.y_num)?;
-        writer.write_i32(self.y_denom)
-    }
-}
-
-impl SdkSize for EmrScaleViewportExtEx {
-    fn sdk_size(&self) -> u64 {
-        16
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+#[sdk(validate = "validate_emr_scale_window_ext_ex")]
 pub struct EmrScaleWindowExtEx {
     pub x_num: i32,
     pub x_denom: i32,
     pub y_num: i32,
     pub y_denom: i32,
-}
-
-impl SdkRead for EmrScaleWindowExtEx {
-    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
-        let value = Self {
-            x_num: reader.read_i32()?,
-            x_denom: reader.read_i32()?,
-            y_num: reader.read_i32()?,
-            y_denom: reader.read_i32()?,
-        };
-        validate_emr_scale_ext(
-            value.x_num,
-            value.x_denom,
-            value.y_num,
-            value.y_denom,
-            "EMR_SCALEWINDOWEXTEX",
-        )?;
-        Ok(value)
-    }
-}
-
-impl SdkWrite for EmrScaleWindowExtEx {
-    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
-        validate_emr_scale_ext(
-            self.x_num,
-            self.x_denom,
-            self.y_num,
-            self.y_denom,
-            "EMR_SCALEWINDOWEXTEX",
-        )?;
-        writer.write_i32(self.x_num)?;
-        writer.write_i32(self.x_denom)?;
-        writer.write_i32(self.y_num)?;
-        writer.write_i32(self.y_denom)
-    }
-}
-
-impl SdkSize for EmrScaleWindowExtEx {
-    fn sdk_size(&self) -> u64 {
-        16
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
@@ -3530,7 +3450,8 @@ fn validate_log_font_w(value: &LogFontW) -> Result<()> {
     Ok(())
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+#[sdk(validate = "validate_panose")]
 pub struct Panose {
     pub family_type: u8,
     pub serif_style: u8,
@@ -3589,48 +3510,7 @@ impl Panose {
         &self,
         writer: &mut Writer<W>,
     ) -> Result<()> {
-        validate_panose(self)?;
-        writer.write_u8(self.family_type)?;
-        writer.write_u8(self.serif_style)?;
-        writer.write_u8(self.weight)?;
-        writer.write_u8(self.proportion)?;
-        writer.write_u8(self.contrast)?;
-        writer.write_u8(self.stroke_variation)?;
-        writer.write_u8(self.arm_style)?;
-        writer.write_u8(self.letterform)?;
-        writer.write_u8(self.midline)?;
-        writer.write_u8(self.x_height)
-    }
-}
-
-impl SdkRead for Panose {
-    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
-        let value = Self {
-            family_type: reader.read_u8()?,
-            serif_style: reader.read_u8()?,
-            weight: reader.read_u8()?,
-            proportion: reader.read_u8()?,
-            contrast: reader.read_u8()?,
-            stroke_variation: reader.read_u8()?,
-            arm_style: reader.read_u8()?,
-            letterform: reader.read_u8()?,
-            midline: reader.read_u8()?,
-            x_height: reader.read_u8()?,
-        };
-        validate_panose(&value)?;
-        Ok(value)
-    }
-}
-
-impl SdkWrite for Panose {
-    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
-        Panose::write_to(self, writer)
-    }
-}
-
-impl SdkSize for Panose {
-    fn sdk_size(&self) -> u64 {
-        10
+        <Self as SdkWrite>::write_to(self, writer)
     }
 }
 
@@ -5045,6 +4925,26 @@ fn validate_emr_scale_ext(
     Ok(())
 }
 
+fn validate_emr_scale_viewport_ext_ex(value: &EmrScaleViewportExtEx) -> Result<()> {
+    validate_emr_scale_ext(
+        value.x_num,
+        value.x_denom,
+        value.y_num,
+        value.y_denom,
+        "EMR_SCALEVIEWPORTEXTEX",
+    )
+}
+
+fn validate_emr_scale_window_ext_ex(value: &EmrScaleWindowExtEx) -> Result<()> {
+    validate_emr_scale_ext(
+        value.x_num,
+        value.x_denom,
+        value.y_num,
+        value.y_denom,
+        "EMR_SCALEWINDOWEXTEX",
+    )
+}
+
 fn validate_emr_set_color_adjustment(value: &EmrSetColorAdjustment) -> Result<()> {
     if value.size != 24 {
         return Err(Error::invalid(0, "EMR_SETCOLORADJUSTMENT Size must be 24"));
@@ -6252,7 +6152,8 @@ impl EmrGlsBoundedRecord {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+#[sdk(validate = "validate_emr_pixel_format")]
 pub struct EmrPixelFormat {
     pub n_size: u16,
     pub n_version: u16,
@@ -6280,79 +6181,6 @@ pub struct EmrPixelFormat {
     pub layer_mask: u32,
     pub visible_mask: u32,
     pub damage_mask: u32,
-}
-
-impl SdkRead for EmrPixelFormat {
-    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
-        let value = Self {
-            n_size: reader.read_u16()?,
-            n_version: reader.read_u16()?,
-            flags: reader.read_u32()?,
-            pixel_type: reader.read_u8()?,
-            color_bits: reader.read_u8()?,
-            red_bits: reader.read_u8()?,
-            red_shift: reader.read_u8()?,
-            green_bits: reader.read_u8()?,
-            green_shift: reader.read_u8()?,
-            blue_bits: reader.read_u8()?,
-            blue_shift: reader.read_u8()?,
-            alpha_bits: reader.read_u8()?,
-            alpha_shift: reader.read_u8()?,
-            accum_bits: reader.read_u8()?,
-            accum_red_bits: reader.read_u8()?,
-            accum_green_bits: reader.read_u8()?,
-            accum_blue_bits: reader.read_u8()?,
-            accum_alpha_bits: reader.read_u8()?,
-            depth_bits: reader.read_u8()?,
-            stencil_bits: reader.read_u8()?,
-            aux_buffers: reader.read_u8()?,
-            layer_type: reader.read_u8()?,
-            reserved: reader.read_u8()?,
-            layer_mask: reader.read_u32()?,
-            visible_mask: reader.read_u32()?,
-            damage_mask: reader.read_u32()?,
-        };
-        validate_emr_pixel_format(&value)?;
-        Ok(value)
-    }
-}
-
-impl SdkWrite for EmrPixelFormat {
-    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
-        validate_emr_pixel_format(self)?;
-        writer.write_u16(self.n_size)?;
-        writer.write_u16(self.n_version)?;
-        writer.write_u32(self.flags)?;
-        writer.write_u8(self.pixel_type)?;
-        writer.write_u8(self.color_bits)?;
-        writer.write_u8(self.red_bits)?;
-        writer.write_u8(self.red_shift)?;
-        writer.write_u8(self.green_bits)?;
-        writer.write_u8(self.green_shift)?;
-        writer.write_u8(self.blue_bits)?;
-        writer.write_u8(self.blue_shift)?;
-        writer.write_u8(self.alpha_bits)?;
-        writer.write_u8(self.alpha_shift)?;
-        writer.write_u8(self.accum_bits)?;
-        writer.write_u8(self.accum_red_bits)?;
-        writer.write_u8(self.accum_green_bits)?;
-        writer.write_u8(self.accum_blue_bits)?;
-        writer.write_u8(self.accum_alpha_bits)?;
-        writer.write_u8(self.depth_bits)?;
-        writer.write_u8(self.stencil_bits)?;
-        writer.write_u8(self.aux_buffers)?;
-        writer.write_u8(self.layer_type)?;
-        writer.write_u8(self.reserved)?;
-        writer.write_u32(self.layer_mask)?;
-        writer.write_u32(self.visible_mask)?;
-        writer.write_u32(self.damage_mask)
-    }
-}
-
-impl SdkSize for EmrPixelFormat {
-    fn sdk_size(&self) -> u64 {
-        u64::from(Self::SIZE)
-    }
 }
 
 impl EmrPixelFormat {
@@ -6387,41 +6215,13 @@ pub struct EmrForceUfiMapping {
 
 pub type UniversalFontId = EmrForceUfiMapping;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+#[sdk(validate = "validate_emr_color_correct_palette")]
 pub struct EmrColorCorrectPalette {
     pub palette_index: u32,
     pub first_entry: u32,
     pub palette_entries: u32,
     pub reserved: u32,
-}
-
-impl SdkRead for EmrColorCorrectPalette {
-    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
-        let value = Self {
-            palette_index: reader.read_u32()?,
-            first_entry: reader.read_u32()?,
-            palette_entries: reader.read_u32()?,
-            reserved: reader.read_u32()?,
-        };
-        validate_emr_color_correct_palette(&value)?;
-        Ok(value)
-    }
-}
-
-impl SdkWrite for EmrColorCorrectPalette {
-    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
-        validate_emr_color_correct_palette(self)?;
-        writer.write_u32(self.palette_index)?;
-        writer.write_u32(self.first_entry)?;
-        writer.write_u32(self.palette_entries)?;
-        writer.write_u32(self.reserved)
-    }
-}
-
-impl SdkSize for EmrColorCorrectPalette {
-    fn sdk_size(&self) -> u64 {
-        16
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

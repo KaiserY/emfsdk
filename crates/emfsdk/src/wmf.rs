@@ -2967,7 +2967,8 @@ impl WmfPaletteObject {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, SdkObject)]
+#[sdk(validate = "validate_wmf_bitmap16_header")]
 pub struct WmfBitmap16Header {
     pub bitmap_type: i16,
     pub width: i16,
@@ -3002,39 +3003,6 @@ impl WmfBitmap16Header {
         self.computed_width_bytes()?
             .checked_mul(height)
             .ok_or_else(|| Error::invalid(0, "Bitmap16 bits size overflows"))
-    }
-}
-
-impl SdkRead for WmfBitmap16Header {
-    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
-        let value = Self {
-            bitmap_type: reader.read_i16()?,
-            width: reader.read_i16()?,
-            height: reader.read_i16()?,
-            width_bytes: reader.read_i16()?,
-            planes: reader.read_u8()?,
-            bits_pixel: reader.read_u8()?,
-        };
-        validate_wmf_bitmap16_header(&value)?;
-        Ok(value)
-    }
-}
-
-impl SdkWrite for WmfBitmap16Header {
-    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
-        validate_wmf_bitmap16_header(self)?;
-        writer.write_i16(self.bitmap_type)?;
-        writer.write_i16(self.width)?;
-        writer.write_i16(self.height)?;
-        writer.write_i16(self.width_bytes)?;
-        writer.write_u8(self.planes)?;
-        writer.write_u8(self.bits_pixel)
-    }
-}
-
-impl SdkSize for WmfBitmap16Header {
-    fn sdk_size(&self) -> u64 {
-        10
     }
 }
 
