@@ -1313,7 +1313,7 @@ pub enum WmfRecordData<'a> {
     Eof,
     RealizePalette,
     SaveDc,
-    SetRelabs(Vec<u8>),
+    SetRelabs,
     SetBkMode(WmfU16Record),
     SetMapMode(WmfU16Record),
     SetRop2(WmfU16Record),
@@ -1399,7 +1399,10 @@ impl<'a> WmfRecordData<'a> {
                 ensure_no_data(data, "META_SAVEDC")?;
                 Self::SaveDc
             }
-            Some(WmfRecordFunction::SetRelabs) => Self::SetRelabs(data.to_vec()),
+            Some(WmfRecordFunction::SetRelabs) => {
+                ensure_no_data(data, "META_SETRELABS")?;
+                Self::SetRelabs
+            }
             Some(WmfRecordFunction::SetBkMode) => {
                 let value = WmfU16Record::read_data(data)?;
                 validate_wmf_set_bk_mode(&value)?;
@@ -1431,7 +1434,9 @@ impl<'a> WmfRecordData<'a> {
                 Self::SetTextAlign(value)
             }
             Some(WmfRecordFunction::SetTextCharExtra) => {
-                Self::SetTextCharExtra(WmfU16Record::read_data(data)?)
+                let value = WmfU16Record::read_data(data)?;
+                validate_wmf_set_text_char_extra(&value)?;
+                Self::SetTextCharExtra(value)
             }
             Some(WmfRecordFunction::SetLayout) => {
                 let value = WmfU16Record::read_data(data)?;
@@ -1620,9 +1625,7 @@ impl<'a> WmfRecordData<'a> {
             Self::Eof => no_data_record(WmfRecordFunction::Eof),
             Self::RealizePalette => no_data_record(WmfRecordFunction::RealizePalette),
             Self::SaveDc => no_data_record(WmfRecordFunction::SaveDc),
-            Self::SetRelabs(data) => {
-                WmfRecord::new(WmfRecordFunction::SetRelabs.raw(), data.clone())
-            }
+            Self::SetRelabs => no_data_record(WmfRecordFunction::SetRelabs),
             Self::SetBkMode(value) => {
                 validate_wmf_set_bk_mode(value)?;
                 u16_record(WmfRecordFunction::SetBkMode, value)?
@@ -1648,6 +1651,7 @@ impl<'a> WmfRecordData<'a> {
                 u16_record(WmfRecordFunction::SetTextAlign, value)?
             }
             Self::SetTextCharExtra(value) => {
+                validate_wmf_set_text_char_extra(value)?;
                 object_record(WmfRecordFunction::SetTextCharExtra, value)?
             }
             Self::SetLayout(value) => {
@@ -1785,7 +1789,10 @@ impl<'a> WmfRecordData<'a> {
             Self::Escape(value) => {
                 WmfRecord::new(WmfRecordFunction::Escape.raw(), value.write_data()?)
             }
-            Self::Unknown(record) => (*record).clone(),
+            Self::Unknown(record) => {
+                validate_unknown_wmf_record(record)?;
+                (*record).clone()
+            }
         })
     }
 }
@@ -1907,13 +1914,41 @@ pub struct WmfRectRecord {
     pub left: i16,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, SdkObject)]
-#[sdk(format = "wmf")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WmfScaleExtRecord {
     pub y_denom: i16,
     pub y_num: i16,
     pub x_denom: i16,
     pub x_num: i16,
+}
+
+impl SdkRead for WmfScaleExtRecord {
+    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
+        let value = Self {
+            y_denom: reader.read_i16()?,
+            y_num: reader.read_i16()?,
+            x_denom: reader.read_i16()?,
+            x_num: reader.read_i16()?,
+        };
+        validate_wmf_scale_ext_record(&value)?;
+        Ok(value)
+    }
+}
+
+impl SdkWrite for WmfScaleExtRecord {
+    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+        validate_wmf_scale_ext_record(self)?;
+        writer.write_i16(self.y_denom)?;
+        writer.write_i16(self.y_num)?;
+        writer.write_i16(self.x_denom)?;
+        writer.write_i16(self.x_num)
+    }
+}
+
+impl SdkSize for WmfScaleExtRecord {
+    fn sdk_size(&self) -> u64 {
+        8
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, SdkObject)]
@@ -1955,8 +1990,7 @@ pub struct WmfFloodFillRecord {
     pub x_start: i16,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, SdkObject)]
-#[sdk(format = "wmf")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WmfExtFloodFillRecord {
     pub mode: u16,
     pub color: ColorRef,
@@ -1970,6 +2004,35 @@ impl WmfExtFloodFillRecord {
     }
 }
 
+impl SdkRead for WmfExtFloodFillRecord {
+    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
+        let value = Self {
+            mode: reader.read_u16()?,
+            color: ColorRef::read_from(reader)?,
+            y: reader.read_i16()?,
+            x: reader.read_i16()?,
+        };
+        validate_wmf_ext_flood_fill(&value)?;
+        Ok(value)
+    }
+}
+
+impl SdkWrite for WmfExtFloodFillRecord {
+    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+        validate_wmf_ext_flood_fill(self)?;
+        writer.write_u16(self.mode)?;
+        self.color.write_to(writer)?;
+        writer.write_i16(self.y)?;
+        writer.write_i16(self.x)
+    }
+}
+
+impl SdkSize for WmfExtFloodFillRecord {
+    fn sdk_size(&self) -> u64 {
+        10
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, SdkObject)]
 #[sdk(format = "wmf")]
 pub struct WmfSetPixelRecord {
@@ -1978,8 +2041,7 @@ pub struct WmfSetPixelRecord {
     pub x: i16,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, SdkObject)]
-#[sdk(format = "wmf")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WmfPatBltRecord {
     pub raster_operation: u32,
     pub height: i16,
@@ -1998,9 +2060,38 @@ impl WmfPatBltRecord {
     }
 
     fn read_data(data: &[u8]) -> Result<Self> {
-        let value: Self = read_object(data, "META_PATBLT")?;
+        read_object(data, "META_PATBLT")
+    }
+}
+
+impl SdkRead for WmfPatBltRecord {
+    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
+        let value = Self {
+            raster_operation: reader.read_u32()?,
+            height: reader.read_i16()?,
+            width: reader.read_i16()?,
+            y_left: reader.read_i16()?,
+            x_left: reader.read_i16()?,
+        };
         validate_wmf_ternary_raster_operation(value.raster_operation, "META_PATBLT")?;
         Ok(value)
+    }
+}
+
+impl SdkWrite for WmfPatBltRecord {
+    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+        validate_wmf_ternary_raster_operation(self.raster_operation, "META_PATBLT")?;
+        writer.write_u32(self.raster_operation)?;
+        writer.write_i16(self.height)?;
+        writer.write_i16(self.width)?;
+        writer.write_i16(self.y_left)?;
+        writer.write_i16(self.x_left)
+    }
+}
+
+impl SdkSize for WmfPatBltRecord {
+    fn sdk_size(&self) -> u64 {
+        12
     }
 }
 
@@ -2648,8 +2739,7 @@ pub struct WmfObjectIndexRecord {
     pub index: u16,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, SdkObject)]
-#[sdk(format = "wmf")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WmfLogBrushObject {
     pub brush_style: u16,
     pub color_ref: ColorRef,
@@ -2664,10 +2754,43 @@ impl WmfLogBrushObject {
     pub fn hatch_style_kind(&self) -> Option<WmfHatchStyle> {
         WmfHatchStyle::from_raw(self.brush_hatch)
     }
+
+    pub fn write_to<W: std::io::Write + std::io::Seek>(
+        &self,
+        writer: &mut Writer<W>,
+    ) -> Result<()> {
+        validate_wmf_log_brush_object(self)?;
+        writer.write_u16(self.brush_style)?;
+        self.color_ref.write_to(writer)?;
+        writer.write_u16(self.brush_hatch)
+    }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, SdkObject)]
-#[sdk(format = "wmf")]
+impl SdkRead for WmfLogBrushObject {
+    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
+        let value = Self {
+            brush_style: reader.read_u16()?,
+            color_ref: ColorRef::read_from(reader)?,
+            brush_hatch: reader.read_u16()?,
+        };
+        validate_wmf_log_brush_object(&value)?;
+        Ok(value)
+    }
+}
+
+impl SdkWrite for WmfLogBrushObject {
+    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+        WmfLogBrushObject::write_to(self, writer)
+    }
+}
+
+impl SdkSize for WmfLogBrushObject {
+    fn sdk_size(&self) -> u64 {
+        8
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WmfPenObject {
     pub pen_style: u16,
     pub width: PointS,
@@ -2713,6 +2836,40 @@ impl WmfPenObject {
 
     pub const fn pen_reserved_bits(&self) -> u16 {
         self.pen_style & 0x00F0
+    }
+
+    pub fn write_to<W: std::io::Write + std::io::Seek>(
+        &self,
+        writer: &mut Writer<W>,
+    ) -> Result<()> {
+        validate_wmf_pen_object(self)?;
+        writer.write_u16(self.pen_style)?;
+        self.width.write_to(writer)?;
+        self.color_ref.write_to(writer)
+    }
+}
+
+impl SdkRead for WmfPenObject {
+    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
+        let value = Self {
+            pen_style: reader.read_u16()?,
+            width: PointS::read_from(reader)?,
+            color_ref: ColorRef::read_from(reader)?,
+        };
+        validate_wmf_pen_object(&value)?;
+        Ok(value)
+    }
+}
+
+impl SdkWrite for WmfPenObject {
+    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+        WmfPenObject::write_to(self, writer)
+    }
+}
+
+impl SdkSize for WmfPenObject {
+    fn sdk_size(&self) -> u64 {
+        10
     }
 }
 
@@ -2813,7 +2970,7 @@ impl SdkRead for WmfFontObject {
         let quality = reader.read_u8()?;
         let pitch_and_family = reader.read_u8()?;
         let face_name = reader.read_array::<32>()?;
-        Ok(Self {
+        let value = Self {
             height,
             width,
             escapement,
@@ -2828,12 +2985,15 @@ impl SdkRead for WmfFontObject {
             quality,
             pitch_and_family,
             face_name,
-        })
+        };
+        validate_wmf_font_object(&value)?;
+        Ok(value)
     }
 }
 
 impl SdkWrite for WmfFontObject {
     fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+        validate_wmf_font_object(self)?;
         writer.write_i16(self.height)?;
         writer.write_i16(self.width)?;
         writer.write_i16(self.escapement)?;
@@ -2851,8 +3011,13 @@ impl SdkWrite for WmfFontObject {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, SdkObject)]
-#[sdk(format = "wmf")]
+impl SdkSize for WmfFontObject {
+    fn sdk_size(&self) -> u64 {
+        50
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WmfPaletteEntry {
     pub red: u8,
     pub green: u8,
@@ -2881,6 +3046,52 @@ impl WmfPaletteEntry {
 
     pub fn invalid_value_bits(&self) -> u8 {
         self.values & !WmfPaletteEntryFlags::all().bits()
+    }
+
+    pub fn write_to<W: std::io::Write + std::io::Seek>(
+        &self,
+        writer: &mut Writer<W>,
+    ) -> Result<()> {
+        if self.flag_kind().is_none() {
+            return Err(Error::invalid(
+                0,
+                "WMF PaletteEntry Values is not a valid PaletteEntryFlag",
+            ));
+        }
+        writer.write_u8(self.red)?;
+        writer.write_u8(self.green)?;
+        writer.write_u8(self.blue)?;
+        writer.write_u8(self.values)
+    }
+}
+
+impl SdkRead for WmfPaletteEntry {
+    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
+        let value = Self {
+            red: reader.read_u8()?,
+            green: reader.read_u8()?,
+            blue: reader.read_u8()?,
+            values: reader.read_u8()?,
+        };
+        if value.flag_kind().is_none() {
+            return Err(Error::invalid(
+                0,
+                "WMF PaletteEntry Values is not a valid PaletteEntryFlag",
+            ));
+        }
+        Ok(value)
+    }
+}
+
+impl SdkWrite for WmfPaletteEntry {
+    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+        WmfPaletteEntry::write_to(self, writer)
+    }
+}
+
+impl SdkSize for WmfPaletteEntry {
+    fn sdk_size(&self) -> u64 {
+        4
     }
 }
 
@@ -3367,6 +3578,40 @@ impl WmfExtTextOutRecord {
         if data.len() < 8 {
             return Err(Error::invalid(0, "META_EXTTEXTOUT record is too short"));
         }
+
+        let mut reader = Reader::new(Cursor::new(data));
+        let _y = reader.read_i16()?;
+        let _x = reader.read_i16()?;
+        let string_length = reader.read_i16()?;
+        if string_length < 0 {
+            return Err(Error::invalid(
+                0,
+                "META_EXTTEXTOUT has negative string length",
+            ));
+        }
+        let options = WmfExtTextOutOptions::from_bits_retain(reader.read_u16()?);
+        let string_len = string_length as usize;
+        let padded_string_len = string_len + usize::from(!string_len.is_multiple_of(2));
+        let needs_rectangle =
+            options.intersects(WmfExtTextOutOptions::OPAQUE | WmfExtTextOutOptions::CLIPPED);
+
+        if needs_rectangle {
+            return Self::read_data_with_rectangle(data, true);
+        }
+
+        match Self::read_data_with_rectangle(data, false) {
+            Ok(value) => Ok(value),
+            Err(no_rectangle_error) if data.len() >= 16 + padded_string_len => {
+                match Self::read_data_with_rectangle(data, true) {
+                    Ok(value) => Ok(value),
+                    Err(_) => Err(no_rectangle_error),
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn read_data_with_rectangle(data: &[u8], include_rectangle: bool) -> Result<Self> {
         let mut reader = Reader::new(Cursor::new(data));
         let y = reader.read_i16()?;
         let x = reader.read_i16()?;
@@ -3380,9 +3625,10 @@ impl WmfExtTextOutRecord {
         let options = WmfExtTextOutOptions::from_bits_retain(reader.read_u16()?);
         let string_len = string_length as usize;
         let padded_string_len = string_len + usize::from(!string_len.is_multiple_of(2));
-        let needs_rectangle =
-            options.intersects(WmfExtTextOutOptions::OPAQUE | WmfExtTextOutOptions::CLIPPED);
-        let rectangle = if needs_rectangle && data.len() >= 16 + padded_string_len {
+        let rectangle = if include_rectangle {
+            if data.len() < 16 + padded_string_len {
+                return Err(Error::invalid(0, "META_EXTTEXTOUT rectangle is truncated"));
+            }
             Some(WmfRectObject::read_from(&mut reader)?)
         } else {
             None
@@ -4151,7 +4397,18 @@ fn validate_wmf_header(value: &WmfHeader) -> Result<()> {
     Ok(())
 }
 
+fn validate_unknown_wmf_record(record: &WmfRecord) -> Result<()> {
+    if record.normalized_function_kind().is_some() {
+        return Err(Error::invalid(
+            0,
+            "WMF Unknown record requires an unknown RecordFunction",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_wmf_set_bk_mode(value: &WmfU16Record) -> Result<()> {
+    validate_wmf_optional_reserved_word(&value.reserved, "META_SETBKMODE")?;
     if value.mix_mode_kind().is_none() {
         return Err(Error::invalid(0, "META_SETBKMODE MixMode is invalid"));
     }
@@ -4159,6 +4416,7 @@ fn validate_wmf_set_bk_mode(value: &WmfU16Record) -> Result<()> {
 }
 
 fn validate_wmf_set_map_mode(value: &WmfU16Record) -> Result<()> {
+    validate_wmf_no_reserved_words(&value.reserved, "META_SETMAPMODE")?;
     if value.map_mode_kind().is_none() {
         return Err(Error::invalid(0, "META_SETMAPMODE MapMode is invalid"));
     }
@@ -4166,6 +4424,7 @@ fn validate_wmf_set_map_mode(value: &WmfU16Record) -> Result<()> {
 }
 
 fn validate_wmf_set_rop2(value: &WmfU16Record) -> Result<()> {
+    validate_wmf_optional_reserved_word(&value.reserved, "META_SETROP2")?;
     if value.binary_raster_operation_kind().is_none() {
         return Err(Error::invalid(0, "META_SETROP2 ROP2Mode is invalid"));
     }
@@ -4173,6 +4432,7 @@ fn validate_wmf_set_rop2(value: &WmfU16Record) -> Result<()> {
 }
 
 fn validate_wmf_set_poly_fill_mode(value: &WmfU16Record) -> Result<()> {
+    validate_wmf_optional_reserved_word(&value.reserved, "META_SETPOLYFILLMODE")?;
     if value.poly_fill_mode_kind().is_none() {
         return Err(Error::invalid(
             0,
@@ -4183,6 +4443,7 @@ fn validate_wmf_set_poly_fill_mode(value: &WmfU16Record) -> Result<()> {
 }
 
 fn validate_wmf_set_stretch_blt_mode(value: &WmfU16Record) -> Result<()> {
+    validate_wmf_optional_reserved_word(&value.reserved, "META_SETSTRETCHBLTMODE")?;
     if value.stretch_mode_kind().is_none() {
         return Err(Error::invalid(
             0,
@@ -4193,6 +4454,7 @@ fn validate_wmf_set_stretch_blt_mode(value: &WmfU16Record) -> Result<()> {
 }
 
 fn validate_wmf_set_text_align(value: &WmfU16Record) -> Result<()> {
+    validate_wmf_optional_reserved_word(&value.reserved, "META_SETTEXTALIGN")?;
     validate_wmf_text_alignment_value(value.value, "META_SETTEXTALIGN")
 }
 
@@ -4223,10 +4485,55 @@ pub(crate) fn validate_wmf_text_alignment_value(value: u16, name: &str) -> Resul
 }
 
 fn validate_wmf_set_layout(value: &WmfU16Record) -> Result<()> {
+    validate_wmf_required_reserved_word(&value.reserved, "META_SETLAYOUT")?;
     if value.invalid_layout_bits() != 0 {
         return Err(Error::invalid(
             0,
             "META_SETLAYOUT Layout contains invalid flags",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_wmf_set_text_char_extra(value: &WmfU16Record) -> Result<()> {
+    validate_wmf_no_reserved_words(&value.reserved, "META_SETTEXTCHAREXTRA")
+}
+
+fn validate_wmf_no_reserved_words(reserved: &[u8], name: &str) -> Result<()> {
+    if !reserved.is_empty() {
+        return Err(Error::invalid(
+            0,
+            format!("{name} must not contain trailing reserved data"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_wmf_optional_reserved_word(reserved: &[u8], name: &str) -> Result<()> {
+    if !matches!(reserved.len(), 0 | 2) {
+        return Err(Error::invalid(
+            0,
+            format!("{name} optional Reserved field must be absent or one WORD"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_wmf_required_reserved_word(reserved: &[u8], name: &str) -> Result<()> {
+    if reserved.len() != 2 {
+        return Err(Error::invalid(
+            0,
+            format!("{name} Reserved field must be one WORD"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_wmf_scale_ext_record(value: &WmfScaleExtRecord) -> Result<()> {
+    if value.x_num == 0 || value.x_denom == 0 || value.y_num == 0 || value.y_denom == 0 {
+        return Err(Error::invalid(
+            0,
+            "WMF scale extension numerator and denominator fields must be nonzero",
         ));
     }
     Ok(())
@@ -4611,6 +4918,12 @@ fn validate_wmf_font_object(value: &WmfFontObject) -> Result<()> {
     }
     if value.strike_out > 1 {
         return Err(Error::invalid(0, "WMF Font StrikeOut must be a Boolean"));
+    }
+    if value.char_set_kind().is_none() {
+        return Err(Error::invalid(
+            0,
+            "WMF Font CharSet is not a valid CharacterSet",
+        ));
     }
     if value.out_precision_kind().is_none() {
         return Err(Error::invalid(
@@ -5719,9 +6032,9 @@ mod tests {
             WmfRecordFunction::RealizePalette.raw(),
             Vec::new(),
         ));
-        let set_relabs = WmfRecord::new(WmfRecordFunction::SetRelabs.raw(), vec![0xAA, 0xBB]);
+        let set_relabs = WmfRecord::new(WmfRecordFunction::SetRelabs.raw(), Vec::new());
         let parsed = set_relabs.parse_data().unwrap();
-        assert_eq!(parsed, WmfRecordData::SetRelabs(vec![0xAA, 0xBB]));
+        assert_eq!(parsed, WmfRecordData::SetRelabs);
         assert_eq!(parsed.to_record().unwrap(), set_relabs);
     }
 
@@ -5785,10 +6098,13 @@ mod tests {
         assert_eq!(parsed.to_record().unwrap(), set_stretch_blt_mode);
         let set_layout = WmfRecord::new(
             WmfRecordFunction::SetLayout.raw(),
-            (WmfLayoutFlags::RTL | WmfLayoutFlags::BITMAP_ORIENTATION_PRESERVED)
-                .bits()
-                .to_le_bytes()
-                .to_vec(),
+            [
+                (WmfLayoutFlags::RTL | WmfLayoutFlags::BITMAP_ORIENTATION_PRESERVED)
+                    .bits()
+                    .to_le_bytes(),
+                0xBEEFu16.to_le_bytes(),
+            ]
+            .concat(),
         );
         let parsed = set_layout.parse_data().unwrap();
         let WmfRecordData::SetLayout(value) = &parsed else {

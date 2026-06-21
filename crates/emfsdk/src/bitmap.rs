@@ -96,6 +96,12 @@ pub enum BitmapLogicalColorSpace {
     WindowsColorSpace = 0x5769_6E20,
 }
 
+impl BitmapLogicalColorSpace {
+    pub fn uses_calibrated_fields(self) -> bool {
+        matches!(self, Self::CalibratedRgb)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, SdkEnum)]
 #[sdk(repr = "u32")]
 pub enum BitmapLogicalColorSpaceV5 {
@@ -112,8 +118,7 @@ pub enum BitmapGamutMappingIntent {
     AbsoluteColorimetric = 0x0000_0008,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, SdkObject)]
-#[sdk(format = "wmf")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RgbQuad {
     pub blue: u8,
     pub green: u8,
@@ -121,8 +126,36 @@ pub struct RgbQuad {
     pub reserved: u8,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
-#[sdk(format = "wmf")]
+impl SdkRead for RgbQuad {
+    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
+        let value = Self {
+            blue: reader.read_u8()?,
+            green: reader.read_u8()?,
+            red: reader.read_u8()?,
+            reserved: reader.read_u8()?,
+        };
+        validate_rgb_quad(&value)?;
+        Ok(value)
+    }
+}
+
+impl SdkWrite for RgbQuad {
+    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+        validate_rgb_quad(self)?;
+        writer.write_u8(self.blue)?;
+        writer.write_u8(self.green)?;
+        writer.write_u8(self.red)?;
+        writer.write_u8(self.reserved)
+    }
+}
+
+impl SdkSize for RgbQuad {
+    fn sdk_size(&self) -> u64 {
+        4
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BitmapCoreHeader {
     pub header_size: u32,
     pub width: u16,
@@ -137,8 +170,38 @@ impl BitmapCoreHeader {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
-#[sdk(format = "wmf")]
+impl SdkRead for BitmapCoreHeader {
+    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
+        let value = Self {
+            header_size: reader.read_u32()?,
+            width: reader.read_u16()?,
+            height: reader.read_u16()?,
+            planes: reader.read_u16()?,
+            bit_count: reader.read_u16()?,
+        };
+        validate_bitmap_core_header(&value)?;
+        Ok(value)
+    }
+}
+
+impl SdkWrite for BitmapCoreHeader {
+    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+        validate_bitmap_core_header(self)?;
+        writer.write_u32(self.header_size)?;
+        writer.write_u16(self.width)?;
+        writer.write_u16(self.height)?;
+        writer.write_u16(self.planes)?;
+        writer.write_u16(self.bit_count)
+    }
+}
+
+impl SdkSize for BitmapCoreHeader {
+    fn sdk_size(&self) -> u64 {
+        u64::from(BITMAP_CORE_HEADER_SIZE)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BitmapInfoHeader {
     pub header_size: u32,
     pub width: i32,
@@ -171,6 +234,49 @@ impl BitmapInfoHeader {
     }
 }
 
+impl SdkRead for BitmapInfoHeader {
+    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
+        let value = Self {
+            header_size: reader.read_u32()?,
+            width: reader.read_i32()?,
+            height: reader.read_i32()?,
+            planes: reader.read_u16()?,
+            bit_count: reader.read_u16()?,
+            compression: reader.read_u32()?,
+            image_size: reader.read_u32()?,
+            x_pels_per_meter: reader.read_i32()?,
+            y_pels_per_meter: reader.read_i32()?,
+            color_used: reader.read_u32()?,
+            color_important: reader.read_u32()?,
+        };
+        validate_bitmap_info_header(&value)?;
+        Ok(value)
+    }
+}
+
+impl SdkWrite for BitmapInfoHeader {
+    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+        validate_bitmap_info_header(self)?;
+        writer.write_u32(self.header_size)?;
+        writer.write_i32(self.width)?;
+        writer.write_i32(self.height)?;
+        writer.write_u16(self.planes)?;
+        writer.write_u16(self.bit_count)?;
+        writer.write_u32(self.compression)?;
+        writer.write_u32(self.image_size)?;
+        writer.write_i32(self.x_pels_per_meter)?;
+        writer.write_i32(self.y_pels_per_meter)?;
+        writer.write_u32(self.color_used)?;
+        writer.write_u32(self.color_important)
+    }
+}
+
+impl SdkSize for BitmapInfoHeader {
+    fn sdk_size(&self) -> u64 {
+        u64::from(BITMAP_INFO_HEADER_SIZE)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
 #[sdk(format = "wmf")]
 pub struct BitmapCieXyz {
@@ -187,8 +293,7 @@ pub struct BitmapCieXyzTriple {
     pub blue: BitmapCieXyz,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
-#[sdk(format = "wmf")]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BitmapV4Header {
     pub base: BitmapInfoHeader,
     pub red_mask: u32,
@@ -224,8 +329,48 @@ impl BitmapV4Header {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
-#[sdk(format = "wmf")]
+impl SdkRead for BitmapV4Header {
+    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
+        let value = Self {
+            base: BitmapInfoHeader::read_from(reader)?,
+            red_mask: reader.read_u32()?,
+            green_mask: reader.read_u32()?,
+            blue_mask: reader.read_u32()?,
+            alpha_mask: reader.read_u32()?,
+            color_space_type: reader.read_u32()?,
+            endpoints: BitmapCieXyzTriple::read_from(reader)?,
+            gamma_red: reader.read_u32()?,
+            gamma_green: reader.read_u32()?,
+            gamma_blue: reader.read_u32()?,
+        };
+        validate_bitmap_v4_header(&value)?;
+        Ok(value)
+    }
+}
+
+impl SdkWrite for BitmapV4Header {
+    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+        validate_bitmap_v4_header(self)?;
+        self.base.write_to(writer)?;
+        writer.write_u32(self.red_mask)?;
+        writer.write_u32(self.green_mask)?;
+        writer.write_u32(self.blue_mask)?;
+        writer.write_u32(self.alpha_mask)?;
+        writer.write_u32(self.color_space_type)?;
+        self.endpoints.write_to(writer)?;
+        writer.write_u32(self.gamma_red)?;
+        writer.write_u32(self.gamma_green)?;
+        writer.write_u32(self.gamma_blue)
+    }
+}
+
+impl SdkSize for BitmapV4Header {
+    fn sdk_size(&self) -> u64 {
+        u64::from(BITMAP_V4_HEADER_SIZE)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BitmapV5Header {
     pub v4: BitmapV4Header,
     pub intent: u32,
@@ -257,6 +402,58 @@ impl BitmapV5Header {
 
     pub fn is_top_down(&self) -> bool {
         self.v4.is_top_down()
+    }
+}
+
+impl SdkRead for BitmapV5Header {
+    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
+        let v4 = BitmapV4Header {
+            base: BitmapInfoHeader::read_from(reader)?,
+            red_mask: reader.read_u32()?,
+            green_mask: reader.read_u32()?,
+            blue_mask: reader.read_u32()?,
+            alpha_mask: reader.read_u32()?,
+            color_space_type: reader.read_u32()?,
+            endpoints: BitmapCieXyzTriple::read_from(reader)?,
+            gamma_red: reader.read_u32()?,
+            gamma_green: reader.read_u32()?,
+            gamma_blue: reader.read_u32()?,
+        };
+        let value = Self {
+            v4,
+            intent: reader.read_u32()?,
+            profile_data: reader.read_u32()?,
+            profile_size: reader.read_u32()?,
+            reserved: reader.read_u32()?,
+        };
+        validate_bitmap_v5_header(&value)?;
+        Ok(value)
+    }
+}
+
+impl SdkWrite for BitmapV5Header {
+    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+        validate_bitmap_v5_header(self)?;
+        self.v4.base.write_to(writer)?;
+        writer.write_u32(self.v4.red_mask)?;
+        writer.write_u32(self.v4.green_mask)?;
+        writer.write_u32(self.v4.blue_mask)?;
+        writer.write_u32(self.v4.alpha_mask)?;
+        writer.write_u32(self.v4.color_space_type)?;
+        self.v4.endpoints.write_to(writer)?;
+        writer.write_u32(self.v4.gamma_red)?;
+        writer.write_u32(self.v4.gamma_green)?;
+        writer.write_u32(self.v4.gamma_blue)?;
+        writer.write_u32(self.intent)?;
+        writer.write_u32(self.profile_data)?;
+        writer.write_u32(self.profile_size)?;
+        writer.write_u32(self.reserved)
+    }
+}
+
+impl SdkSize for BitmapV5Header {
+    fn sdk_size(&self) -> u64 {
+        u64::from(BITMAP_V5_HEADER_SIZE)
     }
 }
 
@@ -644,14 +841,20 @@ fn dib_color_table_entry_count(header: &DibHeader, color_usage: DibColorUsage) -
         return Ok(0);
     }
 
-    if header.color_used() != 0 {
-        return usize::try_from(header.color_used())
-            .map_err(|_| Error::invalid(0, "DIB color table count overflows usize"));
-    }
-
     let bit_count = header.bit_count();
     match bit_count {
-        1 | 4 | 8 => Ok(1usize << bit_count),
+        1 | 4 | 8 => {
+            let maximum = 1usize << bit_count;
+            if header.color_used() == 0 {
+                Ok(maximum)
+            } else {
+                let declared = usize::try_from(header.color_used())
+                    .map_err(|_| Error::invalid(0, "DIB color table count overflows usize"))?;
+                Ok(declared.min(maximum))
+            }
+        }
+        _ if header.color_used() != 0 => usize::try_from(header.color_used())
+            .map_err(|_| Error::invalid(0, "DIB color table count overflows usize")),
         _ => Ok(0),
     }
 }
@@ -741,6 +944,36 @@ fn validate_dib_bitmap_info(value: &DibBitmapInfo) -> Result<()> {
     validate_dib_header(&value.header)?;
     if let Some(masks) = dib_info_bitfield_masks(value)? {
         validate_bitfield_masks(&masks, "BitmapInfoHeader")?;
+    }
+    validate_bitmap_v5_profile_payload(value)?;
+    Ok(())
+}
+
+fn validate_bitmap_v5_profile_payload(value: &DibBitmapInfo) -> Result<()> {
+    let DibHeader::V5(header) = &value.header else {
+        return Ok(());
+    };
+    if header.color_space_v5_kind().is_none() {
+        return Ok(());
+    }
+    if header.profile_data < BITMAP_V5_HEADER_SIZE {
+        return Err(Error::invalid(
+            0,
+            "BitmapV5Header ProfileData must point after the fixed header",
+        ));
+    }
+    let profile_offset = usize::try_from(header.profile_data - BITMAP_V5_HEADER_SIZE)
+        .map_err(|_| Error::invalid(0, "BitmapV5Header ProfileData overflows usize"))?;
+    let profile_size = usize::try_from(header.profile_size)
+        .map_err(|_| Error::invalid(0, "BitmapV5Header ProfileSize overflows usize"))?;
+    let profile_end = profile_offset
+        .checked_add(profile_size)
+        .ok_or_else(|| Error::invalid(0, "BitmapV5Header profile range overflows"))?;
+    if profile_end > value.color_table.len() {
+        return Err(Error::invalid(
+            0,
+            "BitmapV5Header profile range exceeds bitmap info payload",
+        ));
     }
     Ok(())
 }
@@ -854,6 +1087,12 @@ fn validate_bitmap_info_header(value: &BitmapInfoHeader) -> Result<()> {
             "BitmapInfoHeader top-down DIB must not use a compressed format",
         ));
     }
+    if compression.unwrap().embedded_format().is_some() && value.image_size == 0 {
+        return Err(Error::invalid(
+            0,
+            "BitmapInfoHeader JPEG/PNG ImageSize must specify the image buffer size",
+        ));
+    }
     Ok(())
 }
 
@@ -862,11 +1101,17 @@ fn validate_bitmap_v4_header(value: &BitmapV4Header) -> Result<()> {
         return Err(Error::invalid(0, "BitmapV4Header HeaderSize must be 108"));
     }
     validate_bitmap_info_header(&value.base)?;
-    if value.color_space_kind().is_none() {
+    let color_space = value.color_space_kind();
+    if color_space.is_none() {
         return Err(Error::invalid(
             0,
             "BitmapV4Header ColorSpaceType is invalid",
         ));
+    }
+    if color_space.unwrap().uses_calibrated_fields() {
+        validate_bitmap_gamma(value.gamma_red, "BitmapV4Header GammaRed")?;
+        validate_bitmap_gamma(value.gamma_green, "BitmapV4Header GammaGreen")?;
+        validate_bitmap_gamma(value.gamma_blue, "BitmapV4Header GammaBlue")?;
     }
     if value.compression_kind() == Some(BitmapCompression::Bitfields) {
         validate_bitfield_masks(
@@ -887,11 +1132,17 @@ fn validate_bitmap_v5_header(value: &BitmapV5Header) -> Result<()> {
         return Err(Error::invalid(0, "BitmapV5Header HeaderSize must be 124"));
     }
     validate_bitmap_info_header(&value.v4.base)?;
-    if value.color_space_kind().is_none() && value.color_space_v5_kind().is_none() {
+    let color_space = value.color_space_kind();
+    if color_space.is_none() && value.color_space_v5_kind().is_none() {
         return Err(Error::invalid(
             0,
             "BitmapV5Header ColorSpaceType is invalid",
         ));
+    }
+    if matches!(color_space, Some(space) if space.uses_calibrated_fields()) {
+        validate_bitmap_gamma(value.v4.gamma_red, "BitmapV5Header GammaRed")?;
+        validate_bitmap_gamma(value.v4.gamma_green, "BitmapV5Header GammaGreen")?;
+        validate_bitmap_gamma(value.v4.gamma_blue, "BitmapV5Header GammaBlue")?;
     }
     if value.intent_kind().is_none() {
         return Err(Error::invalid(0, "BitmapV5Header Intent is invalid"));
@@ -906,6 +1157,16 @@ fn validate_bitmap_v5_header(value: &BitmapV5Header) -> Result<()> {
             ],
             "BitmapV5Header",
         )?;
+    }
+    Ok(())
+}
+
+fn validate_bitmap_gamma(value: u32, name: &str) -> Result<()> {
+    if value & 0xFF00_00FF != 0 {
+        return Err(Error::invalid(
+            0,
+            format!("{name} must use the 00nnnnnnffffffff00 fixed-point layout"),
+        ));
     }
     Ok(())
 }
@@ -1267,6 +1528,7 @@ mod tests {
         else {
             panic!("expected BitmapInfoHeader");
         };
+        let mut invalid_rle4_write = base.clone();
         base.planes = 2;
         assert!(
             DibBitmapInfo {
@@ -1276,30 +1538,22 @@ mod tests {
             .to_bytes()
             .is_err()
         );
-        let mut invalid_rle4_write = base_info;
-        invalid_rle4_write[14..16].copy_from_slice(&(BitmapBitCount::Eight.raw()).to_le_bytes());
-        invalid_rle4_write[16..20].copy_from_slice(&(BitmapCompression::Rle4.raw()).to_le_bytes());
+        invalid_rle4_write.bit_count = BitmapBitCount::Eight.raw();
+        invalid_rle4_write.compression = BitmapCompression::Rle4.raw();
         let invalid = DibBitmapInfo {
             header: DibHeader::Info {
-                base: BitmapInfoHeader::read_from(&mut Reader::new(std::io::Cursor::new(
-                    invalid_rle4_write.to_vec(),
-                )))
-                .unwrap(),
+                base: invalid_rle4_write.clone(),
                 extension: Vec::new(),
             },
             color_table: Vec::new(),
         };
         assert!(invalid.to_bytes().is_err());
-        let mut invalid_bitfields = base_info;
-        invalid_bitfields[14..16].copy_from_slice(&24u16.to_le_bytes());
-        invalid_bitfields[16..20]
-            .copy_from_slice(&(BitmapCompression::Bitfields.raw()).to_le_bytes());
+        let mut invalid_bitfields = invalid_rle4_write.clone();
+        invalid_bitfields.bit_count = 24;
+        invalid_bitfields.compression = BitmapCompression::Bitfields.raw();
         let invalid = DibBitmapInfo {
             header: DibHeader::Info {
-                base: BitmapInfoHeader::read_from(&mut Reader::new(std::io::Cursor::new(
-                    invalid_bitfields.to_vec(),
-                )))
-                .unwrap(),
+                base: invalid_bitfields,
                 extension: [
                     0x00FF_0000u32.to_le_bytes(),
                     0x0000_FF00u32.to_le_bytes(),

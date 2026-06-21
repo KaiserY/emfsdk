@@ -1053,6 +1053,16 @@ fn validate_emf_comment_groups(records: &[EmfRecord]) -> Result<()> {
     }
 }
 
+fn validate_unknown_emf_record(record: &EmfRecord) -> Result<()> {
+    if record.record_kind().is_some() {
+        return Err(Error::invalid(
+            0,
+            "EMF Unknown record requires an unknown RecordType",
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum EmfRecordData<'a> {
     Header(EmfHeader),
@@ -1929,7 +1939,10 @@ impl<'a> EmfRecordData<'a> {
                 EmfRecordType::Comment.raw(),
                 value.to_data()?,
             )),
-            Self::Unknown(record) => Ok((*record).clone()),
+            Self::Unknown(record) => {
+                validate_unknown_emf_record(record)?;
+                Ok((*record).clone())
+            }
         }
     }
 }
@@ -2208,12 +2221,35 @@ pub struct EmrSetPixelV {
     pub color: ColorRef,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EmrSetMapperFlags {
     pub flags: u32,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+impl SdkRead for EmrSetMapperFlags {
+    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
+        let value = Self {
+            flags: reader.read_u32()?,
+        };
+        validate_emr_set_mapper_flags(&value)?;
+        Ok(value)
+    }
+}
+
+impl SdkWrite for EmrSetMapperFlags {
+    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+        validate_emr_set_mapper_flags(self)?;
+        writer.write_u32(self.flags)
+    }
+}
+
+impl SdkSize for EmrSetMapperFlags {
+    fn sdk_size(&self) -> u64 {
+        4
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EmrSetMapMode {
     pub map_mode: u32,
 }
@@ -2224,7 +2260,30 @@ impl EmrSetMapMode {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+impl SdkRead for EmrSetMapMode {
+    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
+        let value = Self {
+            map_mode: reader.read_u32()?,
+        };
+        validate_emr_set_map_mode(&value)?;
+        Ok(value)
+    }
+}
+
+impl SdkWrite for EmrSetMapMode {
+    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+        validate_emr_set_map_mode(self)?;
+        writer.write_u32(self.map_mode)
+    }
+}
+
+impl SdkSize for EmrSetMapMode {
+    fn sdk_size(&self) -> u64 {
+        4
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EmrSetBkMode {
     pub background_mode: u32,
 }
@@ -2235,7 +2294,30 @@ impl EmrSetBkMode {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+impl SdkRead for EmrSetBkMode {
+    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
+        let value = Self {
+            background_mode: reader.read_u32()?,
+        };
+        validate_emr_set_bk_mode(&value)?;
+        Ok(value)
+    }
+}
+
+impl SdkWrite for EmrSetBkMode {
+    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+        validate_emr_set_bk_mode(self)?;
+        writer.write_u32(self.background_mode)
+    }
+}
+
+impl SdkSize for EmrSetBkMode {
+    fn sdk_size(&self) -> u64 {
+        4
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EmrSetPolyFillMode {
     pub polygon_fill_mode: u32,
 }
@@ -2246,7 +2328,30 @@ impl EmrSetPolyFillMode {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+impl SdkRead for EmrSetPolyFillMode {
+    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
+        let value = Self {
+            polygon_fill_mode: reader.read_u32()?,
+        };
+        validate_emr_set_poly_fill_mode(&value)?;
+        Ok(value)
+    }
+}
+
+impl SdkWrite for EmrSetPolyFillMode {
+    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+        validate_emr_set_poly_fill_mode(self)?;
+        writer.write_u32(self.polygon_fill_mode)
+    }
+}
+
+impl SdkSize for EmrSetPolyFillMode {
+    fn sdk_size(&self) -> u64 {
+        4
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EmrSetRop2 {
     pub rop2_mode: u32,
 }
@@ -2256,6 +2361,29 @@ impl EmrSetRop2 {
         u16::try_from(self.rop2_mode)
             .ok()
             .and_then(WmfBinaryRasterOperation::from_raw)
+    }
+}
+
+impl SdkRead for EmrSetRop2 {
+    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
+        let value = Self {
+            rop2_mode: reader.read_u32()?,
+        };
+        validate_emr_set_rop2(&value)?;
+        Ok(value)
+    }
+}
+
+impl SdkWrite for EmrSetRop2 {
+    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+        validate_emr_set_rop2(self)?;
+        writer.write_u32(self.rop2_mode)
+    }
+}
+
+impl SdkSize for EmrSetRop2 {
+    fn sdk_size(&self) -> u64 {
+        4
     }
 }
 
@@ -2270,7 +2398,7 @@ impl EmrSetStretchBltMode {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EmrSetTextAlign {
     pub text_alignment_mode: u32,
 }
@@ -2285,7 +2413,30 @@ impl EmrSetTextAlign {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+impl SdkRead for EmrSetTextAlign {
+    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
+        let value = Self {
+            text_alignment_mode: reader.read_u32()?,
+        };
+        validate_emr_set_text_align(&value)?;
+        Ok(value)
+    }
+}
+
+impl SdkWrite for EmrSetTextAlign {
+    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+        validate_emr_set_text_align(self)?;
+        writer.write_u32(self.text_alignment_mode)
+    }
+}
+
+impl SdkSize for EmrSetTextAlign {
+    fn sdk_size(&self) -> u64 {
+        4
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EmrSetColorAdjustment {
     pub size: u16,
     pub values: u16,
@@ -2299,6 +2450,51 @@ pub struct EmrSetColorAdjustment {
     pub brightness: i16,
     pub colorfulness: i16,
     pub red_green_tint: i16,
+}
+
+impl SdkRead for EmrSetColorAdjustment {
+    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
+        let value = Self {
+            size: reader.read_u16()?,
+            values: reader.read_u16()?,
+            illuminant_index: reader.read_u16()?,
+            red_gamma: reader.read_u16()?,
+            green_gamma: reader.read_u16()?,
+            blue_gamma: reader.read_u16()?,
+            reference_black: reader.read_u16()?,
+            reference_white: reader.read_u16()?,
+            contrast: reader.read_i16()?,
+            brightness: reader.read_i16()?,
+            colorfulness: reader.read_i16()?,
+            red_green_tint: reader.read_i16()?,
+        };
+        validate_emr_set_color_adjustment(&value)?;
+        Ok(value)
+    }
+}
+
+impl SdkWrite for EmrSetColorAdjustment {
+    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+        validate_emr_set_color_adjustment(self)?;
+        writer.write_u16(self.size)?;
+        writer.write_u16(self.values)?;
+        writer.write_u16(self.illuminant_index)?;
+        writer.write_u16(self.red_gamma)?;
+        writer.write_u16(self.green_gamma)?;
+        writer.write_u16(self.blue_gamma)?;
+        writer.write_u16(self.reference_black)?;
+        writer.write_u16(self.reference_white)?;
+        writer.write_i16(self.contrast)?;
+        writer.write_i16(self.brightness)?;
+        writer.write_i16(self.colorfulness)?;
+        writer.write_i16(self.red_green_tint)
+    }
+}
+
+impl SdkSize for EmrSetColorAdjustment {
+    fn sdk_size(&self) -> u64 {
+        24
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -2399,7 +2595,7 @@ pub struct EmrIntersectClipRect {
     pub rect: RectL,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EmrScaleViewportExtEx {
     pub x_num: i32,
     pub x_denom: i32,
@@ -2407,7 +2603,48 @@ pub struct EmrScaleViewportExtEx {
     pub y_denom: i32,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+impl SdkRead for EmrScaleViewportExtEx {
+    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
+        let value = Self {
+            x_num: reader.read_i32()?,
+            x_denom: reader.read_i32()?,
+            y_num: reader.read_i32()?,
+            y_denom: reader.read_i32()?,
+        };
+        validate_emr_scale_ext(
+            value.x_num,
+            value.x_denom,
+            value.y_num,
+            value.y_denom,
+            "EMR_SCALEVIEWPORTEXTEX",
+        )?;
+        Ok(value)
+    }
+}
+
+impl SdkWrite for EmrScaleViewportExtEx {
+    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+        validate_emr_scale_ext(
+            self.x_num,
+            self.x_denom,
+            self.y_num,
+            self.y_denom,
+            "EMR_SCALEVIEWPORTEXTEX",
+        )?;
+        writer.write_i32(self.x_num)?;
+        writer.write_i32(self.x_denom)?;
+        writer.write_i32(self.y_num)?;
+        writer.write_i32(self.y_denom)
+    }
+}
+
+impl SdkSize for EmrScaleViewportExtEx {
+    fn sdk_size(&self) -> u64 {
+        16
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EmrScaleWindowExtEx {
     pub x_num: i32,
     pub x_denom: i32,
@@ -2415,9 +2652,73 @@ pub struct EmrScaleWindowExtEx {
     pub y_denom: i32,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+impl SdkRead for EmrScaleWindowExtEx {
+    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
+        let value = Self {
+            x_num: reader.read_i32()?,
+            x_denom: reader.read_i32()?,
+            y_num: reader.read_i32()?,
+            y_denom: reader.read_i32()?,
+        };
+        validate_emr_scale_ext(
+            value.x_num,
+            value.x_denom,
+            value.y_num,
+            value.y_denom,
+            "EMR_SCALEWINDOWEXTEX",
+        )?;
+        Ok(value)
+    }
+}
+
+impl SdkWrite for EmrScaleWindowExtEx {
+    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+        validate_emr_scale_ext(
+            self.x_num,
+            self.x_denom,
+            self.y_num,
+            self.y_denom,
+            "EMR_SCALEWINDOWEXTEX",
+        )?;
+        writer.write_i32(self.x_num)?;
+        writer.write_i32(self.x_denom)?;
+        writer.write_i32(self.y_num)?;
+        writer.write_i32(self.y_denom)
+    }
+}
+
+impl SdkSize for EmrScaleWindowExtEx {
+    fn sdk_size(&self) -> u64 {
+        16
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EmrRestoreDc {
     pub saved_dc: i32,
+}
+
+impl SdkRead for EmrRestoreDc {
+    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
+        let value = Self {
+            saved_dc: reader.read_i32()?,
+        };
+        validate_emr_restore_dc(&value)?;
+        Ok(value)
+    }
+}
+
+impl SdkWrite for EmrRestoreDc {
+    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+        validate_emr_restore_dc(self)?;
+        writer.write_i32(self.saved_dc)
+    }
+}
+
+impl SdkSize for EmrRestoreDc {
+    fn sdk_size(&self) -> u64 {
+        4
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, SdkObject)]
@@ -2425,7 +2726,7 @@ pub struct EmrSetWorldTransform {
     pub transform: XForm,
 }
 
-#[derive(Clone, Debug, PartialEq, SdkObject)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct EmrModifyWorldTransform {
     pub transform: XForm,
     pub mode: u32,
@@ -2437,7 +2738,32 @@ impl EmrModifyWorldTransform {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+impl SdkRead for EmrModifyWorldTransform {
+    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
+        let value = Self {
+            transform: XForm::read_from(reader)?,
+            mode: reader.read_u32()?,
+        };
+        validate_emr_modify_world_transform(&value)?;
+        Ok(value)
+    }
+}
+
+impl SdkWrite for EmrModifyWorldTransform {
+    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+        validate_emr_modify_world_transform(self)?;
+        self.transform.write_to(writer)?;
+        writer.write_u32(self.mode)
+    }
+}
+
+impl SdkSize for EmrModifyWorldTransform {
+    fn sdk_size(&self) -> u64 {
+        self.transform.sdk_size() + 4
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EmrSelectObject {
     pub object_index: u32,
 }
@@ -2448,7 +2774,30 @@ impl EmrSelectObject {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+impl SdkRead for EmrSelectObject {
+    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
+        let value = Self {
+            object_index: reader.read_u32()?,
+        };
+        validate_emr_select_object(&value)?;
+        Ok(value)
+    }
+}
+
+impl SdkWrite for EmrSelectObject {
+    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+        validate_emr_select_object(self)?;
+        writer.write_u32(self.object_index)
+    }
+}
+
+impl SdkSize for EmrSelectObject {
+    fn sdk_size(&self) -> u64 {
+        4
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EmrSelectPalette {
     pub palette_index: u32,
 }
@@ -2459,13 +2808,61 @@ impl EmrSelectPalette {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+impl SdkRead for EmrSelectPalette {
+    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
+        let value = Self {
+            palette_index: reader.read_u32()?,
+        };
+        validate_emr_select_palette(&value)?;
+        Ok(value)
+    }
+}
+
+impl SdkWrite for EmrSelectPalette {
+    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+        validate_emr_select_palette(self)?;
+        writer.write_u32(self.palette_index)
+    }
+}
+
+impl SdkSize for EmrSelectPalette {
+    fn sdk_size(&self) -> u64 {
+        4
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EmrResizePalette {
     pub palette_index: u32,
     pub number_of_entries: u32,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+impl SdkRead for EmrResizePalette {
+    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
+        let value = Self {
+            palette_index: reader.read_u32()?,
+            number_of_entries: reader.read_u32()?,
+        };
+        validate_emr_resize_palette(&value)?;
+        Ok(value)
+    }
+}
+
+impl SdkWrite for EmrResizePalette {
+    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+        validate_emr_resize_palette(self)?;
+        writer.write_u32(self.palette_index)?;
+        writer.write_u32(self.number_of_entries)
+    }
+}
+
+impl SdkSize for EmrResizePalette {
+    fn sdk_size(&self) -> u64 {
+        8
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EmrDeleteObject {
     pub object_index: u32,
 }
@@ -2473,6 +2870,29 @@ pub struct EmrDeleteObject {
 impl EmrDeleteObject {
     pub fn stock_object_kind(&self) -> Option<EmrStockObject> {
         EmrStockObject::from_raw(self.object_index)
+    }
+}
+
+impl SdkRead for EmrDeleteObject {
+    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
+        let value = Self {
+            object_index: reader.read_u32()?,
+        };
+        validate_emr_delete_object(&value)?;
+        Ok(value)
+    }
+}
+
+impl SdkWrite for EmrDeleteObject {
+    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+        validate_emr_delete_object(self)?;
+        writer.write_u32(self.object_index)
+    }
+}
+
+impl SdkSize for EmrDeleteObject {
+    fn sdk_size(&self) -> u64 {
+        4
     }
 }
 
@@ -2507,7 +2927,7 @@ pub struct EmrArc {
     pub end: PointL,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EmrExtFloodFill {
     pub start: PointL,
     pub color: ColorRef,
@@ -2520,7 +2940,34 @@ impl EmrExtFloodFill {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+impl SdkRead for EmrExtFloodFill {
+    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
+        let value = Self {
+            start: PointL::read_from(reader)?,
+            color: ColorRef::read_from(reader)?,
+            flood_fill_mode: reader.read_u32()?,
+        };
+        validate_emr_ext_flood_fill(&value)?;
+        Ok(value)
+    }
+}
+
+impl SdkWrite for EmrExtFloodFill {
+    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+        validate_emr_ext_flood_fill(self)?;
+        self.start.write_to(writer)?;
+        self.color.write_to(writer)?;
+        writer.write_u32(self.flood_fill_mode)
+    }
+}
+
+impl SdkSize for EmrExtFloodFill {
+    fn sdk_size(&self) -> u64 {
+        self.start.sdk_size() + self.color.sdk_size() + 4
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EmrSetArcDirection {
     pub arc_direction: u32,
 }
@@ -2531,12 +2978,35 @@ impl EmrSetArcDirection {
     }
 }
 
+impl SdkRead for EmrSetArcDirection {
+    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
+        let value = Self {
+            arc_direction: reader.read_u32()?,
+        };
+        validate_emr_set_arc_direction(&value)?;
+        Ok(value)
+    }
+}
+
+impl SdkWrite for EmrSetArcDirection {
+    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+        validate_emr_set_arc_direction(self)?;
+        writer.write_u32(self.arc_direction)
+    }
+}
+
+impl SdkSize for EmrSetArcDirection {
+    fn sdk_size(&self) -> u64 {
+        4
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
 pub struct EmrSetMiterLimit {
     pub miter_limit: u32,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EmrSelectClipPath {
     pub region_mode: u32,
 }
@@ -2544,6 +3014,29 @@ pub struct EmrSelectClipPath {
 impl EmrSelectClipPath {
     pub fn region_mode_kind(&self) -> Option<EmrRegionMode> {
         EmrRegionMode::from_raw(self.region_mode)
+    }
+}
+
+impl SdkRead for EmrSelectClipPath {
+    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
+        let value = Self {
+            region_mode: reader.read_u32()?,
+        };
+        validate_emr_select_clip_path(&value)?;
+        Ok(value)
+    }
+}
+
+impl SdkWrite for EmrSelectClipPath {
+    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+        validate_emr_select_clip_path(self)?;
+        writer.write_u32(self.region_mode)
+    }
+}
+
+impl SdkSize for EmrSelectClipPath {
+    fn sdk_size(&self) -> u64 {
+        4
     }
 }
 
@@ -2842,7 +3335,7 @@ impl EmrExtSelectClipRgn {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LogPen {
     pub pen_style: u32,
     pub width: PointL,
@@ -2888,6 +3381,33 @@ impl LogPen {
 
     pub const fn pen_reserved_bits(&self) -> u32 {
         self.pen_style & !(0x0000_000F | 0x0000_0F00 | 0x0000_F000 | 0x000F_0000)
+    }
+}
+
+impl SdkRead for LogPen {
+    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
+        let value = Self {
+            pen_style: reader.read_u32()?,
+            width: PointL::read_from(reader)?,
+            color: ColorRef::read_from(reader)?,
+        };
+        validate_log_pen(&value)?;
+        Ok(value)
+    }
+}
+
+impl SdkWrite for LogPen {
+    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+        validate_log_pen(self)?;
+        writer.write_u32(self.pen_style)?;
+        self.width.write_to(writer)?;
+        self.color.write_to(writer)
+    }
+}
+
+impl SdkSize for LogPen {
+    fn sdk_size(&self) -> u64 {
+        16
     }
 }
 
@@ -2975,20 +3495,23 @@ impl LogPenEx {
         for _ in 0..style_count {
             style_entries.push(reader.read_u32()?);
         }
-        Ok(Self {
+        let value = Self {
             pen_style,
             width,
             brush_style,
             color,
             brush_hatch,
             style_entries,
-        })
+        };
+        validate_log_pen_ex(&value)?;
+        Ok(value)
     }
 
     pub fn write_to<W: std::io::Write + std::io::Seek>(
         &self,
         writer: &mut Writer<W>,
     ) -> Result<()> {
+        validate_log_pen_ex(self)?;
         writer.write_u32(self.pen_style)?;
         writer.write_u32(self.width)?;
         writer.write_u32(self.brush_style)?;
@@ -3009,7 +3532,7 @@ impl LogPenEx {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EmrCreatePen {
     pub object_index: u32,
     pub pen_style: u32,
@@ -3067,7 +3590,36 @@ impl EmrCreatePen {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+impl SdkRead for EmrCreatePen {
+    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
+        let value = Self {
+            object_index: reader.read_u32()?,
+            pen_style: reader.read_u32()?,
+            width: PointL::read_from(reader)?,
+            color: ColorRef::read_from(reader)?,
+        };
+        validate_emr_create_pen(&value)?;
+        Ok(value)
+    }
+}
+
+impl SdkWrite for EmrCreatePen {
+    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+        validate_emr_create_pen(self)?;
+        writer.write_u32(self.object_index)?;
+        writer.write_u32(self.pen_style)?;
+        self.width.write_to(writer)?;
+        self.color.write_to(writer)
+    }
+}
+
+impl SdkSize for EmrCreatePen {
+    fn sdk_size(&self) -> u64 {
+        20
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EmrCreateBrushIndirect {
     pub object_index: u32,
     pub brush_style: u32,
@@ -3082,6 +3634,35 @@ impl EmrCreateBrushIndirect {
 
     pub fn brush_hatch_kind(&self) -> Option<EmrHatchStyle> {
         EmrHatchStyle::from_raw(self.brush_hatch)
+    }
+}
+
+impl SdkRead for EmrCreateBrushIndirect {
+    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
+        let value = Self {
+            object_index: reader.read_u32()?,
+            brush_style: reader.read_u32()?,
+            color: ColorRef::read_from(reader)?,
+            brush_hatch: reader.read_u32()?,
+        };
+        validate_emr_create_brush_indirect(&value)?;
+        Ok(value)
+    }
+}
+
+impl SdkWrite for EmrCreateBrushIndirect {
+    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+        validate_emr_create_brush_indirect(self)?;
+        writer.write_u32(self.object_index)?;
+        writer.write_u32(self.brush_style)?;
+        self.color.write_to(writer)?;
+        writer.write_u32(self.brush_hatch)
+    }
+}
+
+impl SdkSize for EmrCreateBrushIndirect {
+    fn sdk_size(&self) -> u64 {
+        16
     }
 }
 
@@ -3203,7 +3784,7 @@ impl EmrExtCreatePen {
         let bitmap_bits_size = reader.read_u32()?;
         let log_pen_ex = LogPenEx::read_from_with_end(&mut reader, Some(data.len() as u64))?;
         let position = reader.position()? as usize;
-        Ok(Self {
+        let value = Self {
             object_index,
             bitmap_info_offset,
             bitmap_info_size,
@@ -3216,10 +3797,13 @@ impl EmrExtCreatePen {
             brush_hatch: log_pen_ex.brush_hatch,
             style_entries: log_pen_ex.style_entries,
             bitmap_buffer: data[position..].to_vec(),
-        })
+        };
+        validate_emr_ext_create_pen(&value)?;
+        Ok(value)
     }
 
     pub fn to_data(&self) -> Result<Vec<u8>> {
+        validate_emr_ext_create_pen(self)?;
         let log_pen_ex = self.log_pen_ex();
         let mut writer = Writer::new(Cursor::new(Vec::with_capacity(
             20 + log_pen_ex.sdk_size() + self.bitmap_buffer.len(),
@@ -3410,7 +3994,7 @@ fn validate_log_font_w(value: &LogFontW) -> Result<()> {
     Ok(())
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Panose {
     pub family_type: u8,
     pub serif_style: u8,
@@ -3463,6 +4047,54 @@ impl Panose {
 
     pub fn x_height_kind(&self) -> Option<EmrPanoseXHeight> {
         EmrPanoseXHeight::from_raw(self.x_height)
+    }
+
+    pub fn write_to<W: std::io::Write + std::io::Seek>(
+        &self,
+        writer: &mut Writer<W>,
+    ) -> Result<()> {
+        validate_panose(self)?;
+        writer.write_u8(self.family_type)?;
+        writer.write_u8(self.serif_style)?;
+        writer.write_u8(self.weight)?;
+        writer.write_u8(self.proportion)?;
+        writer.write_u8(self.contrast)?;
+        writer.write_u8(self.stroke_variation)?;
+        writer.write_u8(self.arm_style)?;
+        writer.write_u8(self.letterform)?;
+        writer.write_u8(self.midline)?;
+        writer.write_u8(self.x_height)
+    }
+}
+
+impl SdkRead for Panose {
+    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
+        let value = Self {
+            family_type: reader.read_u8()?,
+            serif_style: reader.read_u8()?,
+            weight: reader.read_u8()?,
+            proportion: reader.read_u8()?,
+            contrast: reader.read_u8()?,
+            stroke_variation: reader.read_u8()?,
+            arm_style: reader.read_u8()?,
+            letterform: reader.read_u8()?,
+            midline: reader.read_u8()?,
+            x_height: reader.read_u8()?,
+        };
+        validate_panose(&value)?;
+        Ok(value)
+    }
+}
+
+impl SdkWrite for Panose {
+    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+        Panose::write_to(self, writer)
+    }
+}
+
+impl SdkSize for Panose {
+    fn sdk_size(&self) -> u64 {
+        10
     }
 }
 
@@ -3678,11 +4310,47 @@ impl LogFontPanose {
 }
 
 fn validate_log_font_panose(value: &LogFontPanose) -> Result<()> {
+    validate_log_font_w(&value.log_font)?;
     if value.reserved != 0 {
         return Err(Error::invalid(0, "LogFontPanose Reserved must be zero"));
     }
     if value.culture != 0 {
         return Err(Error::invalid(0, "LogFontPanose Culture must be zero"));
+    }
+    validate_panose(&value.panose)?;
+    Ok(())
+}
+
+fn validate_panose(value: &Panose) -> Result<()> {
+    if value.family_type_kind().is_none() {
+        return Err(Error::invalid(0, "Panose FamilyType is invalid"));
+    }
+    if value.serif_style_kind().is_none() {
+        return Err(Error::invalid(0, "Panose SerifStyle is invalid"));
+    }
+    if value.weight_kind().is_none() {
+        return Err(Error::invalid(0, "Panose Weight is invalid"));
+    }
+    if value.proportion_kind().is_none() {
+        return Err(Error::invalid(0, "Panose Proportion is invalid"));
+    }
+    if value.contrast_kind().is_none() {
+        return Err(Error::invalid(0, "Panose Contrast is invalid"));
+    }
+    if value.stroke_variation_kind().is_none() {
+        return Err(Error::invalid(0, "Panose StrokeVariation is invalid"));
+    }
+    if value.arm_style_kind().is_none() {
+        return Err(Error::invalid(0, "Panose ArmStyle is invalid"));
+    }
+    if value.letterform_kind().is_none() {
+        return Err(Error::invalid(0, "Panose Letterform is invalid"));
+    }
+    if value.midline_kind().is_none() {
+        return Err(Error::invalid(0, "Panose Midline is invalid"));
+    }
+    if value.x_height_kind().is_none() {
+        return Err(Error::invalid(0, "Panose XHeight is invalid"));
     }
     Ok(())
 }
@@ -3731,6 +4399,7 @@ impl EmrExtCreateFont {
         &self,
         writer: &mut Writer<W>,
     ) -> Result<()> {
+        validate_emr_ext_create_font(self)?;
         match self {
             Self::LogFont(value) => value.write_to(writer),
             Self::LogFontPanose(value) => value.write_to(writer),
@@ -4610,8 +5279,7 @@ impl EmrEscape {
         writer.write_u32(self.escape)?;
         writer.write_u32(usize_to_u32(self.data.len(), "EMR_ESCAPE data size")?)?;
         writer.write_all(&self.data)?;
-        writer.write_all(&self.padding)?;
-        pad_writer_to_4(&mut writer)?;
+        write_emf_record_alignment_padding(&mut writer, &self.padding, "EMR_ESCAPE")?;
         Ok(writer.into_inner().into_inner())
     }
 }
@@ -4657,14 +5325,14 @@ impl EmrNamedEscape {
         writer.write_u32(usize_to_u32(self.data.len(), "EMR_NAMEDESCAPE data size")?)?;
         writer.write_all(&driver_name)?;
         writer.write_all(&self.data)?;
-        writer.write_all(&self.padding)?;
-        pad_writer_to_4(&mut writer)?;
+        write_emf_record_alignment_padding(&mut writer, &self.padding, "EMR_NAMEDESCAPE")?;
         Ok(writer.into_inner().into_inner())
     }
 }
 
 fn validate_emr_escape(value: &EmrEscape) -> Result<()> {
-    validate_emr_escape_function(value.escape)
+    validate_emr_escape_function(value.escape)?;
+    validate_emr_escape_padding(&value.padding, 8 + value.data.len(), "EMR_ESCAPE")
 }
 
 fn validate_emr_named_escape(value: &EmrNamedEscape) -> Result<()> {
@@ -4682,11 +5350,22 @@ fn validate_emr_named_escape(value: &EmrNamedEscape) -> Result<()> {
             "EMR_NAMEDESCAPE driver name must be UTF-16 null-terminated",
         ));
     }
-    Ok(())
+    validate_emr_escape_padding(
+        &value.padding,
+        12 + driver_name.len() + value.data.len(),
+        "EMR_NAMEDESCAPE",
+    )
 }
 
-fn validate_emr_create_pen(value: &EmrCreatePen) -> Result<()> {
-    validate_emr_created_object_index(value.object_index, "EMR_CREATEPEN", "ihPen")?;
+fn validate_emr_escape_padding(
+    padding: &[u8],
+    unpadded_size: usize,
+    record_name: &str,
+) -> Result<()> {
+    validate_emf_record_alignment_padding(padding, unpadded_size, record_name)
+}
+
+fn validate_log_pen(value: &LogPen) -> Result<()> {
     validate_emr_pen_style(
         value.pen_line_style_kind(),
         value.pen_end_cap_kind(),
@@ -4695,12 +5374,14 @@ fn validate_emr_create_pen(value: &EmrCreatePen) -> Result<()> {
         value.pen_reserved_bits(),
     )?;
     if value.pen_type_kind() == Some(EmrPenType::Cosmetic) && value.width.x != 1 {
-        return Err(Error::invalid(
-            0,
-            "EMR_CREATEPEN cosmetic pen width must be 1",
-        ));
+        return Err(Error::invalid(0, "LogPen cosmetic pen width must be 1"));
     }
     Ok(())
+}
+
+fn validate_emr_create_pen(value: &EmrCreatePen) -> Result<()> {
+    validate_emr_created_object_index(value.object_index, "EMR_CREATEPEN", "ihPen")?;
+    validate_log_pen(&value.log_pen())
 }
 
 fn validate_emr_create_brush_indirect(value: &EmrCreateBrushIndirect) -> Result<()> {
@@ -5060,17 +5741,24 @@ fn validate_ext_text_out_options(options: ExtTextOutOptions, record_name: &str) 
 
 fn validate_emr_text(value: &EmrText, wide: bool, record_name: &str) -> Result<()> {
     validate_ext_text_out_options(value.options, record_name)?;
-    if emr_text_requires_rectangle(value.options) {
-        if value.rectangle.is_none() {
+    if value.options.contains(ExtTextOutOptions::NO_RECT) {
+        if value.rectangle.is_some() {
             return Err(Error::invalid(
                 0,
-                format!("{record_name} rectangle missing for ETO_OPAQUE or ETO_CLIPPED"),
+                format!("{record_name} rectangle supplied with ETO_NO_RECT"),
             ));
         }
-    } else if value.rectangle.is_some() {
+        if emr_text_requires_rectangle(value.options) {
+            return Err(Error::invalid(
+                0,
+                format!("{record_name} ETO_NO_RECT cannot be combined with rectangle options"),
+            ));
+        }
+    }
+    if emr_text_requires_rectangle(value.options) && value.rectangle.is_none() {
         return Err(Error::invalid(
             0,
-            format!("{record_name} rectangle supplied without ETO_OPAQUE or ETO_CLIPPED"),
+            format!("{record_name} rectangle missing for ETO_OPAQUE or ETO_CLIPPED"),
         ));
     }
 
@@ -5239,7 +5927,34 @@ fn validate_log_color_space(value: &LogColorSpace, filename_bytes: usize) -> Res
 }
 
 fn validate_emr_ext_create_font_indirect_w(value: &EmrExtCreateFontIndirectW) -> Result<()> {
-    validate_emr_created_object_index(value.object_index, "EMR_EXTCREATEFONTINDIRECTW", "ihFonts")
+    validate_emr_created_object_index(value.object_index, "EMR_EXTCREATEFONTINDIRECTW", "ihFonts")?;
+    validate_emr_ext_create_font(&value.font)
+}
+
+fn validate_emr_ext_create_font(value: &EmrExtCreateFont) -> Result<()> {
+    match value {
+        EmrExtCreateFont::LogFont(value) => validate_log_font_w(value),
+        EmrExtCreateFont::LogFontPanose(value) => validate_log_font_panose(value),
+        EmrExtCreateFont::LogFontExDv(value) => {
+            validate_log_font_w(&value.log_font_ex.log_font)?;
+            validate_design_vector(&value.design_vector)
+        }
+        EmrExtCreateFont::Raw(data) => {
+            if data.len() == LogFontW::SIZE {
+                return Err(Error::invalid(
+                    0,
+                    "EMR_EXTCREATEFONTINDIRECTW raw elw uses LogFont size",
+                ));
+            }
+            if data.len() >= LOGFONT_PANOSE_SIZE {
+                return Err(Error::invalid(
+                    0,
+                    "EMR_EXTCREATEFONTINDIRECTW raw elw uses a known LogFontPanose/LogFontExDv shape",
+                ));
+            }
+            Ok(())
+        }
+    }
 }
 
 fn validate_emr_create_color_space(value: &EmrCreateColorSpace) -> Result<()> {
@@ -5398,6 +6113,16 @@ fn validate_emr_comment_emf_spool(spool_identifier: u32, alignment_padding: &[u8
         ));
     }
     validate_emr_comment_alignment_padding(alignment_padding)
+}
+
+fn validate_unknown_public_comment_identifier(identifier: u32, offset: u64) -> Result<()> {
+    if EmrPublicCommentIdentifier::from_raw(identifier).is_some() {
+        return Err(Error::invalid(
+            offset,
+            "EMR_COMMENT_PUBLIC Unknown comment requires an unknown identifier",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_emr_raw_comment(
@@ -5812,8 +6537,7 @@ fn validate_emr_blend_function(value: &EmrBlendFunction) -> Result<()> {
     Ok(())
 }
 
-fn validate_emr_ext_create_pen(value: &EmrExtCreatePen) -> Result<()> {
-    validate_emr_created_object_index(value.object_index, "EMR_EXTCREATEPEN", "ihPen")?;
+fn validate_log_pen_ex(value: &LogPenEx) -> Result<()> {
     validate_emr_pen_style(
         value.pen_line_style_kind(),
         value.pen_end_cap_kind(),
@@ -5822,16 +6546,13 @@ fn validate_emr_ext_create_pen(value: &EmrExtCreatePen) -> Result<()> {
         value.pen_reserved_bits(),
     )?;
     if value.pen_type_kind() == Some(EmrPenType::Cosmetic) && value.width != 1 {
-        return Err(Error::invalid(
-            0,
-            "EMR_EXTCREATEPEN cosmetic pen width must be 1",
-        ));
+        return Err(Error::invalid(0, "LogPenEx cosmetic pen width must be 1"));
     }
 
     let Some(brush_style) = value.brush_style_kind() else {
         return Err(Error::invalid(
             0,
-            "EMR_EXTCREATEPEN BrushStyle is not a valid BrushStyle",
+            "LogPenEx BrushStyle is not a valid BrushStyle",
         ));
     };
     if value.pen_type_kind() == Some(EmrPenType::Geometric) {
@@ -5841,7 +6562,7 @@ fn validate_emr_ext_create_pen(value: &EmrExtCreatePen) -> Result<()> {
             _ => {
                 return Err(Error::invalid(
                     0,
-                    "EMR_EXTCREATEPEN geometric pen BrushStyle must be BS_SOLID, BS_HATCHED, or BS_NULL with PS_NULL",
+                    "LogPenEx geometric pen BrushStyle must be BS_SOLID, BS_HATCHED, or BS_NULL with PS_NULL",
                 ));
             }
         }
@@ -5849,7 +6570,7 @@ fn validate_emr_ext_create_pen(value: &EmrExtCreatePen) -> Result<()> {
     if brush_style == WmfBrushStyle::Hatched && value.brush_hatch_kind().is_none() {
         return Err(Error::invalid(
             0,
-            "EMR_EXTCREATEPEN BrushHatch is not a valid HatchStyle for BS_HATCHED",
+            "LogPenEx BrushHatch is not a valid HatchStyle for BS_HATCHED",
         ));
     }
     if brush_style == WmfBrushStyle::Hatched
@@ -5861,9 +6582,15 @@ fn validate_emr_ext_create_pen(value: &EmrExtCreatePen) -> Result<()> {
     {
         return Err(Error::invalid(
             0,
-            "EMR_EXTCREATEPEN non-geometric hatched pen BrushHatch must be HS_SOLIDTEXTCLR or HS_SOLIDBKCLR",
+            "LogPenEx non-geometric hatched pen BrushHatch must be HS_SOLIDTEXTCLR or HS_SOLIDBKCLR",
         ));
     }
+    Ok(())
+}
+
+fn validate_emr_ext_create_pen(value: &EmrExtCreatePen) -> Result<()> {
+    validate_emr_created_object_index(value.object_index, "EMR_EXTCREATEPEN", "ihPen")?;
+    validate_log_pen_ex(&value.log_pen_ex())?;
     value.bitmap()?;
     Ok(())
 }
@@ -5989,7 +6716,7 @@ impl EmrGlsBoundedRecord {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EmrPixelFormat {
     pub n_size: u16,
     pub n_version: u16,
@@ -6017,6 +6744,79 @@ pub struct EmrPixelFormat {
     pub layer_mask: u32,
     pub visible_mask: u32,
     pub damage_mask: u32,
+}
+
+impl SdkRead for EmrPixelFormat {
+    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
+        let value = Self {
+            n_size: reader.read_u16()?,
+            n_version: reader.read_u16()?,
+            flags: reader.read_u32()?,
+            pixel_type: reader.read_u8()?,
+            color_bits: reader.read_u8()?,
+            red_bits: reader.read_u8()?,
+            red_shift: reader.read_u8()?,
+            green_bits: reader.read_u8()?,
+            green_shift: reader.read_u8()?,
+            blue_bits: reader.read_u8()?,
+            blue_shift: reader.read_u8()?,
+            alpha_bits: reader.read_u8()?,
+            alpha_shift: reader.read_u8()?,
+            accum_bits: reader.read_u8()?,
+            accum_red_bits: reader.read_u8()?,
+            accum_green_bits: reader.read_u8()?,
+            accum_blue_bits: reader.read_u8()?,
+            accum_alpha_bits: reader.read_u8()?,
+            depth_bits: reader.read_u8()?,
+            stencil_bits: reader.read_u8()?,
+            aux_buffers: reader.read_u8()?,
+            layer_type: reader.read_u8()?,
+            reserved: reader.read_u8()?,
+            layer_mask: reader.read_u32()?,
+            visible_mask: reader.read_u32()?,
+            damage_mask: reader.read_u32()?,
+        };
+        validate_emr_pixel_format(&value)?;
+        Ok(value)
+    }
+}
+
+impl SdkWrite for EmrPixelFormat {
+    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+        validate_emr_pixel_format(self)?;
+        writer.write_u16(self.n_size)?;
+        writer.write_u16(self.n_version)?;
+        writer.write_u32(self.flags)?;
+        writer.write_u8(self.pixel_type)?;
+        writer.write_u8(self.color_bits)?;
+        writer.write_u8(self.red_bits)?;
+        writer.write_u8(self.red_shift)?;
+        writer.write_u8(self.green_bits)?;
+        writer.write_u8(self.green_shift)?;
+        writer.write_u8(self.blue_bits)?;
+        writer.write_u8(self.blue_shift)?;
+        writer.write_u8(self.alpha_bits)?;
+        writer.write_u8(self.alpha_shift)?;
+        writer.write_u8(self.accum_bits)?;
+        writer.write_u8(self.accum_red_bits)?;
+        writer.write_u8(self.accum_green_bits)?;
+        writer.write_u8(self.accum_blue_bits)?;
+        writer.write_u8(self.accum_alpha_bits)?;
+        writer.write_u8(self.depth_bits)?;
+        writer.write_u8(self.stencil_bits)?;
+        writer.write_u8(self.aux_buffers)?;
+        writer.write_u8(self.layer_type)?;
+        writer.write_u8(self.reserved)?;
+        writer.write_u32(self.layer_mask)?;
+        writer.write_u32(self.visible_mask)?;
+        writer.write_u32(self.damage_mask)
+    }
+}
+
+impl SdkSize for EmrPixelFormat {
+    fn sdk_size(&self) -> u64 {
+        u64::from(Self::SIZE)
+    }
 }
 
 impl EmrPixelFormat {
@@ -6051,12 +6851,41 @@ pub struct EmrForceUfiMapping {
 
 pub type UniversalFontId = EmrForceUfiMapping;
 
-#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EmrColorCorrectPalette {
     pub palette_index: u32,
     pub first_entry: u32,
     pub palette_entries: u32,
     pub reserved: u32,
+}
+
+impl SdkRead for EmrColorCorrectPalette {
+    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
+        let value = Self {
+            palette_index: reader.read_u32()?,
+            first_entry: reader.read_u32()?,
+            palette_entries: reader.read_u32()?,
+            reserved: reader.read_u32()?,
+        };
+        validate_emr_color_correct_palette(&value)?;
+        Ok(value)
+    }
+}
+
+impl SdkWrite for EmrColorCorrectPalette {
+    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+        validate_emr_color_correct_palette(self)?;
+        writer.write_u32(self.palette_index)?;
+        writer.write_u32(self.first_entry)?;
+        writer.write_u32(self.palette_entries)?;
+        writer.write_u32(self.reserved)
+    }
+}
+
+impl SdkSize for EmrColorCorrectPalette {
+    fn sdk_size(&self) -> u64 {
+        16
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -6410,16 +7239,12 @@ impl EmrPolyTextOut {
                 "EMR_POLYTEXTOUT string offset",
             )?)?;
             writer.write_u32(text.options.bits())?;
-            if emr_text_requires_rectangle(text.options) {
-                text.rectangle
-                    .ok_or_else(|| {
-                        Error::invalid(0, "EMR_POLYTEXTOUT rectangle missing for text options")
-                    })?
-                    .write_to(&mut writer)?;
-            } else if text.rectangle.is_some() {
+            if let Some(rectangle) = &text.rectangle {
+                rectangle.write_to(&mut writer)?;
+            } else if emr_text_requires_rectangle(text.options) {
                 return Err(Error::invalid(
                     0,
-                    "EMR_POLYTEXTOUT rectangle supplied without ETO_OPAQUE or ETO_CLIPPED",
+                    "EMR_POLYTEXTOUT rectangle missing for text options",
                 ));
             }
             writer.write_u32(usize_to_u32(
@@ -7504,7 +8329,7 @@ pub struct BitmapSourceBounds {
     pub height: i32,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EmrSetIcmMode {
     pub icm_mode: u32,
 }
@@ -7515,17 +8340,86 @@ impl EmrSetIcmMode {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+impl SdkRead for EmrSetIcmMode {
+    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
+        let value = Self {
+            icm_mode: reader.read_u32()?,
+        };
+        validate_emr_set_icm_mode(&value)?;
+        Ok(value)
+    }
+}
+
+impl SdkWrite for EmrSetIcmMode {
+    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+        validate_emr_set_icm_mode(self)?;
+        writer.write_u32(self.icm_mode)
+    }
+}
+
+impl SdkSize for EmrSetIcmMode {
+    fn sdk_size(&self) -> u64 {
+        4
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EmrSetColorSpace {
     pub color_space_index: u32,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+impl SdkRead for EmrSetColorSpace {
+    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
+        let value = Self {
+            color_space_index: reader.read_u32()?,
+        };
+        validate_emr_set_color_space(&value)?;
+        Ok(value)
+    }
+}
+
+impl SdkWrite for EmrSetColorSpace {
+    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+        validate_emr_set_color_space(self)?;
+        writer.write_u32(self.color_space_index)
+    }
+}
+
+impl SdkSize for EmrSetColorSpace {
+    fn sdk_size(&self) -> u64 {
+        4
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EmrDeleteColorSpace {
     pub color_space_index: u32,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+impl SdkRead for EmrDeleteColorSpace {
+    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
+        let value = Self {
+            color_space_index: reader.read_u32()?,
+        };
+        validate_emr_delete_color_space(&value)?;
+        Ok(value)
+    }
+}
+
+impl SdkWrite for EmrDeleteColorSpace {
+    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+        validate_emr_delete_color_space(self)?;
+        writer.write_u32(self.color_space_index)
+    }
+}
+
+impl SdkSize for EmrDeleteColorSpace {
+    fn sdk_size(&self) -> u64 {
+        4
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EmrSetLayout {
     pub layout_mode: u32,
 }
@@ -7537,6 +8431,29 @@ impl EmrSetLayout {
 
     pub const fn invalid_layout_bits(&self) -> u32 {
         self.layout_mode & !EmrLayoutModeFlags::all().bits()
+    }
+}
+
+impl SdkRead for EmrSetLayout {
+    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
+        let value = Self {
+            layout_mode: reader.read_u32()?,
+        };
+        validate_emr_set_layout(&value)?;
+        Ok(value)
+    }
+}
+
+impl SdkWrite for EmrSetLayout {
+    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+        validate_emr_set_layout(self)?;
+        writer.write_u32(self.layout_mode)
+    }
+}
+
+impl SdkSize for EmrSetLayout {
+    fn sdk_size(&self) -> u64 {
+        4
     }
 }
 
@@ -7914,10 +8831,7 @@ impl EmrPublicComment {
                 if data.is_empty() {
                     Ok(Self::EndGroup)
                 } else {
-                    Ok(Self::Unknown {
-                        identifier,
-                        data: data.to_vec(),
-                    })
+                    Err(Error::invalid(0, "EMR_COMMENT_ENDGROUP must not have data"))
                 }
             }
             Some(EmrPublicCommentIdentifier::MultiFormats) => {
@@ -7958,16 +8872,10 @@ impl EmrPublicComment {
             Self::MultiFormats(value) => value.write_to(writer),
             Self::WindowsMetafile(value) => value.write_to(writer),
             Self::Unknown { identifier, data } => {
-                match EmrPublicCommentIdentifier::from_raw(*identifier) {
-                    Some(EmrPublicCommentIdentifier::UnicodeString)
-                    | Some(EmrPublicCommentIdentifier::UnicodeEnd) => {
-                        return Err(Error::invalid(
-                            writer.position().unwrap_or(0),
-                            "EMR_COMMENT_UNICODE_STRING and EMR_COMMENT_UNICODE_END are reserved",
-                        ));
-                    }
-                    _ => {}
-                }
+                validate_unknown_public_comment_identifier(
+                    *identifier,
+                    writer.position().unwrap_or(0),
+                )?;
                 writer.write_all(data)
             }
         }
@@ -8547,11 +9455,82 @@ fn read_emr_text<R: std::io::Read + std::io::Seek>(
     wide: bool,
     record_name: &str,
 ) -> Result<(EmrText, usize)> {
+    let descriptor_start = reader.position()?;
+    let descriptor = peek_emr_text_descriptor(reader)?;
+    if descriptor.options.contains(ExtTextOutOptions::NO_RECT) {
+        reader.seek(descriptor_start)?;
+        return read_emr_text_with_rectangle(reader, data, wide, record_name, false);
+    }
+    if emr_text_requires_rectangle(descriptor.options) {
+        reader.seek(descriptor_start)?;
+        return read_emr_text_with_rectangle(reader, data, wide, record_name, true);
+    }
+
+    let string_start = record_relative_data_offset(descriptor.string_offset)?;
+    if string_start >= descriptor_start as usize + 40 {
+        reader.seek(descriptor_start)?;
+        match read_emr_text_with_rectangle(reader, data, wide, record_name, true) {
+            Ok(value) => return Ok(value),
+            Err(with_rectangle_error) => {
+                reader.seek(descriptor_start)?;
+                match read_emr_text_with_rectangle(reader, data, wide, record_name, false) {
+                    Ok(value) => return Ok(value),
+                    Err(_) => {
+                        reader.seek(descriptor_start)?;
+                        return Err(with_rectangle_error);
+                    }
+                }
+            }
+        }
+    }
+
+    reader.seek(descriptor_start)?;
+    match read_emr_text_with_rectangle(reader, data, wide, record_name, false) {
+        Ok(value) => Ok(value),
+        Err(no_rectangle_error) => {
+            reader.seek(descriptor_start)?;
+            match read_emr_text_with_rectangle(reader, data, wide, record_name, true) {
+                Ok(value) => Ok(value),
+                Err(_) => {
+                    reader.seek(descriptor_start)?;
+                    Err(no_rectangle_error)
+                }
+            }
+        }
+    }
+}
+
+struct EmrTextDescriptorHeader {
+    string_offset: usize,
+    options: ExtTextOutOptions,
+}
+
+fn peek_emr_text_descriptor<R: std::io::Read + std::io::Seek>(
+    reader: &mut Reader<R>,
+) -> Result<EmrTextDescriptorHeader> {
+    let descriptor_start = reader.position()?;
+    reader.seek(descriptor_start + 12)?;
+    let string_offset = reader.read_u32()? as usize;
+    let options = ExtTextOutOptions::from_bits_retain(reader.read_u32()?);
+    reader.seek(descriptor_start)?;
+    Ok(EmrTextDescriptorHeader {
+        string_offset,
+        options,
+    })
+}
+
+fn read_emr_text_with_rectangle<R: std::io::Read + std::io::Seek>(
+    reader: &mut Reader<R>,
+    data: &[u8],
+    wide: bool,
+    record_name: &str,
+    include_rectangle: bool,
+) -> Result<(EmrText, usize)> {
     let reference = PointL::read_from(reader)?;
     let chars = reader.read_u32()? as usize;
     let string_offset = reader.read_u32()? as usize;
     let options = ExtTextOutOptions::from_bits_retain(reader.read_u32()?);
-    let rectangle = if emr_text_requires_rectangle(options) {
+    let rectangle = if include_rectangle {
         Some(RectL::read_from(reader)?)
     } else {
         None
@@ -8641,11 +9620,7 @@ fn layout_emr_texts(
     let mut encoded = Vec::with_capacity(texts.len());
     for text in texts {
         current = current
-            .checked_add(if emr_text_requires_rectangle(text.options) {
-                40
-            } else {
-                24
-            })
+            .checked_add(if text.rectangle.is_some() { 40 } else { 24 })
             .ok_or_else(|| Error::invalid(0, "EMR text descriptor range overflows"))?;
         let text_bytes = text.text.encoded_bytes()?;
         if wide && !text_bytes.len().is_multiple_of(2) {
@@ -12501,7 +13476,7 @@ mod tests {
         let mut misaligned_string = record.clone();
         misaligned_string.data[40..44].copy_from_slice(&59_u32.to_le_bytes());
         assert!(misaligned_string.parse_data().is_err());
-        let invalid_rectangle = EmfRecordData::ExtTextOutW(EmrExtTextOut {
+        let rectangle_without_options = EmfRecordData::ExtTextOutW(EmrExtTextOut {
             bounds: RectL::default(),
             graphics_mode: EmrGraphicsMode::Compatible.raw(),
             ex_scale: 1.0,
@@ -12515,7 +13490,26 @@ mod tests {
             },
             padding: Vec::new(),
         });
-        assert!(invalid_rectangle.to_record().is_err());
+        let rectangle_record = rectangle_without_options.to_record().unwrap();
+        assert_eq!(
+            rectangle_record.parse_data().unwrap(),
+            rectangle_without_options
+        );
+        let invalid_no_rect = EmfRecordData::ExtTextOutW(EmrExtTextOut {
+            bounds: RectL::default(),
+            graphics_mode: EmrGraphicsMode::Compatible.raw(),
+            ex_scale: 1.0,
+            ey_scale: 1.0,
+            text: EmrText {
+                reference: PointL { x: 12, y: 34 },
+                options: ExtTextOutOptions::NO_RECT,
+                rectangle: Some(RectL::default()),
+                text: SdkString::raw(vec![b'H', 0, b'i', 0], SdkEncoding::Utf16Le),
+                dx: Vec::new(),
+            },
+            padding: Vec::new(),
+        });
+        assert!(invalid_no_rect.to_record().is_err());
         let invalid_dx = EmfRecordData::ExtTextOutW(EmrExtTextOut {
             bounds: RectL::default(),
             graphics_mode: EmrGraphicsMode::Compatible.raw(),
