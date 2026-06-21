@@ -2221,35 +2221,14 @@ pub struct EmrSetPixelV {
     pub color: ColorRef,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+#[sdk(validate = "validate_emr_set_mapper_flags")]
 pub struct EmrSetMapperFlags {
     pub flags: u32,
 }
 
-impl SdkRead for EmrSetMapperFlags {
-    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
-        let value = Self {
-            flags: reader.read_u32()?,
-        };
-        validate_emr_set_mapper_flags(&value)?;
-        Ok(value)
-    }
-}
-
-impl SdkWrite for EmrSetMapperFlags {
-    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
-        validate_emr_set_mapper_flags(self)?;
-        writer.write_u32(self.flags)
-    }
-}
-
-impl SdkSize for EmrSetMapperFlags {
-    fn sdk_size(&self) -> u64 {
-        4
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+#[sdk(validate = "validate_emr_set_map_mode")]
 pub struct EmrSetMapMode {
     pub map_mode: u32,
 }
@@ -2260,30 +2239,8 @@ impl EmrSetMapMode {
     }
 }
 
-impl SdkRead for EmrSetMapMode {
-    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
-        let value = Self {
-            map_mode: reader.read_u32()?,
-        };
-        validate_emr_set_map_mode(&value)?;
-        Ok(value)
-    }
-}
-
-impl SdkWrite for EmrSetMapMode {
-    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
-        validate_emr_set_map_mode(self)?;
-        writer.write_u32(self.map_mode)
-    }
-}
-
-impl SdkSize for EmrSetMapMode {
-    fn sdk_size(&self) -> u64 {
-        4
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+#[sdk(validate = "validate_emr_set_bk_mode")]
 pub struct EmrSetBkMode {
     pub background_mode: u32,
 }
@@ -2294,30 +2251,8 @@ impl EmrSetBkMode {
     }
 }
 
-impl SdkRead for EmrSetBkMode {
-    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
-        let value = Self {
-            background_mode: reader.read_u32()?,
-        };
-        validate_emr_set_bk_mode(&value)?;
-        Ok(value)
-    }
-}
-
-impl SdkWrite for EmrSetBkMode {
-    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
-        validate_emr_set_bk_mode(self)?;
-        writer.write_u32(self.background_mode)
-    }
-}
-
-impl SdkSize for EmrSetBkMode {
-    fn sdk_size(&self) -> u64 {
-        4
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+#[sdk(validate = "validate_emr_set_poly_fill_mode")]
 pub struct EmrSetPolyFillMode {
     pub polygon_fill_mode: u32,
 }
@@ -2328,30 +2263,8 @@ impl EmrSetPolyFillMode {
     }
 }
 
-impl SdkRead for EmrSetPolyFillMode {
-    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
-        let value = Self {
-            polygon_fill_mode: reader.read_u32()?,
-        };
-        validate_emr_set_poly_fill_mode(&value)?;
-        Ok(value)
-    }
-}
-
-impl SdkWrite for EmrSetPolyFillMode {
-    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
-        validate_emr_set_poly_fill_mode(self)?;
-        writer.write_u32(self.polygon_fill_mode)
-    }
-}
-
-impl SdkSize for EmrSetPolyFillMode {
-    fn sdk_size(&self) -> u64 {
-        4
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+#[sdk(validate = "validate_emr_set_rop2")]
 pub struct EmrSetRop2 {
     pub rop2_mode: u32,
 }
@@ -2361,29 +2274,6 @@ impl EmrSetRop2 {
         u16::try_from(self.rop2_mode)
             .ok()
             .and_then(WmfBinaryRasterOperation::from_raw)
-    }
-}
-
-impl SdkRead for EmrSetRop2 {
-    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
-        let value = Self {
-            rop2_mode: reader.read_u32()?,
-        };
-        validate_emr_set_rop2(&value)?;
-        Ok(value)
-    }
-}
-
-impl SdkWrite for EmrSetRop2 {
-    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
-        validate_emr_set_rop2(self)?;
-        writer.write_u32(self.rop2_mode)
-    }
-}
-
-impl SdkSize for EmrSetRop2 {
-    fn sdk_size(&self) -> u64 {
-        4
     }
 }
 
@@ -2398,7 +2288,8 @@ impl EmrSetStretchBltMode {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+#[sdk(validate = "validate_emr_set_text_align")]
 pub struct EmrSetTextAlign {
     pub text_alignment_mode: u32,
 }
@@ -2413,30 +2304,8 @@ impl EmrSetTextAlign {
     }
 }
 
-impl SdkRead for EmrSetTextAlign {
-    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
-        let value = Self {
-            text_alignment_mode: reader.read_u32()?,
-        };
-        validate_emr_set_text_align(&value)?;
-        Ok(value)
-    }
-}
-
-impl SdkWrite for EmrSetTextAlign {
-    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
-        validate_emr_set_text_align(self)?;
-        writer.write_u32(self.text_alignment_mode)
-    }
-}
-
-impl SdkSize for EmrSetTextAlign {
-    fn sdk_size(&self) -> u64 {
-        4
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+#[sdk(validate = "validate_emr_set_color_adjustment")]
 pub struct EmrSetColorAdjustment {
     pub size: u16,
     pub values: u16,
@@ -2450,51 +2319,6 @@ pub struct EmrSetColorAdjustment {
     pub brightness: i16,
     pub colorfulness: i16,
     pub red_green_tint: i16,
-}
-
-impl SdkRead for EmrSetColorAdjustment {
-    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
-        let value = Self {
-            size: reader.read_u16()?,
-            values: reader.read_u16()?,
-            illuminant_index: reader.read_u16()?,
-            red_gamma: reader.read_u16()?,
-            green_gamma: reader.read_u16()?,
-            blue_gamma: reader.read_u16()?,
-            reference_black: reader.read_u16()?,
-            reference_white: reader.read_u16()?,
-            contrast: reader.read_i16()?,
-            brightness: reader.read_i16()?,
-            colorfulness: reader.read_i16()?,
-            red_green_tint: reader.read_i16()?,
-        };
-        validate_emr_set_color_adjustment(&value)?;
-        Ok(value)
-    }
-}
-
-impl SdkWrite for EmrSetColorAdjustment {
-    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
-        validate_emr_set_color_adjustment(self)?;
-        writer.write_u16(self.size)?;
-        writer.write_u16(self.values)?;
-        writer.write_u16(self.illuminant_index)?;
-        writer.write_u16(self.red_gamma)?;
-        writer.write_u16(self.green_gamma)?;
-        writer.write_u16(self.blue_gamma)?;
-        writer.write_u16(self.reference_black)?;
-        writer.write_u16(self.reference_white)?;
-        writer.write_i16(self.contrast)?;
-        writer.write_i16(self.brightness)?;
-        writer.write_i16(self.colorfulness)?;
-        writer.write_i16(self.red_green_tint)
-    }
-}
-
-impl SdkSize for EmrSetColorAdjustment {
-    fn sdk_size(&self) -> u64 {
-        24
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -2693,32 +2517,10 @@ impl SdkSize for EmrScaleWindowExtEx {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+#[sdk(validate = "validate_emr_restore_dc")]
 pub struct EmrRestoreDc {
     pub saved_dc: i32,
-}
-
-impl SdkRead for EmrRestoreDc {
-    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
-        let value = Self {
-            saved_dc: reader.read_i32()?,
-        };
-        validate_emr_restore_dc(&value)?;
-        Ok(value)
-    }
-}
-
-impl SdkWrite for EmrRestoreDc {
-    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
-        validate_emr_restore_dc(self)?;
-        writer.write_i32(self.saved_dc)
-    }
-}
-
-impl SdkSize for EmrRestoreDc {
-    fn sdk_size(&self) -> u64 {
-        4
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, SdkObject)]
@@ -2726,7 +2528,8 @@ pub struct EmrSetWorldTransform {
     pub transform: XForm,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, SdkObject)]
+#[sdk(validate = "validate_emr_modify_world_transform")]
 pub struct EmrModifyWorldTransform {
     pub transform: XForm,
     pub mode: u32,
@@ -2738,32 +2541,8 @@ impl EmrModifyWorldTransform {
     }
 }
 
-impl SdkRead for EmrModifyWorldTransform {
-    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
-        let value = Self {
-            transform: XForm::read_from(reader)?,
-            mode: reader.read_u32()?,
-        };
-        validate_emr_modify_world_transform(&value)?;
-        Ok(value)
-    }
-}
-
-impl SdkWrite for EmrModifyWorldTransform {
-    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
-        validate_emr_modify_world_transform(self)?;
-        self.transform.write_to(writer)?;
-        writer.write_u32(self.mode)
-    }
-}
-
-impl SdkSize for EmrModifyWorldTransform {
-    fn sdk_size(&self) -> u64 {
-        self.transform.sdk_size() + 4
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+#[sdk(validate = "validate_emr_select_object")]
 pub struct EmrSelectObject {
     pub object_index: u32,
 }
@@ -2774,30 +2553,8 @@ impl EmrSelectObject {
     }
 }
 
-impl SdkRead for EmrSelectObject {
-    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
-        let value = Self {
-            object_index: reader.read_u32()?,
-        };
-        validate_emr_select_object(&value)?;
-        Ok(value)
-    }
-}
-
-impl SdkWrite for EmrSelectObject {
-    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
-        validate_emr_select_object(self)?;
-        writer.write_u32(self.object_index)
-    }
-}
-
-impl SdkSize for EmrSelectObject {
-    fn sdk_size(&self) -> u64 {
-        4
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+#[sdk(validate = "validate_emr_select_palette")]
 pub struct EmrSelectPalette {
     pub palette_index: u32,
 }
@@ -2808,61 +2565,15 @@ impl EmrSelectPalette {
     }
 }
 
-impl SdkRead for EmrSelectPalette {
-    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
-        let value = Self {
-            palette_index: reader.read_u32()?,
-        };
-        validate_emr_select_palette(&value)?;
-        Ok(value)
-    }
-}
-
-impl SdkWrite for EmrSelectPalette {
-    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
-        validate_emr_select_palette(self)?;
-        writer.write_u32(self.palette_index)
-    }
-}
-
-impl SdkSize for EmrSelectPalette {
-    fn sdk_size(&self) -> u64 {
-        4
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+#[sdk(validate = "validate_emr_resize_palette")]
 pub struct EmrResizePalette {
     pub palette_index: u32,
     pub number_of_entries: u32,
 }
 
-impl SdkRead for EmrResizePalette {
-    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
-        let value = Self {
-            palette_index: reader.read_u32()?,
-            number_of_entries: reader.read_u32()?,
-        };
-        validate_emr_resize_palette(&value)?;
-        Ok(value)
-    }
-}
-
-impl SdkWrite for EmrResizePalette {
-    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
-        validate_emr_resize_palette(self)?;
-        writer.write_u32(self.palette_index)?;
-        writer.write_u32(self.number_of_entries)
-    }
-}
-
-impl SdkSize for EmrResizePalette {
-    fn sdk_size(&self) -> u64 {
-        8
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+#[sdk(validate = "validate_emr_delete_object")]
 pub struct EmrDeleteObject {
     pub object_index: u32,
 }
@@ -2870,29 +2581,6 @@ pub struct EmrDeleteObject {
 impl EmrDeleteObject {
     pub fn stock_object_kind(&self) -> Option<EmrStockObject> {
         EmrStockObject::from_raw(self.object_index)
-    }
-}
-
-impl SdkRead for EmrDeleteObject {
-    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
-        let value = Self {
-            object_index: reader.read_u32()?,
-        };
-        validate_emr_delete_object(&value)?;
-        Ok(value)
-    }
-}
-
-impl SdkWrite for EmrDeleteObject {
-    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
-        validate_emr_delete_object(self)?;
-        writer.write_u32(self.object_index)
-    }
-}
-
-impl SdkSize for EmrDeleteObject {
-    fn sdk_size(&self) -> u64 {
-        4
     }
 }
 
@@ -2927,7 +2615,8 @@ pub struct EmrArc {
     pub end: PointL,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+#[sdk(validate = "validate_emr_ext_flood_fill")]
 pub struct EmrExtFloodFill {
     pub start: PointL,
     pub color: ColorRef,
@@ -2940,34 +2629,8 @@ impl EmrExtFloodFill {
     }
 }
 
-impl SdkRead for EmrExtFloodFill {
-    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
-        let value = Self {
-            start: PointL::read_from(reader)?,
-            color: ColorRef::read_from(reader)?,
-            flood_fill_mode: reader.read_u32()?,
-        };
-        validate_emr_ext_flood_fill(&value)?;
-        Ok(value)
-    }
-}
-
-impl SdkWrite for EmrExtFloodFill {
-    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
-        validate_emr_ext_flood_fill(self)?;
-        self.start.write_to(writer)?;
-        self.color.write_to(writer)?;
-        writer.write_u32(self.flood_fill_mode)
-    }
-}
-
-impl SdkSize for EmrExtFloodFill {
-    fn sdk_size(&self) -> u64 {
-        self.start.sdk_size() + self.color.sdk_size() + 4
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+#[sdk(validate = "validate_emr_set_arc_direction")]
 pub struct EmrSetArcDirection {
     pub arc_direction: u32,
 }
@@ -2978,35 +2641,13 @@ impl EmrSetArcDirection {
     }
 }
 
-impl SdkRead for EmrSetArcDirection {
-    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
-        let value = Self {
-            arc_direction: reader.read_u32()?,
-        };
-        validate_emr_set_arc_direction(&value)?;
-        Ok(value)
-    }
-}
-
-impl SdkWrite for EmrSetArcDirection {
-    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
-        validate_emr_set_arc_direction(self)?;
-        writer.write_u32(self.arc_direction)
-    }
-}
-
-impl SdkSize for EmrSetArcDirection {
-    fn sdk_size(&self) -> u64 {
-        4
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
 pub struct EmrSetMiterLimit {
     pub miter_limit: u32,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+#[sdk(validate = "validate_emr_select_clip_path")]
 pub struct EmrSelectClipPath {
     pub region_mode: u32,
 }
@@ -3014,29 +2655,6 @@ pub struct EmrSelectClipPath {
 impl EmrSelectClipPath {
     pub fn region_mode_kind(&self) -> Option<EmrRegionMode> {
         EmrRegionMode::from_raw(self.region_mode)
-    }
-}
-
-impl SdkRead for EmrSelectClipPath {
-    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
-        let value = Self {
-            region_mode: reader.read_u32()?,
-        };
-        validate_emr_select_clip_path(&value)?;
-        Ok(value)
-    }
-}
-
-impl SdkWrite for EmrSelectClipPath {
-    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
-        validate_emr_select_clip_path(self)?;
-        writer.write_u32(self.region_mode)
-    }
-}
-
-impl SdkSize for EmrSelectClipPath {
-    fn sdk_size(&self) -> u64 {
-        4
     }
 }
 
@@ -3335,7 +2953,8 @@ impl EmrExtSelectClipRgn {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+#[sdk(validate = "validate_log_pen")]
 pub struct LogPen {
     pub pen_style: u32,
     pub width: PointL,
@@ -3381,33 +3000,6 @@ impl LogPen {
 
     pub const fn pen_reserved_bits(&self) -> u32 {
         self.pen_style & !(0x0000_000F | 0x0000_0F00 | 0x0000_F000 | 0x000F_0000)
-    }
-}
-
-impl SdkRead for LogPen {
-    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
-        let value = Self {
-            pen_style: reader.read_u32()?,
-            width: PointL::read_from(reader)?,
-            color: ColorRef::read_from(reader)?,
-        };
-        validate_log_pen(&value)?;
-        Ok(value)
-    }
-}
-
-impl SdkWrite for LogPen {
-    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
-        validate_log_pen(self)?;
-        writer.write_u32(self.pen_style)?;
-        self.width.write_to(writer)?;
-        self.color.write_to(writer)
-    }
-}
-
-impl SdkSize for LogPen {
-    fn sdk_size(&self) -> u64 {
-        16
     }
 }
 
@@ -3532,7 +3124,8 @@ impl LogPenEx {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+#[sdk(validate = "validate_emr_create_pen")]
 pub struct EmrCreatePen {
     pub object_index: u32,
     pub pen_style: u32,
@@ -3590,36 +3183,8 @@ impl EmrCreatePen {
     }
 }
 
-impl SdkRead for EmrCreatePen {
-    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
-        let value = Self {
-            object_index: reader.read_u32()?,
-            pen_style: reader.read_u32()?,
-            width: PointL::read_from(reader)?,
-            color: ColorRef::read_from(reader)?,
-        };
-        validate_emr_create_pen(&value)?;
-        Ok(value)
-    }
-}
-
-impl SdkWrite for EmrCreatePen {
-    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
-        validate_emr_create_pen(self)?;
-        writer.write_u32(self.object_index)?;
-        writer.write_u32(self.pen_style)?;
-        self.width.write_to(writer)?;
-        self.color.write_to(writer)
-    }
-}
-
-impl SdkSize for EmrCreatePen {
-    fn sdk_size(&self) -> u64 {
-        20
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+#[sdk(validate = "validate_emr_create_brush_indirect")]
 pub struct EmrCreateBrushIndirect {
     pub object_index: u32,
     pub brush_style: u32,
@@ -3634,35 +3199,6 @@ impl EmrCreateBrushIndirect {
 
     pub fn brush_hatch_kind(&self) -> Option<EmrHatchStyle> {
         EmrHatchStyle::from_raw(self.brush_hatch)
-    }
-}
-
-impl SdkRead for EmrCreateBrushIndirect {
-    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
-        let value = Self {
-            object_index: reader.read_u32()?,
-            brush_style: reader.read_u32()?,
-            color: ColorRef::read_from(reader)?,
-            brush_hatch: reader.read_u32()?,
-        };
-        validate_emr_create_brush_indirect(&value)?;
-        Ok(value)
-    }
-}
-
-impl SdkWrite for EmrCreateBrushIndirect {
-    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
-        validate_emr_create_brush_indirect(self)?;
-        writer.write_u32(self.object_index)?;
-        writer.write_u32(self.brush_style)?;
-        self.color.write_to(writer)?;
-        writer.write_u32(self.brush_hatch)
-    }
-}
-
-impl SdkSize for EmrCreateBrushIndirect {
-    fn sdk_size(&self) -> u64 {
-        16
     }
 }
 
@@ -8329,7 +7865,8 @@ pub struct BitmapSourceBounds {
     pub height: i32,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+#[sdk(validate = "validate_emr_set_icm_mode")]
 pub struct EmrSetIcmMode {
     pub icm_mode: u32,
 }
@@ -8340,86 +7877,20 @@ impl EmrSetIcmMode {
     }
 }
 
-impl SdkRead for EmrSetIcmMode {
-    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
-        let value = Self {
-            icm_mode: reader.read_u32()?,
-        };
-        validate_emr_set_icm_mode(&value)?;
-        Ok(value)
-    }
-}
-
-impl SdkWrite for EmrSetIcmMode {
-    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
-        validate_emr_set_icm_mode(self)?;
-        writer.write_u32(self.icm_mode)
-    }
-}
-
-impl SdkSize for EmrSetIcmMode {
-    fn sdk_size(&self) -> u64 {
-        4
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+#[sdk(validate = "validate_emr_set_color_space")]
 pub struct EmrSetColorSpace {
     pub color_space_index: u32,
 }
 
-impl SdkRead for EmrSetColorSpace {
-    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
-        let value = Self {
-            color_space_index: reader.read_u32()?,
-        };
-        validate_emr_set_color_space(&value)?;
-        Ok(value)
-    }
-}
-
-impl SdkWrite for EmrSetColorSpace {
-    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
-        validate_emr_set_color_space(self)?;
-        writer.write_u32(self.color_space_index)
-    }
-}
-
-impl SdkSize for EmrSetColorSpace {
-    fn sdk_size(&self) -> u64 {
-        4
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+#[sdk(validate = "validate_emr_delete_color_space")]
 pub struct EmrDeleteColorSpace {
     pub color_space_index: u32,
 }
 
-impl SdkRead for EmrDeleteColorSpace {
-    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
-        let value = Self {
-            color_space_index: reader.read_u32()?,
-        };
-        validate_emr_delete_color_space(&value)?;
-        Ok(value)
-    }
-}
-
-impl SdkWrite for EmrDeleteColorSpace {
-    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
-        validate_emr_delete_color_space(self)?;
-        writer.write_u32(self.color_space_index)
-    }
-}
-
-impl SdkSize for EmrDeleteColorSpace {
-    fn sdk_size(&self) -> u64 {
-        4
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+#[sdk(validate = "validate_emr_set_layout")]
 pub struct EmrSetLayout {
     pub layout_mode: u32,
 }
@@ -8431,29 +7902,6 @@ impl EmrSetLayout {
 
     pub const fn invalid_layout_bits(&self) -> u32 {
         self.layout_mode & !EmrLayoutModeFlags::all().bits()
-    }
-}
-
-impl SdkRead for EmrSetLayout {
-    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
-        let value = Self {
-            layout_mode: reader.read_u32()?,
-        };
-        validate_emr_set_layout(&value)?;
-        Ok(value)
-    }
-}
-
-impl SdkWrite for EmrSetLayout {
-    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
-        validate_emr_set_layout(self)?;
-        writer.write_u32(self.layout_mode)
-    }
-}
-
-impl SdkSize for EmrSetLayout {
-    fn sdk_size(&self) -> u64 {
-        4
     }
 }
 

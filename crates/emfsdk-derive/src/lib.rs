@@ -1,7 +1,7 @@
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::{
-    Data, DeriveInput, Expr, ExprLit, Fields, Lit, Type, parse_macro_input, spanned::Spanned,
+    Data, DeriveInput, Expr, ExprLit, Fields, Lit, Path, Type, parse_macro_input, spanned::Spanned,
 };
 
 #[proc_macro_derive(SdkEnum, attributes(sdk))]
@@ -24,6 +24,7 @@ pub fn sdk_object(input: TokenStream) -> TokenStream {
 
 fn expand_sdk_object(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
     let name = &input.ident;
+    let validate = sdk_validate(input)?;
     let fields = match &input.data {
         Data::Struct(data) => match &data.fields {
             Fields::Named(fields) => fields,
@@ -71,14 +72,33 @@ fn expand_sdk_object(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
         }
     }
 
+    let validate_read = validate
+        .as_ref()
+        .map(|path| {
+            quote! {
+                #path(&value)?;
+            }
+        })
+        .unwrap_or_default();
+    let validate_write = validate
+        .as_ref()
+        .map(|path| {
+            quote! {
+                #path(self)?;
+            }
+        })
+        .unwrap_or_default();
+
     Ok(quote! {
         impl ::emfsdk::common::SdkRead for #name {
             fn read_from<R: ::std::io::Read + ::std::io::Seek>(
                 reader: &mut ::emfsdk::common::Reader<R>,
             ) -> ::emfsdk::common::Result<Self> {
-                Ok(Self {
+                let value = Self {
                     #(#read_fields,)*
-                })
+                };
+                #validate_read
+                Ok(value)
             }
         }
 
@@ -87,6 +107,7 @@ fn expand_sdk_object(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
                 &self,
                 writer: &mut ::emfsdk::common::Writer<W>,
             ) -> ::emfsdk::common::Result<()> {
+                #validate_write
                 #(#write_fields)*
                 Ok(())
             }
@@ -98,6 +119,39 @@ fn expand_sdk_object(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
             }
         }
     })
+}
+
+fn sdk_validate(input: &DeriveInput) -> syn::Result<Option<Path>> {
+    let mut validate = None;
+    for attr in &input.attrs {
+        if !attr.path().is_ident("sdk") {
+            continue;
+        }
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("validate") {
+                let value = meta.value()?;
+                if value.peek(Lit) {
+                    let lit: Lit = value.parse()?;
+                    match lit {
+                        Lit::Str(value) => validate = Some(value.parse()?),
+                        _ => {
+                            return Err(syn::Error::new(
+                                lit.span(),
+                                "sdk validate literal must be a string",
+                            ));
+                        }
+                    }
+                } else {
+                    validate = Some(value.parse()?);
+                }
+            } else if meta.input.peek(syn::Token![=]) {
+                let value = meta.value()?;
+                let _: Expr = value.parse()?;
+            }
+            Ok(())
+        })?;
+    }
+    Ok(validate)
 }
 
 fn expand_sdk_enum(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {

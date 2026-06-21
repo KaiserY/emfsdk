@@ -1914,41 +1914,13 @@ pub struct WmfRectRecord {
     pub left: i16,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, SdkObject)]
+#[sdk(validate = "validate_wmf_scale_ext_record")]
 pub struct WmfScaleExtRecord {
     pub y_denom: i16,
     pub y_num: i16,
     pub x_denom: i16,
     pub x_num: i16,
-}
-
-impl SdkRead for WmfScaleExtRecord {
-    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
-        let value = Self {
-            y_denom: reader.read_i16()?,
-            y_num: reader.read_i16()?,
-            x_denom: reader.read_i16()?,
-            x_num: reader.read_i16()?,
-        };
-        validate_wmf_scale_ext_record(&value)?;
-        Ok(value)
-    }
-}
-
-impl SdkWrite for WmfScaleExtRecord {
-    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
-        validate_wmf_scale_ext_record(self)?;
-        writer.write_i16(self.y_denom)?;
-        writer.write_i16(self.y_num)?;
-        writer.write_i16(self.x_denom)?;
-        writer.write_i16(self.x_num)
-    }
-}
-
-impl SdkSize for WmfScaleExtRecord {
-    fn sdk_size(&self) -> u64 {
-        8
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, SdkObject)]
@@ -1990,7 +1962,8 @@ pub struct WmfFloodFillRecord {
     pub x_start: i16,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, SdkObject)]
+#[sdk(validate = "validate_wmf_ext_flood_fill")]
 pub struct WmfExtFloodFillRecord {
     pub mode: u16,
     pub color: ColorRef,
@@ -2004,35 +1977,6 @@ impl WmfExtFloodFillRecord {
     }
 }
 
-impl SdkRead for WmfExtFloodFillRecord {
-    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
-        let value = Self {
-            mode: reader.read_u16()?,
-            color: ColorRef::read_from(reader)?,
-            y: reader.read_i16()?,
-            x: reader.read_i16()?,
-        };
-        validate_wmf_ext_flood_fill(&value)?;
-        Ok(value)
-    }
-}
-
-impl SdkWrite for WmfExtFloodFillRecord {
-    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
-        validate_wmf_ext_flood_fill(self)?;
-        writer.write_u16(self.mode)?;
-        self.color.write_to(writer)?;
-        writer.write_i16(self.y)?;
-        writer.write_i16(self.x)
-    }
-}
-
-impl SdkSize for WmfExtFloodFillRecord {
-    fn sdk_size(&self) -> u64 {
-        10
-    }
-}
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, SdkObject)]
 #[sdk(format = "wmf")]
 pub struct WmfSetPixelRecord {
@@ -2041,7 +1985,8 @@ pub struct WmfSetPixelRecord {
     pub x: i16,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, SdkObject)]
+#[sdk(validate = "validate_wmf_pat_blt_record")]
 pub struct WmfPatBltRecord {
     pub raster_operation: u32,
     pub height: i16,
@@ -2061,37 +2006,6 @@ impl WmfPatBltRecord {
 
     fn read_data(data: &[u8]) -> Result<Self> {
         read_object(data, "META_PATBLT")
-    }
-}
-
-impl SdkRead for WmfPatBltRecord {
-    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
-        let value = Self {
-            raster_operation: reader.read_u32()?,
-            height: reader.read_i16()?,
-            width: reader.read_i16()?,
-            y_left: reader.read_i16()?,
-            x_left: reader.read_i16()?,
-        };
-        validate_wmf_ternary_raster_operation(value.raster_operation, "META_PATBLT")?;
-        Ok(value)
-    }
-}
-
-impl SdkWrite for WmfPatBltRecord {
-    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
-        validate_wmf_ternary_raster_operation(self.raster_operation, "META_PATBLT")?;
-        writer.write_u32(self.raster_operation)?;
-        writer.write_i16(self.height)?;
-        writer.write_i16(self.width)?;
-        writer.write_i16(self.y_left)?;
-        writer.write_i16(self.x_left)
-    }
-}
-
-impl SdkSize for WmfPatBltRecord {
-    fn sdk_size(&self) -> u64 {
-        12
     }
 }
 
@@ -2739,7 +2653,8 @@ pub struct WmfObjectIndexRecord {
     pub index: u16,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, SdkObject)]
+#[sdk(validate = "validate_wmf_log_brush_object")]
 pub struct WmfLogBrushObject {
     pub brush_style: u16,
     pub color_ref: ColorRef,
@@ -2766,31 +2681,8 @@ impl WmfLogBrushObject {
     }
 }
 
-impl SdkRead for WmfLogBrushObject {
-    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
-        let value = Self {
-            brush_style: reader.read_u16()?,
-            color_ref: ColorRef::read_from(reader)?,
-            brush_hatch: reader.read_u16()?,
-        };
-        validate_wmf_log_brush_object(&value)?;
-        Ok(value)
-    }
-}
-
-impl SdkWrite for WmfLogBrushObject {
-    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
-        WmfLogBrushObject::write_to(self, writer)
-    }
-}
-
-impl SdkSize for WmfLogBrushObject {
-    fn sdk_size(&self) -> u64 {
-        8
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, SdkObject)]
+#[sdk(validate = "validate_wmf_pen_object")]
 pub struct WmfPenObject {
     pub pen_style: u16,
     pub width: PointS,
@@ -2846,30 +2738,6 @@ impl WmfPenObject {
         writer.write_u16(self.pen_style)?;
         self.width.write_to(writer)?;
         self.color_ref.write_to(writer)
-    }
-}
-
-impl SdkRead for WmfPenObject {
-    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
-        let value = Self {
-            pen_style: reader.read_u16()?,
-            width: PointS::read_from(reader)?,
-            color_ref: ColorRef::read_from(reader)?,
-        };
-        validate_wmf_pen_object(&value)?;
-        Ok(value)
-    }
-}
-
-impl SdkWrite for WmfPenObject {
-    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
-        WmfPenObject::write_to(self, writer)
-    }
-}
-
-impl SdkSize for WmfPenObject {
-    fn sdk_size(&self) -> u64 {
-        10
     }
 }
 
@@ -3017,7 +2885,8 @@ impl SdkSize for WmfFontObject {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, SdkObject)]
+#[sdk(validate = "validate_wmf_palette_entry")]
 pub struct WmfPaletteEntry {
     pub red: u8,
     pub green: u8,
@@ -3052,46 +2921,11 @@ impl WmfPaletteEntry {
         &self,
         writer: &mut Writer<W>,
     ) -> Result<()> {
-        if self.flag_kind().is_none() {
-            return Err(Error::invalid(
-                0,
-                "WMF PaletteEntry Values is not a valid PaletteEntryFlag",
-            ));
-        }
+        validate_wmf_palette_entry(self)?;
         writer.write_u8(self.red)?;
         writer.write_u8(self.green)?;
         writer.write_u8(self.blue)?;
         writer.write_u8(self.values)
-    }
-}
-
-impl SdkRead for WmfPaletteEntry {
-    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
-        let value = Self {
-            red: reader.read_u8()?,
-            green: reader.read_u8()?,
-            blue: reader.read_u8()?,
-            values: reader.read_u8()?,
-        };
-        if value.flag_kind().is_none() {
-            return Err(Error::invalid(
-                0,
-                "WMF PaletteEntry Values is not a valid PaletteEntryFlag",
-            ));
-        }
-        Ok(value)
-    }
-}
-
-impl SdkWrite for WmfPaletteEntry {
-    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
-        WmfPaletteEntry::write_to(self, writer)
-    }
-}
-
-impl SdkSize for WmfPaletteEntry {
-    fn sdk_size(&self) -> u64 {
-        4
     }
 }
 
@@ -4539,6 +4373,10 @@ fn validate_wmf_scale_ext_record(value: &WmfScaleExtRecord) -> Result<()> {
     Ok(())
 }
 
+fn validate_wmf_pat_blt_record(value: &WmfPatBltRecord) -> Result<()> {
+    validate_wmf_ternary_raster_operation(value.raster_operation, "META_PATBLT")
+}
+
 fn validate_wmf_ext_flood_fill(value: &WmfExtFloodFillRecord) -> Result<()> {
     if value.mode_kind().is_none() {
         return Err(Error::invalid(
@@ -4570,14 +4408,19 @@ fn validate_wmf_log_brush_object(value: &WmfLogBrushObject) -> Result<()> {
     Ok(())
 }
 
+fn validate_wmf_palette_entry(value: &WmfPaletteEntry) -> Result<()> {
+    if value.flag_kind().is_none() {
+        return Err(Error::invalid(
+            0,
+            "WMF PaletteEntry Values is not a valid PaletteEntryFlag",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_wmf_palette_object(value: &WmfPaletteObject) -> Result<()> {
     for entry in &value.entries {
-        if entry.flag_kind().is_none() {
-            return Err(Error::invalid(
-                0,
-                "WMF PaletteEntry Values is not a valid PaletteEntryFlag",
-            ));
-        }
+        validate_wmf_palette_entry(entry)?;
     }
     Ok(())
 }

@@ -118,7 +118,8 @@ pub enum BitmapGamutMappingIntent {
     AbsoluteColorimetric = 0x0000_0008,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, SdkObject)]
+#[sdk(validate = "validate_rgb_quad")]
 pub struct RgbQuad {
     pub blue: u8,
     pub green: u8,
@@ -126,36 +127,8 @@ pub struct RgbQuad {
     pub reserved: u8,
 }
 
-impl SdkRead for RgbQuad {
-    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
-        let value = Self {
-            blue: reader.read_u8()?,
-            green: reader.read_u8()?,
-            red: reader.read_u8()?,
-            reserved: reader.read_u8()?,
-        };
-        validate_rgb_quad(&value)?;
-        Ok(value)
-    }
-}
-
-impl SdkWrite for RgbQuad {
-    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
-        validate_rgb_quad(self)?;
-        writer.write_u8(self.blue)?;
-        writer.write_u8(self.green)?;
-        writer.write_u8(self.red)?;
-        writer.write_u8(self.reserved)
-    }
-}
-
-impl SdkSize for RgbQuad {
-    fn sdk_size(&self) -> u64 {
-        4
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+#[sdk(validate = "validate_bitmap_core_header")]
 pub struct BitmapCoreHeader {
     pub header_size: u32,
     pub width: u16,
@@ -170,38 +143,8 @@ impl BitmapCoreHeader {
     }
 }
 
-impl SdkRead for BitmapCoreHeader {
-    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
-        let value = Self {
-            header_size: reader.read_u32()?,
-            width: reader.read_u16()?,
-            height: reader.read_u16()?,
-            planes: reader.read_u16()?,
-            bit_count: reader.read_u16()?,
-        };
-        validate_bitmap_core_header(&value)?;
-        Ok(value)
-    }
-}
-
-impl SdkWrite for BitmapCoreHeader {
-    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
-        validate_bitmap_core_header(self)?;
-        writer.write_u32(self.header_size)?;
-        writer.write_u16(self.width)?;
-        writer.write_u16(self.height)?;
-        writer.write_u16(self.planes)?;
-        writer.write_u16(self.bit_count)
-    }
-}
-
-impl SdkSize for BitmapCoreHeader {
-    fn sdk_size(&self) -> u64 {
-        u64::from(BITMAP_CORE_HEADER_SIZE)
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+#[sdk(validate = "validate_bitmap_info_header")]
 pub struct BitmapInfoHeader {
     pub header_size: u32,
     pub width: i32,
@@ -234,49 +177,6 @@ impl BitmapInfoHeader {
     }
 }
 
-impl SdkRead for BitmapInfoHeader {
-    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
-        let value = Self {
-            header_size: reader.read_u32()?,
-            width: reader.read_i32()?,
-            height: reader.read_i32()?,
-            planes: reader.read_u16()?,
-            bit_count: reader.read_u16()?,
-            compression: reader.read_u32()?,
-            image_size: reader.read_u32()?,
-            x_pels_per_meter: reader.read_i32()?,
-            y_pels_per_meter: reader.read_i32()?,
-            color_used: reader.read_u32()?,
-            color_important: reader.read_u32()?,
-        };
-        validate_bitmap_info_header(&value)?;
-        Ok(value)
-    }
-}
-
-impl SdkWrite for BitmapInfoHeader {
-    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
-        validate_bitmap_info_header(self)?;
-        writer.write_u32(self.header_size)?;
-        writer.write_i32(self.width)?;
-        writer.write_i32(self.height)?;
-        writer.write_u16(self.planes)?;
-        writer.write_u16(self.bit_count)?;
-        writer.write_u32(self.compression)?;
-        writer.write_u32(self.image_size)?;
-        writer.write_i32(self.x_pels_per_meter)?;
-        writer.write_i32(self.y_pels_per_meter)?;
-        writer.write_u32(self.color_used)?;
-        writer.write_u32(self.color_important)
-    }
-}
-
-impl SdkSize for BitmapInfoHeader {
-    fn sdk_size(&self) -> u64 {
-        u64::from(BITMAP_INFO_HEADER_SIZE)
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
 #[sdk(format = "wmf")]
 pub struct BitmapCieXyz {
@@ -293,7 +193,8 @@ pub struct BitmapCieXyzTriple {
     pub blue: BitmapCieXyz,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+#[sdk(validate = "validate_bitmap_v4_header")]
 pub struct BitmapV4Header {
     pub base: BitmapInfoHeader,
     pub red_mask: u32,
@@ -326,47 +227,6 @@ impl BitmapV4Header {
 
     pub fn is_top_down(&self) -> bool {
         self.base.is_top_down()
-    }
-}
-
-impl SdkRead for BitmapV4Header {
-    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
-        let value = Self {
-            base: BitmapInfoHeader::read_from(reader)?,
-            red_mask: reader.read_u32()?,
-            green_mask: reader.read_u32()?,
-            blue_mask: reader.read_u32()?,
-            alpha_mask: reader.read_u32()?,
-            color_space_type: reader.read_u32()?,
-            endpoints: BitmapCieXyzTriple::read_from(reader)?,
-            gamma_red: reader.read_u32()?,
-            gamma_green: reader.read_u32()?,
-            gamma_blue: reader.read_u32()?,
-        };
-        validate_bitmap_v4_header(&value)?;
-        Ok(value)
-    }
-}
-
-impl SdkWrite for BitmapV4Header {
-    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
-        validate_bitmap_v4_header(self)?;
-        self.base.write_to(writer)?;
-        writer.write_u32(self.red_mask)?;
-        writer.write_u32(self.green_mask)?;
-        writer.write_u32(self.blue_mask)?;
-        writer.write_u32(self.alpha_mask)?;
-        writer.write_u32(self.color_space_type)?;
-        self.endpoints.write_to(writer)?;
-        writer.write_u32(self.gamma_red)?;
-        writer.write_u32(self.gamma_green)?;
-        writer.write_u32(self.gamma_blue)
-    }
-}
-
-impl SdkSize for BitmapV4Header {
-    fn sdk_size(&self) -> u64 {
-        u64::from(BITMAP_V4_HEADER_SIZE)
     }
 }
 
