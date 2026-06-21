@@ -595,6 +595,14 @@ impl WmfTernaryRasterOperationCode {
     pub const fn raw(self) -> u8 {
         self.0
     }
+
+    pub const fn uses_source(self) -> bool {
+        ((self.0 ^ (self.0 >> 2)) & 0x33) != 0
+    }
+
+    pub const fn canonical_raw(self) -> u32 {
+        WMF_TERNARY_RASTER_OPERATION_VALUES[self.0 as usize]
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -624,7 +632,54 @@ impl WmfTernaryRasterOperation {
     pub const fn operation_code(self) -> WmfTernaryRasterOperationCode {
         WmfTernaryRasterOperationCode::from_raw(self.operation_code_raw())
     }
+
+    pub const fn uses_source(self) -> bool {
+        self.operation_code().uses_source()
+    }
+
+    pub const fn canonical_raw(self) -> u32 {
+        self.operation_code().canonical_raw()
+    }
+
+    pub const fn is_valid(self) -> bool {
+        self.raw == self.canonical_raw()
+    }
 }
+
+const WMF_TERNARY_RASTER_OPERATION_VALUES: [u32; 256] = [
+    0x00000042, 0x00010289, 0x00020C89, 0x000300AA, 0x00040C88, 0x000500A9, 0x00060865, 0x000702C5,
+    0x00080F08, 0x00090245, 0x000A0329, 0x000B0B2A, 0x000C0324, 0x000D0B25, 0x000E08A5, 0x000F0001,
+    0x00100C85, 0x001100A6, 0x00120868, 0x001302C8, 0x00140869, 0x001502C9, 0x00165CCA, 0x00171D54,
+    0x00180D59, 0x00191CC8, 0x001A06C5, 0x001B0768, 0x001C06CA, 0x001D0766, 0x001E01A5, 0x001F0385,
+    0x00200F09, 0x00210248, 0x00220326, 0x00230B24, 0x00240D55, 0x00251CC5, 0x002606C8, 0x00271868,
+    0x00280369, 0x002916CA, 0x002A0CC9, 0x002B1D58, 0x002C0784, 0x002D060A, 0x002E064A, 0x002F0E2A,
+    0x0030032A, 0x00310B28, 0x00320688, 0x00330008, 0x003406C4, 0x00351864, 0x003601A8, 0x00370388,
+    0x0038078A, 0x00390604, 0x003A0644, 0x003B0E24, 0x003C004A, 0x003D18A4, 0x003E1B24, 0x003F00EA,
+    0x00400F0A, 0x00410249, 0x00420D5D, 0x00431CC4, 0x00440328, 0x00450B29, 0x004606C6, 0x0047076A,
+    0x00480368, 0x004916C5, 0x004A0789, 0x004B0605, 0x004C0CC8, 0x004D1954, 0x004E0645, 0x004F0E25,
+    0x00500325, 0x00510B26, 0x005206C9, 0x00530764, 0x005408A9, 0x00550009, 0x005601A9, 0x00570389,
+    0x00580785, 0x00590609, 0x005A0049, 0x005B18A9, 0x005C0649, 0x005D0E29, 0x005E1B29, 0x005F00E9,
+    0x00600365, 0x006116C6, 0x00620786, 0x00630608, 0x00640788, 0x00650606, 0x00660046, 0x006718A8,
+    0x006858A6, 0x00690145, 0x006A01E9, 0x006B178A, 0x006C01E8, 0x006D1785, 0x006E1E28, 0x006F0C65,
+    0x00700CC5, 0x00711D5C, 0x00720648, 0x00730E28, 0x00740646, 0x00750E26, 0x00761B28, 0x007700E6,
+    0x007801E5, 0x00791786, 0x007A1E29, 0x007B0C68, 0x007C1E24, 0x007D0C69, 0x007E0955, 0x007F03C9,
+    0x008003E9, 0x00810975, 0x00820C49, 0x00831E04, 0x00840C48, 0x00851E05, 0x008617A6, 0x008701C5,
+    0x008800C6, 0x00891B08, 0x008A0E06, 0x008B0666, 0x008C0E08, 0x008D0668, 0x008E1D7C, 0x008F0CE5,
+    0x00900C45, 0x00911E08, 0x009217A9, 0x009301C4, 0x009417AA, 0x009501C9, 0x00960169, 0x0097588A,
+    0x00981888, 0x00990066, 0x009A0709, 0x009B07A8, 0x009C0704, 0x009D07A6, 0x009E16E6, 0x009F0345,
+    0x00A000C9, 0x00A11B05, 0x00A20E09, 0x00A30669, 0x00A41885, 0x00A50065, 0x00A60706, 0x00A707A5,
+    0x00A803A9, 0x00A90189, 0x00AA0029, 0x00AB0889, 0x00AC0744, 0x00AD06E9, 0x00AE0B06, 0x00AF0229,
+    0x00B00E05, 0x00B10665, 0x00B21974, 0x00B30CE8, 0x00B4070A, 0x00B507A9, 0x00B616E9, 0x00B70348,
+    0x00B8074A, 0x00B906E6, 0x00BA0B09, 0x00BB0226, 0x00BC1CE4, 0x00BD0D7D, 0x00BE0269, 0x00BF08C9,
+    0x00C000CA, 0x00C11B04, 0x00C21884, 0x00C3006A, 0x00C40E04, 0x00C50664, 0x00C60708, 0x00C707AA,
+    0x00C803A8, 0x00C90184, 0x00CA0749, 0x00CB06E4, 0x00CC0020, 0x00CD0888, 0x00CE0B08, 0x00CF0224,
+    0x00D00E0A, 0x00D1066A, 0x00D20705, 0x00D307A4, 0x00D41D78, 0x00D50CE9, 0x00D616EA, 0x00D70349,
+    0x00D80745, 0x00D906E8, 0x00DA1CE9, 0x00DB0D75, 0x00DC0B04, 0x00DD0228, 0x00DE0268, 0x00DF08C8,
+    0x00E003A5, 0x00E10185, 0x00E20746, 0x00E306EA, 0x00E40748, 0x00E506E5, 0x00E61CE8, 0x00E70D79,
+    0x00E81D74, 0x00E95CE6, 0x00EA02E9, 0x00EB0849, 0x00EC02E8, 0x00ED0848, 0x00EE0086, 0x00EF0A08,
+    0x00F00021, 0x00F10885, 0x00F20B05, 0x00F3022A, 0x00F40B0A, 0x00F50225, 0x00F60265, 0x00F708C5,
+    0x00F802E5, 0x00F90845, 0x00FA0089, 0x00FB0A09, 0x00FC008A, 0x00FD0A0A, 0x00FE02A9, 0x00FF0062,
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, SdkEnum)]
 #[sdk(repr = "u16")]
@@ -855,6 +910,7 @@ pub struct WmfMetafile {
     pub placeable_header: Option<WmfPlaceableHeader>,
     pub header: WmfHeader,
     pub records: Vec<WmfRecord>,
+    pub trailing_data: Vec<u8>,
 }
 
 impl WmfMetafile {
@@ -877,10 +933,16 @@ impl WmfMetafile {
             }
         }
 
+        if !matches!(records.last(), Some(record) if record.function == META_EOF) {
+            return Err(Error::invalid(0, "WMF metafile must end with META_EOF"));
+        }
+        let trailing_data = bytes[reader.position()? as usize..].to_vec();
+
         Ok(Self {
             placeable_header,
             header,
             records,
+            trailing_data,
         })
     }
 
@@ -893,7 +955,59 @@ impl WmfMetafile {
         for record in &self.records {
             record.write_to(&mut writer)?;
         }
+        writer.write_all(&self.trailing_data)?;
         Ok(writer.into_inner().into_inner())
+    }
+
+    pub fn computed_file_size_words(&self) -> Result<u32> {
+        let mut total = u64::from(self.header.header_size_words);
+        for record in &self.records {
+            total = total
+                .checked_add(u64::from(record_size_words(record)?))
+                .ok_or_else(|| Error::invalid(0, "WMF FileSize overflows"))?;
+        }
+        if total > u64::from(u32::MAX) {
+            return Err(Error::invalid(0, "WMF FileSize exceeds u32::MAX WORDs"));
+        }
+        Ok(total as u32)
+    }
+
+    pub fn computed_max_record_words(&self) -> Result<u32> {
+        let mut max_record_words = 0;
+        for record in &self.records {
+            max_record_words = max_record_words.max(record_size_words(record)?);
+        }
+        Ok(max_record_words)
+    }
+
+    pub fn computed_number_of_objects(&self) -> Result<u16> {
+        count_wmf_object_creation_records(&self.records)
+    }
+
+    pub fn validate_header_metrics(&self) -> Result<()> {
+        let file_size_words = self.computed_file_size_words()?;
+        if self.header.file_size_words != file_size_words {
+            return Err(Error::invalid(
+                0,
+                "WMF header FileSize does not match records",
+            ));
+        }
+        let max_record_words = self.computed_max_record_words()?;
+        if self.header.max_record_words != max_record_words {
+            return Err(Error::invalid(
+                0,
+                "WMF header MaxRecord does not match records",
+            ));
+        }
+        let number_of_objects = self.computed_number_of_objects()?;
+        if self.header.number_of_objects != number_of_objects {
+            return Err(Error::invalid(
+                0,
+                "WMF header NumberOfObjects does not match object records",
+            ));
+        }
+        validate_wmf_object_table_references(self.header.number_of_objects, &self.records)?;
+        Ok(())
     }
 }
 
@@ -928,7 +1042,7 @@ impl WmfPlaceableHeader {
             reserved: reader.read_u32()?,
             checksum: reader.read_u16()?,
         };
-        validate_wmf_placeable_header(&value)?;
+        validate_wmf_placeable_header_lossless(&value)?;
         Ok(value)
     }
 
@@ -936,7 +1050,7 @@ impl WmfPlaceableHeader {
         &self,
         writer: &mut Writer<W>,
     ) -> Result<()> {
-        validate_wmf_placeable_header(self)?;
+        validate_wmf_placeable_header_lossless(self)?;
         writer.write_u32(self.key)?;
         writer.write_u16(self.handle)?;
         writer.write_i16(self.left)?;
@@ -961,6 +1075,31 @@ impl WmfPlaceableHeader {
         checksum ^= (self.reserved & 0xFFFF) as u16;
         checksum ^= (self.reserved >> 16) as u16;
         checksum
+    }
+
+    pub fn refresh_checksum(&mut self) {
+        self.checksum = self.computed_checksum();
+    }
+
+    pub fn with_computed_checksum(mut self) -> Self {
+        self.refresh_checksum();
+        self
+    }
+
+    pub fn bounding_box_width(&self) -> i32 {
+        i32::from(self.right) - i32::from(self.left)
+    }
+
+    pub fn bounding_box_height(&self) -> i32 {
+        i32::from(self.bottom) - i32::from(self.top)
+    }
+
+    pub fn uses_twips(&self) -> bool {
+        self.inch == 1440
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        validate_wmf_placeable_header(self)
     }
 }
 
@@ -1033,6 +1172,22 @@ impl WmfHeader {
     pub fn version_kind(&self) -> Option<WmfMetafileVersion> {
         WmfMetafileVersion::from_raw(self.version)
     }
+
+    pub fn header_size_bytes(&self) -> u32 {
+        u32::from(self.header_size_words) * 2
+    }
+
+    pub fn file_size_bytes(&self) -> u64 {
+        u64::from(self.file_size_words) * 2
+    }
+
+    pub fn max_record_bytes(&self) -> u64 {
+        u64::from(self.max_record_words) * 2
+    }
+
+    pub fn number_of_members_is_zero(&self) -> bool {
+        self.number_of_parameters == 0
+    }
 }
 
 impl SdkRead for WmfHeader {
@@ -1066,6 +1221,26 @@ impl WmfRecord {
 
     pub fn function_kind(&self) -> Option<WmfRecordFunction> {
         WmfRecordFunction::from_raw(self.function)
+    }
+
+    pub fn normalized_function_kind(&self) -> Option<WmfRecordFunction> {
+        normalized_wmf_record_function(self.function)
+    }
+
+    pub fn size_words(&self) -> Result<u32> {
+        record_size_words(self)
+    }
+
+    pub fn embedded_source_present(&self) -> Result<Option<bool>> {
+        match self.normalized_function_kind() {
+            Some(
+                WmfRecordFunction::BitBlt
+                | WmfRecordFunction::DibBitBlt
+                | WmfRecordFunction::DibStretchBlt
+                | WmfRecordFunction::StretchBlt,
+            ) => Ok(Some(has_bitmap_source(self)?)),
+            _ => Ok(None),
+        }
     }
 
     pub fn parse_data(&self) -> Result<WmfRecordData<'_>> {
@@ -1138,7 +1313,7 @@ pub enum WmfRecordData<'a> {
     Eof,
     RealizePalette,
     SaveDc,
-    SetRelabs,
+    SetRelabs(Vec<u8>),
     SetBkMode(WmfU16Record),
     SetMapMode(WmfU16Record),
     SetRop2(WmfU16Record),
@@ -1211,7 +1386,7 @@ pub enum WmfRecordData<'a> {
 impl<'a> WmfRecordData<'a> {
     pub fn from_record(record: &'a WmfRecord) -> Result<Self> {
         let data = &record.data;
-        Ok(match record.function_kind() {
+        Ok(match record.normalized_function_kind() {
             Some(WmfRecordFunction::Eof) => {
                 ensure_no_data(data, "META_EOF")?;
                 Self::Eof
@@ -1224,10 +1399,7 @@ impl<'a> WmfRecordData<'a> {
                 ensure_no_data(data, "META_SAVEDC")?;
                 Self::SaveDc
             }
-            Some(WmfRecordFunction::SetRelabs) => {
-                ensure_no_data(data, "META_SETRELABS")?;
-                Self::SetRelabs
-            }
+            Some(WmfRecordFunction::SetRelabs) => Self::SetRelabs(data.to_vec()),
             Some(WmfRecordFunction::SetBkMode) => {
                 let value = WmfU16Record::read_data(data)?;
                 validate_wmf_set_bk_mode(&value)?;
@@ -1332,6 +1504,7 @@ impl<'a> WmfRecordData<'a> {
             Some(WmfRecordFunction::BitBlt) => Self::BitBlt(WmfBitBltRecord::read_data(
                 data,
                 has_bitmap_source(record)?,
+                "META_BITBLT",
             )?),
             Some(WmfRecordFunction::DibBitBlt) => Self::DibBitBlt(WmfDibBitBltRecord::read_data(
                 data,
@@ -1354,18 +1527,22 @@ impl<'a> WmfRecordData<'a> {
             Some(WmfRecordFunction::SetPixel) => {
                 Self::SetPixel(read_object(data, "META_SETPIXEL")?)
             }
-            Some(WmfRecordFunction::StretchBlt) => Self::StretchBlt(
-                WmfStretchBltRecord::read_data(data, has_bitmap_source(record)?)?,
-            ),
+            Some(WmfRecordFunction::StretchBlt) => {
+                Self::StretchBlt(WmfStretchBltRecord::read_data(
+                    data,
+                    has_bitmap_source(record)?,
+                    "META_STRETCHBLT",
+                )?)
+            }
             Some(WmfRecordFunction::StretchDib) => {
                 Self::StretchDib(WmfStretchDibRecord::read_data(data)?)
             }
-            Some(WmfRecordFunction::PatBlt) => Self::PatBlt(read_object(data, "META_PATBLT")?),
+            Some(WmfRecordFunction::PatBlt) => Self::PatBlt(WmfPatBltRecord::read_data(data)?),
             Some(WmfRecordFunction::Polygon) => {
-                Self::Polygon(WmfPolyPointsRecord::read_data(data, "META_POLYGON")?)
+                Self::Polygon(WmfPolyPointsRecord::read_data(data, "META_POLYGON", 2)?)
             }
             Some(WmfRecordFunction::Polyline) => {
-                Self::Polyline(WmfPolyPointsRecord::read_data(data, "META_POLYLINE")?)
+                Self::Polyline(WmfPolyPointsRecord::read_data(data, "META_POLYLINE", 0)?)
             }
             Some(WmfRecordFunction::PolyPolygon) => {
                 Self::PolyPolygon(WmfPolyPolygonRecord::read_data(data)?)
@@ -1418,7 +1595,7 @@ impl<'a> WmfRecordData<'a> {
                 Self::CreatePenIndirect(value)
             }
             Some(WmfRecordFunction::CreateRegion) => {
-                Self::CreateRegion(read_object(data, "META_CREATEREGION")?)
+                Self::CreateRegion(WmfRegionObject::read_data(data)?)
             }
             Some(WmfRecordFunction::DibCreatePatternBrush) => {
                 Self::DibCreatePatternBrush(WmfDibCreatePatternBrushRecord::read_data(data)?)
@@ -1443,7 +1620,9 @@ impl<'a> WmfRecordData<'a> {
             Self::Eof => no_data_record(WmfRecordFunction::Eof),
             Self::RealizePalette => no_data_record(WmfRecordFunction::RealizePalette),
             Self::SaveDc => no_data_record(WmfRecordFunction::SaveDc),
-            Self::SetRelabs => no_data_record(WmfRecordFunction::SetRelabs),
+            Self::SetRelabs(data) => {
+                WmfRecord::new(WmfRecordFunction::SetRelabs.raw(), data.clone())
+            }
             Self::SetBkMode(value) => {
                 validate_wmf_set_bk_mode(value)?;
                 u16_record(WmfRecordFunction::SetBkMode, value)?
@@ -1536,14 +1715,17 @@ impl<'a> WmfRecordData<'a> {
             Self::StretchDib(value) => {
                 WmfRecord::new(WmfRecordFunction::StretchDib.raw(), value.write_data()?)
             }
-            Self::PatBlt(value) => object_record(WmfRecordFunction::PatBlt, value)?,
+            Self::PatBlt(value) => {
+                validate_wmf_ternary_raster_operation(value.raster_operation, "META_PATBLT")?;
+                object_record(WmfRecordFunction::PatBlt, value)?
+            }
             Self::Polygon(value) => WmfRecord::new(
                 WmfRecordFunction::Polygon.raw(),
-                value.write_data("META_POLYGON")?,
+                value.write_data("META_POLYGON", 2)?,
             ),
             Self::Polyline(value) => WmfRecord::new(
                 WmfRecordFunction::Polyline.raw(),
-                value.write_data("META_POLYLINE")?,
+                value.write_data("META_POLYLINE", 0)?,
             ),
             Self::PolyPolygon(value) => {
                 WmfRecord::new(WmfRecordFunction::PolyPolygon.raw(), value.write_data()?)
@@ -1814,6 +1996,12 @@ impl WmfPatBltRecord {
     pub const fn raster_operation_code(&self) -> WmfTernaryRasterOperationCode {
         self.ternary_raster_operation().operation_code()
     }
+
+    fn read_data(data: &[u8]) -> Result<Self> {
+        let value: Self = read_object(data, "META_PATBLT")?;
+        validate_wmf_ternary_raster_operation(value.raster_operation, "META_PATBLT")?;
+        Ok(value)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1822,10 +2010,51 @@ pub enum WmfBitmap16Target {
     NoSource { reserved: u16 },
 }
 
+impl WmfBitmap16Target {
+    pub fn is_source_present(&self) -> bool {
+        matches!(self, Self::Source(_))
+    }
+
+    pub fn source_bytes(&self) -> Option<&[u8]> {
+        match self {
+            Self::Source(value) => Some(value),
+            Self::NoSource { .. } => None,
+        }
+    }
+
+    pub fn bitmap16(&self) -> Result<Option<WmfBitmap16>> {
+        self.source_bytes()
+            .map(WmfBitmap16::read_from_slice)
+            .transpose()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WmfDibTarget {
     Source(Vec<u8>),
     NoSource { reserved: u16 },
+}
+
+impl WmfDibTarget {
+    pub fn is_source_present(&self) -> bool {
+        matches!(self, Self::Source(_))
+    }
+
+    pub fn source_bytes(&self) -> Option<&[u8]> {
+        match self {
+            Self::Source(value) => Some(value),
+            Self::NoSource { .. } => None,
+        }
+    }
+
+    pub fn device_independent_bitmap(
+        &self,
+        color_usage: DibColorUsage,
+    ) -> Result<Option<DeviceIndependentBitmap>> {
+        self.source_bytes()
+            .map(|bytes| DeviceIndependentBitmap::from_packed_slice(bytes, color_usage))
+            .transpose()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1849,7 +2078,7 @@ impl WmfBitBltRecord {
         self.ternary_raster_operation().operation_code()
     }
 
-    fn read_data(data: &[u8], has_source: bool) -> Result<Self> {
+    fn read_data(data: &[u8], has_source: bool, name: &str) -> Result<Self> {
         if data.len() < if has_source { 16 } else { 18 } {
             return Err(Error::invalid(0, "META_BITBLT record is too short"));
         }
@@ -1870,7 +2099,7 @@ impl WmfBitBltRecord {
             Some(reserved) => WmfBitmap16Target::NoSource { reserved },
             None => WmfBitmap16Target::Source(read_remaining(&mut reader, data.len())?),
         };
-        Ok(Self {
+        let value = Self {
             raster_operation,
             y_src,
             x_src,
@@ -1879,10 +2108,13 @@ impl WmfBitBltRecord {
             y_dest,
             x_dest,
             target,
-        })
+        };
+        validate_wmf_bitmap16_transfer_source(&value, name)?;
+        Ok(value)
     }
 
     fn write_data(&self) -> Result<Vec<u8>> {
+        validate_wmf_bitmap16_transfer_source(self, "META_BITBLT")?;
         let mut writer = Writer::new(Cursor::new(Vec::new()));
         writer.write_u32(self.raster_operation)?;
         writer.write_i16(self.y_src)?;
@@ -1926,7 +2158,7 @@ impl WmfDibBitBltRecord {
         if data.len() < if has_source { 16 } else { 18 } {
             return Err(Error::invalid(0, "META_DIBBITBLT record is too short"));
         }
-        let bit_blt = WmfBitBltRecord::read_data(data, has_source)?;
+        let bit_blt = WmfBitBltRecord::read_data(data, has_source, "META_DIBBITBLT")?;
         Ok(Self {
             raster_operation: bit_blt.raster_operation,
             y_src: bit_blt.y_src,
@@ -1943,6 +2175,7 @@ impl WmfDibBitBltRecord {
     }
 
     fn write_data(&self) -> Result<Vec<u8>> {
+        validate_wmf_dib_transfer_source(self, "META_DIBBITBLT")?;
         WmfBitBltRecord {
             raster_operation: self.raster_operation,
             y_src: self.y_src,
@@ -1985,7 +2218,7 @@ impl WmfStretchBltRecord {
         self.ternary_raster_operation().operation_code()
     }
 
-    fn read_data(data: &[u8], has_source: bool) -> Result<Self> {
+    fn read_data(data: &[u8], has_source: bool, name: &str) -> Result<Self> {
         if data.len() < if has_source { 20 } else { 22 } {
             return Err(Error::invalid(0, "META_STRETCHBLT record is too short"));
         }
@@ -2008,7 +2241,7 @@ impl WmfStretchBltRecord {
             Some(reserved) => WmfBitmap16Target::NoSource { reserved },
             None => WmfBitmap16Target::Source(read_remaining(&mut reader, data.len())?),
         };
-        Ok(Self {
+        let value = Self {
             raster_operation,
             src_height,
             src_width,
@@ -2019,10 +2252,13 @@ impl WmfStretchBltRecord {
             y_dest,
             x_dest,
             target,
-        })
+        };
+        validate_wmf_bitmap16_transfer_source(&value, name)?;
+        Ok(value)
     }
 
     fn write_data(&self) -> Result<Vec<u8>> {
+        validate_wmf_bitmap16_transfer_source(self, "META_STRETCHBLT")?;
         let mut writer = Writer::new(Cursor::new(Vec::new()));
         writer.write_u32(self.raster_operation)?;
         writer.write_i16(self.src_height)?;
@@ -2070,7 +2306,7 @@ impl WmfDibStretchBltRecord {
         if data.len() < if has_source { 20 } else { 22 } {
             return Err(Error::invalid(0, "META_DIBSTRETCHBLT record is too short"));
         }
-        let stretch_blt = WmfStretchBltRecord::read_data(data, has_source)?;
+        let stretch_blt = WmfStretchBltRecord::read_data(data, has_source, "META_DIBSTRETCHBLT")?;
         Ok(Self {
             raster_operation: stretch_blt.raster_operation,
             src_height: stretch_blt.src_height,
@@ -2089,6 +2325,7 @@ impl WmfDibStretchBltRecord {
     }
 
     fn write_data(&self) -> Result<Vec<u8>> {
+        validate_wmf_dib_stretch_transfer_source(self, "META_DIBSTRETCHBLT")?;
         WmfStretchBltRecord {
             raster_operation: self.raster_operation,
             src_height: self.src_height,
@@ -2271,7 +2508,7 @@ pub struct WmfPolyPointsRecord {
 }
 
 impl WmfPolyPointsRecord {
-    fn read_data(data: &[u8], name: &str) -> Result<Self> {
+    fn read_data(data: &[u8], name: &str, min_points: usize) -> Result<Self> {
         let mut reader = Reader::new(Cursor::new(data));
         let count = reader.read_i16()?;
         if count < 0 {
@@ -2280,6 +2517,14 @@ impl WmfPolyPointsRecord {
                 format!("{name} has negative point count"),
             ));
         }
+        if (count as usize) < min_points {
+            return Err(Error::invalid(
+                0,
+                format!("{name} point count must be at least {min_points}"),
+            ));
+        }
+        let point_bytes = checked_record_array_bytes(count as usize, 4, name)?;
+        ensure_record_remaining(&mut reader, data.len() as u64, point_bytes, name)?;
         let mut points = Vec::with_capacity(count as usize);
         for _ in 0..count {
             points.push(PointS::read_from(&mut reader)?);
@@ -2288,7 +2533,13 @@ impl WmfPolyPointsRecord {
         Ok(Self { points })
     }
 
-    fn write_data(&self, name: &str) -> Result<Vec<u8>> {
+    fn write_data(&self, name: &str, min_points: usize) -> Result<Vec<u8>> {
+        if self.points.len() < min_points {
+            return Err(Error::invalid(
+                0,
+                format!("{name} point count must be at least {min_points}"),
+            ));
+        }
         if self.points.len() > i16::MAX as usize {
             return Err(Error::invalid(0, format!("{name} has too many points")));
         }
@@ -2311,6 +2562,14 @@ impl WmfPolyPolygonRecord {
     fn read_data(data: &[u8]) -> Result<Self> {
         let mut reader = Reader::new(Cursor::new(data));
         let number_of_polygons = reader.read_u16()? as usize;
+        let count_bytes =
+            checked_record_array_bytes(number_of_polygons, 2, "META_POLYPOLYGON counts")?;
+        ensure_record_remaining(
+            &mut reader,
+            data.len() as u64,
+            count_bytes,
+            "META_POLYPOLYGON counts",
+        )?;
         let mut points_per_polygon = Vec::with_capacity(number_of_polygons);
         let mut total_points = 0usize;
         for _ in 0..number_of_polygons {
@@ -2320,6 +2579,13 @@ impl WmfPolyPolygonRecord {
                 .ok_or_else(|| Error::invalid(0, "META_POLYPOLYGON point count overflows"))?;
             points_per_polygon.push(count);
         }
+        let point_bytes = checked_record_array_bytes(total_points, 4, "META_POLYPOLYGON points")?;
+        ensure_record_remaining(
+            &mut reader,
+            data.len() as u64,
+            point_bytes,
+            "META_POLYPOLYGON points",
+        )?;
         let mut points = Vec::with_capacity(total_points);
         for _ in 0..total_points {
             points.push(PointS::read_from(&mut reader)?);
@@ -2546,10 +2812,7 @@ impl SdkRead for WmfFontObject {
         let clip_precision = reader.read_u8()?;
         let quality = reader.read_u8()?;
         let pitch_and_family = reader.read_u8()?;
-        let face_name = reader
-            .read_vec(32)?
-            .try_into()
-            .map_err(|_| Error::invalid(0, "WMF font face name has invalid length"))?;
+        let face_name = reader.read_array::<32>()?;
         Ok(Self {
             height,
             width,
@@ -2632,6 +2895,8 @@ impl WmfPaletteObject {
         let mut reader = Reader::new(Cursor::new(data));
         let start = reader.read_u16()?;
         let number_of_entries = reader.read_u16()? as usize;
+        let entry_bytes = checked_record_array_bytes(number_of_entries, 4, name)?;
+        ensure_record_remaining(&mut reader, data.len() as u64, entry_bytes, name)?;
         let mut entries = Vec::with_capacity(number_of_entries);
         for _ in 0..number_of_entries {
             entries.push(WmfPaletteEntry::read_from(&mut reader)?);
@@ -2668,7 +2933,7 @@ pub struct WmfBitmap16Header {
 }
 
 impl WmfBitmap16Header {
-    pub fn computed_bits_len(&self) -> Result<usize> {
+    pub fn computed_width_bytes(&self) -> Result<usize> {
         if self.width < 0 || self.height < 0 {
             return Err(Error::invalid(
                 0,
@@ -2677,16 +2942,19 @@ impl WmfBitmap16Header {
         }
         let width = usize::try_from(self.width)
             .map_err(|_| Error::invalid(0, "Bitmap16 width is invalid"))?;
-        let height = usize::try_from(self.height)
-            .map_err(|_| Error::invalid(0, "Bitmap16 height is invalid"))?;
         let bits_per_line = width
             .checked_mul(usize::from(self.bits_pixel))
             .ok_or_else(|| Error::invalid(0, "Bitmap16 scan line size overflows"))?;
-        let width_bytes = bits_per_line
+        bits_per_line
             .checked_add(15)
             .map(|value| (value >> 4) << 1)
-            .ok_or_else(|| Error::invalid(0, "Bitmap16 scan line size overflows"))?;
-        width_bytes
+            .ok_or_else(|| Error::invalid(0, "Bitmap16 scan line size overflows"))
+    }
+
+    pub fn computed_bits_len(&self) -> Result<usize> {
+        let height = usize::try_from(self.height)
+            .map_err(|_| Error::invalid(0, "Bitmap16 height is invalid"))?;
+        self.computed_width_bytes()?
             .checked_mul(height)
             .ok_or_else(|| Error::invalid(0, "Bitmap16 bits size overflows"))
     }
@@ -2731,6 +2999,28 @@ pub struct WmfBitmap16 {
     pub bits: Vec<u8>,
 }
 
+impl WmfBitmap16 {
+    pub fn read_from_slice(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() < 10 {
+            return Err(Error::invalid(0, "Bitmap16 object is too short"));
+        }
+        let mut reader = Reader::new(Cursor::new(bytes));
+        let header = WmfBitmap16Header::read_from(&mut reader)?;
+        let bits = reader.read_vec(bytes.len() - 10)?;
+        let value = Self { header, bits };
+        validate_wmf_bitmap16(&value)?;
+        Ok(value)
+    }
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        validate_wmf_bitmap16(self)?;
+        let mut writer = Writer::new(Cursor::new(Vec::new()));
+        self.header.write_to(&mut writer)?;
+        writer.write_all(&self.bits)?;
+        Ok(writer.into_inner().into_inner())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WmfCreatePatternBrushRecord {
     pub bitmap: WmfBitmap16Header,
@@ -2750,10 +3040,7 @@ impl WmfCreatePatternBrushRecord {
         let mut reader = Reader::new(Cursor::new(data));
         let bitmap = WmfBitmap16Header::read_from(&mut reader)?;
         let ignored_bits = reader.read_u32()?;
-        let reserved = reader
-            .read_vec(18)?
-            .try_into()
-            .map_err(|_| Error::invalid(0, "META_CREATEPATTERNBRUSH reserved size is invalid"))?;
+        let reserved = reader.read_array::<18>()?;
         let pattern = reader.read_vec(data.len() - 32)?;
         let value = Self {
             bitmap,
@@ -2872,12 +3159,26 @@ pub struct WmfScanObject {
 
 impl SdkRead for WmfScanObject {
     fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
+        Self::read_from_with_end(reader, None)
+    }
+}
+
+impl WmfScanObject {
+    fn read_from_with_end<R: std::io::Read + std::io::Seek>(
+        reader: &mut Reader<R>,
+        end: Option<u64>,
+    ) -> Result<Self> {
         let count = reader.read_u16()?;
         if !count.is_multiple_of(2) {
             return Err(Error::invalid(0, "WMF scan count must be even"));
         }
         let top = reader.read_u16()?;
         let bottom = reader.read_u16()?;
+        if let Some(end) = end {
+            let scan_line_bytes =
+                checked_record_array_bytes(usize::from(count / 2), 4, "WMF ScanObject ScanLines")?;
+            ensure_record_remaining(reader, end, scan_line_bytes + 2, "WMF ScanObject")?;
+        }
         let mut scan_lines = Vec::with_capacity(count as usize / 2);
         for _ in 0..count / 2 {
             scan_lines.push(WmfScanLine::read_from(reader)?);
@@ -2922,6 +3223,22 @@ pub struct WmfRegionObject {
 
 impl SdkRead for WmfRegionObject {
     fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
+        Self::read_from_with_end(reader, None)
+    }
+}
+
+impl WmfRegionObject {
+    fn read_data(data: &[u8]) -> Result<Self> {
+        let mut reader = Reader::new(Cursor::new(data));
+        let value = Self::read_from_with_end(&mut reader, Some(data.len() as u64))?;
+        ensure_reader_end(&mut reader, data.len() as u64, "META_CREATEREGION")?;
+        Ok(value)
+    }
+
+    fn read_from_with_end<R: std::io::Read + std::io::Seek>(
+        reader: &mut Reader<R>,
+        end: Option<u64>,
+    ) -> Result<Self> {
         let next_in_chain = reader.read_u16()?;
         let object_type = reader.read_i16()?;
         let object_count = reader.read_u32()?;
@@ -2932,9 +3249,14 @@ impl SdkRead for WmfRegionObject {
         }
         let max_scan = reader.read_i16()?;
         let bounding_rectangle = WmfRectObject::read_from(reader)?;
+        if let Some(end) = end {
+            let minimum_scan_bytes =
+                checked_record_array_bytes(scan_count as usize, 8, "WMF Region scans")?;
+            ensure_record_remaining(reader, end, minimum_scan_bytes, "WMF Region scans")?;
+        }
         let mut scans = Vec::with_capacity(scan_count as usize);
         for _ in 0..scan_count {
-            scans.push(WmfScanObject::read_from(reader)?);
+            scans.push(WmfScanObject::read_from_with_end(reader, end)?);
         }
         let value = Self {
             next_in_chain,
@@ -3229,6 +3551,48 @@ impl WmfEscapeData<'_> {
             Self::PostScriptInjection { .. } => WmfMetafileEscape::PostScriptInjection,
             Self::SpclPassThrough2 { .. } => WmfMetafileEscape::SpclPassThrough2,
         }
+    }
+
+    pub fn query_escape_kind(&self) -> Option<WmfMetafileEscape> {
+        let Self::QueryEscSupport { query } = self else {
+            return None;
+        };
+        WmfMetafileEscape::from_raw(*query)
+    }
+
+    pub fn post_script_cap_kind(&self) -> Option<WmfPostScriptCap> {
+        let Self::SetLineCap { cap } = self else {
+            return None;
+        };
+        WmfPostScriptCap::from_raw(*cap)
+    }
+
+    pub fn post_script_join_kind(&self) -> Option<WmfPostScriptJoin> {
+        let Self::SetLineJoin { join } = self else {
+            return None;
+        };
+        WmfPostScriptJoin::from_raw(*join)
+    }
+
+    pub fn post_script_clipping_kind(&self) -> Option<WmfPostScriptClipping> {
+        let Self::ClipToPath { clip_function, .. } = self else {
+            return None;
+        };
+        WmfPostScriptClipping::from_raw(*clip_function)
+    }
+
+    pub fn post_script_feature_setting_kind(&self) -> Option<WmfPostScriptFeatureSetting> {
+        let Self::GetPsFeatureSetting { feature_setting } = self else {
+            return None;
+        };
+        WmfPostScriptFeatureSetting::from_raw(*feature_setting)
+    }
+
+    pub fn is_valid_post_script_feature_setting(&self) -> bool {
+        let Self::GetPsFeatureSetting { feature_setting } = self else {
+            return false;
+        };
+        is_valid_post_script_feature_setting(*feature_setting)
     }
 
     fn to_escape_data(&self) -> Result<Vec<u8>> {
@@ -3577,11 +3941,14 @@ impl WmfEscapeRecord {
     }
 
     pub fn from_typed_data(data: WmfEscapeData<'_>, padding: Vec<u8>) -> Result<Self> {
-        let value = Self {
+        let mut value = Self {
             escape_function: data.escape_kind().raw(),
             escape_data: data.to_escape_data()?,
             padding,
         };
+        if value.padding.is_empty() && !value.escape_data.len().is_multiple_of(2) {
+            value.padding.push(0);
+        }
         validate_escape_record(&value)?;
         Ok(value)
     }
@@ -3742,9 +4109,7 @@ fn parse_encapsulated_postscript_escape(
 }
 
 fn validate_wmf_placeable_header(value: &WmfPlaceableHeader) -> Result<()> {
-    if value.key != PLACEABLE_KEY {
-        return Err(Error::invalid(0, "WMF placeable header Key is invalid"));
-    }
+    validate_wmf_placeable_header_lossless(value)?;
     if value.reserved != 0 {
         return Err(Error::invalid(
             0,
@@ -3755,6 +4120,19 @@ fn validate_wmf_placeable_header(value: &WmfPlaceableHeader) -> Result<()> {
         return Err(Error::invalid(
             0,
             "WMF placeable header Checksum is invalid",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_wmf_placeable_header_lossless(value: &WmfPlaceableHeader) -> Result<()> {
+    if value.key != PLACEABLE_KEY {
+        return Err(Error::invalid(0, "WMF placeable header Key is invalid"));
+    }
+    if value.inch == 0 {
+        return Err(Error::invalid(
+            0,
+            "WMF placeable header Inch must be nonzero",
         ));
     }
     Ok(())
@@ -3957,7 +4335,74 @@ fn validate_wmf_set_dib_to_dev_record(value: &WmfSetDibToDevRecord) -> Result<()
     Ok(())
 }
 
+trait WmfBitmap16TransferSource {
+    fn raster_operation(&self) -> u32;
+    fn has_embedded_source(&self) -> bool;
+}
+
+impl WmfBitmap16TransferSource for WmfBitBltRecord {
+    fn raster_operation(&self) -> u32 {
+        self.raster_operation
+    }
+
+    fn has_embedded_source(&self) -> bool {
+        matches!(self.target, WmfBitmap16Target::Source(_))
+    }
+}
+
+impl WmfBitmap16TransferSource for WmfStretchBltRecord {
+    fn raster_operation(&self) -> u32 {
+        self.raster_operation
+    }
+
+    fn has_embedded_source(&self) -> bool {
+        matches!(self.target, WmfBitmap16Target::Source(_))
+    }
+}
+
+fn validate_wmf_bitmap16_transfer_source<T: WmfBitmap16TransferSource>(
+    value: &T,
+    name: &str,
+) -> Result<()> {
+    validate_wmf_transfer_source(value.raster_operation(), value.has_embedded_source(), name)
+}
+
+fn validate_wmf_dib_transfer_source(value: &WmfDibBitBltRecord, name: &str) -> Result<()> {
+    validate_wmf_transfer_source(
+        value.raster_operation,
+        matches!(value.target, WmfDibTarget::Source(_)),
+        name,
+    )
+}
+
+fn validate_wmf_dib_stretch_transfer_source(
+    value: &WmfDibStretchBltRecord,
+    name: &str,
+) -> Result<()> {
+    validate_wmf_transfer_source(
+        value.raster_operation,
+        matches!(value.target, WmfDibTarget::Source(_)),
+        name,
+    )
+}
+
+fn validate_wmf_transfer_source(
+    raster_operation: u32,
+    has_embedded_source: bool,
+    name: &str,
+) -> Result<()> {
+    validate_wmf_ternary_raster_operation(raster_operation, name)?;
+    if !has_embedded_source && WmfTernaryRasterOperation::new(raster_operation).uses_source() {
+        return Err(Error::invalid(
+            0,
+            format!("{name} without embedded source must not use a source-dependent ROP"),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_wmf_stretch_dib_record(value: &WmfStretchDibRecord) -> Result<()> {
+    validate_wmf_ternary_raster_operation(value.raster_operation, "META_STRETCHDIB")?;
     let color_usage = require_wmf_color_usage(value.color_usage)?;
     let dib = DeviceIndependentBitmap::from_packed_slice(&value.dib, color_usage)?;
     if dib.embedded_format().is_some() {
@@ -3977,11 +4422,45 @@ fn validate_wmf_stretch_dib_record(value: &WmfStretchDibRecord) -> Result<()> {
     Ok(())
 }
 
+fn validate_wmf_ternary_raster_operation(raster_operation: u32, name: &str) -> Result<()> {
+    if !WmfTernaryRasterOperation::new(raster_operation).is_valid() {
+        return Err(Error::invalid(
+            0,
+            format!("{name} RasterOperation is not a valid TernaryRasterOperation"),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_wmf_bitmap16_header(value: &WmfBitmap16Header) -> Result<()> {
     if value.planes != 1 {
         return Err(Error::invalid(0, "Bitmap16 Planes must be 1"));
     }
+    if value.width_bytes < 0 {
+        return Err(Error::invalid(
+            0,
+            "Bitmap16 WidthBytes must be non-negative",
+        ));
+    }
+    if value.width_bytes as usize != value.computed_width_bytes()? {
+        return Err(Error::invalid(
+            0,
+            "Bitmap16 WidthBytes does not match Width and BitsPixel",
+        ));
+    }
     value.computed_bits_len()?;
+    Ok(())
+}
+
+fn validate_wmf_bitmap16(value: &WmfBitmap16) -> Result<()> {
+    validate_wmf_bitmap16_header(&value.header)?;
+    let expected = value.header.computed_bits_len()?;
+    if value.bits.len() != expected {
+        return Err(Error::invalid(
+            0,
+            "Bitmap16 Bits length does not match WidthBytes and Height",
+        ));
+    }
     Ok(())
 }
 
@@ -4074,6 +4553,16 @@ fn validate_wmf_ext_text_out_record(value: &WmfExtTextOutRecord) -> Result<()> {
             "META_EXTTEXTOUT fwOpts contains invalid flags",
         ));
     }
+    if value
+        .options
+        .intersects(WmfExtTextOutOptions::OPAQUE | WmfExtTextOutOptions::CLIPPED)
+        && value.rectangle.is_none()
+    {
+        return Err(Error::invalid(
+            0,
+            "META_EXTTEXTOUT rectangle is required by ETO_OPAQUE or ETO_CLIPPED",
+        ));
+    }
     if value.string_length < 0 || value.string_length as usize != value.string.len() {
         return Err(Error::invalid(
             0,
@@ -4084,6 +4573,27 @@ fn validate_wmf_ext_text_out_record(value: &WmfExtTextOutRecord) -> Result<()> {
         return Err(Error::invalid(
             0,
             "META_EXTTEXTOUT string field must be WORD aligned",
+        ));
+    }
+    let expected_dx_count = if value.options.contains(WmfExtTextOutOptions::PDY) {
+        value
+            .string
+            .len()
+            .checked_mul(2)
+            .ok_or_else(|| Error::invalid(0, "META_EXTTEXTOUT ETO_PDY Dx count overflows"))?
+    } else {
+        value.string.len()
+    };
+    if !value.dx.is_empty() && value.dx.len() != expected_dx_count {
+        return Err(Error::invalid(
+            0,
+            "META_EXTTEXTOUT Dx count must match StringLength",
+        ));
+    }
+    if !value.trailing_data.is_empty() {
+        return Err(Error::invalid(
+            0,
+            "META_EXTTEXTOUT must not contain trailing data",
         ));
     }
     Ok(())
@@ -4145,6 +4655,7 @@ fn validate_escape_record(value: &WmfEscapeRecord) -> Result<()> {
     let Some(escape) = value.escape_kind() else {
         return Err(Error::invalid(0, "META_ESCAPE EscapeFunction is invalid"));
     };
+    validate_escape_record_padding(value)?;
     match escape {
         WmfMetafileEscape::AbortDoc
         | WmfMetafileEscape::BeginPath
@@ -4242,6 +4753,18 @@ fn validate_escape_record(value: &WmfEscapeRecord) -> Result<()> {
         _ => {}
     }
     Ok(())
+}
+
+fn validate_escape_record_padding(value: &WmfEscapeRecord) -> Result<()> {
+    let expected = value.escape_data.len() % 2;
+    if value.padding.len() == expected {
+        Ok(())
+    } else {
+        Err(Error::invalid(
+            0,
+            "META_ESCAPE padding must align EscapeData to a WORD",
+        ))
+    }
 }
 
 const fn is_no_data_escape(escape: WmfMetafileEscape) -> bool {
@@ -4491,6 +5014,32 @@ fn ensure_reader_end<R: std::io::Read + std::io::Seek>(
     }
 }
 
+fn checked_record_array_bytes(count: usize, element_size: usize, name: &str) -> Result<usize> {
+    count
+        .checked_mul(element_size)
+        .ok_or_else(|| Error::invalid(0, format!("{name} size overflows usize")))
+}
+
+fn ensure_record_remaining<R: std::io::Read + std::io::Seek>(
+    reader: &mut Reader<R>,
+    end: u64,
+    required: usize,
+    name: &str,
+) -> Result<()> {
+    let position = reader.position()?;
+    if position
+        .checked_add(required as u64)
+        .is_some_and(|required_end| required_end <= end)
+    {
+        Ok(())
+    } else {
+        Err(Error::invalid(
+            position,
+            format!("{name} extends past record data"),
+        ))
+    }
+}
+
 fn read_object<T: SdkRead>(data: &[u8], name: &str) -> Result<T> {
     let mut reader = Reader::new(Cursor::new(data));
     let value = T::read_from(&mut reader)?;
@@ -4530,8 +5079,181 @@ fn record_size_words(record: &WmfRecord) -> Result<u32> {
     Ok((size_bytes / 2) as u32)
 }
 
+fn count_wmf_object_creation_records(records: &[WmfRecord]) -> Result<u16> {
+    let mut count = 0u32;
+    for record in records {
+        if matches!(
+            record.normalized_function_kind(),
+            Some(
+                WmfRecordFunction::CreateBrushIndirect
+                    | WmfRecordFunction::CreateFontIndirect
+                    | WmfRecordFunction::CreatePalette
+                    | WmfRecordFunction::CreatePatternBrush
+                    | WmfRecordFunction::CreatePenIndirect
+                    | WmfRecordFunction::CreateRegion
+                    | WmfRecordFunction::DibCreatePatternBrush
+            )
+        ) {
+            count = count
+                .checked_add(1)
+                .ok_or_else(|| Error::invalid(0, "WMF NumberOfObjects overflows"))?;
+        }
+    }
+    u16::try_from(count).map_err(|_| Error::invalid(0, "WMF NumberOfObjects exceeds u16::MAX"))
+}
+
+fn validate_wmf_object_table_references(
+    number_of_objects: u16,
+    records: &[WmfRecord],
+) -> Result<()> {
+    if let Some(index) = max_wmf_referenced_object_index(records)?
+        && index >= number_of_objects
+    {
+        return Err(Error::invalid(
+            0,
+            "WMF object table reference exceeds NumberOfObjects",
+        ));
+    }
+    Ok(())
+}
+
+fn max_wmf_referenced_object_index(records: &[WmfRecord]) -> Result<Option<u16>> {
+    let mut max_index = None;
+    for record in records {
+        let mut push_index = |index| {
+            max_index = Some(max_index.map_or(index, |current: u16| current.max(index)));
+        };
+        match record.normalized_function_kind() {
+            Some(
+                WmfRecordFunction::InvertRegion
+                | WmfRecordFunction::PaintRegion
+                | WmfRecordFunction::SelectClipRegion
+                | WmfRecordFunction::SelectObject
+                | WmfRecordFunction::SelectPalette
+                | WmfRecordFunction::DeleteObject,
+            ) => {
+                let value: WmfObjectIndexRecord =
+                    read_object(&record.data, "WMF object table reference")?;
+                push_index(value.index);
+            }
+            Some(WmfRecordFunction::FillRegion) => {
+                let value: WmfRegionBrushRecord = read_object(&record.data, "META_FILLREGION")?;
+                push_index(value.region);
+                push_index(value.brush);
+            }
+            Some(WmfRecordFunction::FrameRegion) => {
+                let value: WmfFrameRegionRecord = read_object(&record.data, "META_FRAMEREGION")?;
+                push_index(value.region);
+                push_index(value.brush);
+            }
+            _ => {}
+        }
+    }
+    Ok(max_index)
+}
+
 fn has_bitmap_source(record: &WmfRecord) -> Result<bool> {
-    Ok(record_size_words(record)? > (u32::from(record.function) >> 8) + 3)
+    let kind = record.normalized_function_kind().ok_or_else(|| {
+        Error::invalid(
+            0,
+            "WMF bitmap transfer record function byte is not recognized",
+        )
+    })?;
+    let canonical = kind.raw();
+    let size_words = record_size_words(record)?;
+    let fixed_words = u32::from(canonical >> 8);
+    let expected_no_source_words = fixed_words
+        .checked_add(3)
+        .ok_or_else(|| Error::invalid(0, "WMF bitmap transfer size overflows"))?;
+    if record.function != canonical {
+        return Err(Error::invalid(
+            0,
+            "WMF bitmap transfer RecordFunction high byte is invalid",
+        ));
+    }
+    match size_words.cmp(&expected_no_source_words) {
+        std::cmp::Ordering::Equal => Ok(false),
+        std::cmp::Ordering::Greater => Ok(true),
+        std::cmp::Ordering::Less => Err(Error::invalid(
+            0,
+            "WMF bitmap transfer RecordSize is smaller than fixed fields",
+        )),
+    }
+}
+
+fn normalized_wmf_record_function(function: u16) -> Option<WmfRecordFunction> {
+    WmfRecordFunction::from_raw(function).or(match function & 0x00FF {
+        0x00 => Some(WmfRecordFunction::Eof),
+        0x01 => Some(WmfRecordFunction::SetBkColor),
+        0x02 => Some(WmfRecordFunction::SetBkMode),
+        0x03 => Some(WmfRecordFunction::SetMapMode),
+        0x04 => Some(WmfRecordFunction::SetRop2),
+        0x05 => Some(WmfRecordFunction::SetRelabs),
+        0x06 => Some(WmfRecordFunction::SetPolyFillMode),
+        0x07 => Some(WmfRecordFunction::SetStretchBltMode),
+        0x08 => Some(WmfRecordFunction::SetTextCharExtra),
+        0x09 => Some(WmfRecordFunction::SetTextColor),
+        0x0A => Some(WmfRecordFunction::SetTextJustification),
+        0x0B => Some(WmfRecordFunction::SetWindowOrg),
+        0x0C => Some(WmfRecordFunction::SetWindowExt),
+        0x0D => Some(WmfRecordFunction::SetViewportOrg),
+        0x0E => Some(WmfRecordFunction::SetViewportExt),
+        0x0F => Some(WmfRecordFunction::OffsetWindowOrg),
+        0x10 => Some(WmfRecordFunction::ScaleWindowExt),
+        0x11 => Some(WmfRecordFunction::OffsetViewportOrg),
+        0x12 => Some(WmfRecordFunction::ScaleViewportExt),
+        0x13 => Some(WmfRecordFunction::LineTo),
+        0x14 => Some(WmfRecordFunction::MoveTo),
+        0x15 => Some(WmfRecordFunction::ExcludeClipRect),
+        0x16 => Some(WmfRecordFunction::IntersectClipRect),
+        0x17 => Some(WmfRecordFunction::Arc),
+        0x18 => Some(WmfRecordFunction::Ellipse),
+        0x19 => Some(WmfRecordFunction::FloodFill),
+        0x1A => Some(WmfRecordFunction::Pie),
+        0x1B => Some(WmfRecordFunction::Rectangle),
+        0x1C => Some(WmfRecordFunction::RoundRect),
+        0x1D => Some(WmfRecordFunction::PatBlt),
+        0x1E => Some(WmfRecordFunction::SaveDc),
+        0x20 => Some(WmfRecordFunction::OffsetClipRgn),
+        0x21 => Some(WmfRecordFunction::TextOut),
+        0x22 => Some(WmfRecordFunction::BitBlt),
+        0x23 => Some(WmfRecordFunction::StretchBlt),
+        0x24 => Some(WmfRecordFunction::Polygon),
+        0x25 => Some(WmfRecordFunction::Polyline),
+        0x26 => Some(WmfRecordFunction::Escape),
+        0x27 => Some(WmfRecordFunction::RestoreDc),
+        0x28 => Some(WmfRecordFunction::FillRegion),
+        0x29 => Some(WmfRecordFunction::FrameRegion),
+        0x2A => Some(WmfRecordFunction::InvertRegion),
+        0x2B => Some(WmfRecordFunction::PaintRegion),
+        0x2C => Some(WmfRecordFunction::SelectClipRegion),
+        0x2D => Some(WmfRecordFunction::SelectObject),
+        0x2E => Some(WmfRecordFunction::SetTextAlign),
+        0x30 => Some(WmfRecordFunction::Chord),
+        0x31 => Some(WmfRecordFunction::SetMapperFlags),
+        0x32 => Some(WmfRecordFunction::ExtTextOut),
+        0x33 => Some(WmfRecordFunction::SetDibToDev),
+        0x34 => Some(WmfRecordFunction::SelectPalette),
+        0x35 => Some(WmfRecordFunction::RealizePalette),
+        0x36 => Some(WmfRecordFunction::AnimatePalette),
+        0x37 => Some(WmfRecordFunction::SetPalEntries),
+        0x38 => Some(WmfRecordFunction::PolyPolygon),
+        0x39 => Some(WmfRecordFunction::ResizePalette),
+        0x40 => Some(WmfRecordFunction::DibBitBlt),
+        0x41 => Some(WmfRecordFunction::DibStretchBlt),
+        0x42 => Some(WmfRecordFunction::DibCreatePatternBrush),
+        0x43 => Some(WmfRecordFunction::StretchDib),
+        0x48 => Some(WmfRecordFunction::ExtFloodFill),
+        0x49 => Some(WmfRecordFunction::SetLayout),
+        0xF0 => Some(WmfRecordFunction::DeleteObject),
+        0xF7 => Some(WmfRecordFunction::CreatePalette),
+        0xF9 => Some(WmfRecordFunction::CreatePatternBrush),
+        0xFA => Some(WmfRecordFunction::CreatePenIndirect),
+        0xFB => Some(WmfRecordFunction::CreateFontIndirect),
+        0xFC => Some(WmfRecordFunction::CreateBrushIndirect),
+        0xFF => Some(WmfRecordFunction::CreateRegion),
+        _ => None,
+    })
 }
 
 fn read_remaining<R: std::io::Read + std::io::Seek>(
@@ -4647,7 +5369,7 @@ mod tests {
     }
 
     fn test_placeable_header() -> WmfPlaceableHeader {
-        let mut header = WmfPlaceableHeader {
+        WmfPlaceableHeader {
             key: PLACEABLE_KEY,
             handle: 0,
             left: 0,
@@ -4657,9 +5379,8 @@ mod tests {
             inch: 1440,
             reserved: 0,
             checksum: 0,
-        };
-        header.checksum = header.computed_checksum();
-        header
+        }
+        .with_computed_checksum()
     }
 
     #[test]
@@ -4688,17 +5409,135 @@ mod tests {
         bytes.extend_from_slice(&minimal_wmf());
         let metafile = WmfMetafile::from_bytes(&bytes).unwrap();
         assert_eq!(metafile.placeable_header, Some(placeable.clone()));
+        assert_eq!(placeable.bounding_box_width(), 100);
+        assert_eq!(placeable.bounding_box_height(), 100);
+        assert!(placeable.uses_twips());
+        assert_eq!(metafile.header.header_size_bytes(), WMF_HEADER_SIZE as u32);
+        assert_eq!(metafile.header.file_size_bytes(), 24);
+        assert_eq!(metafile.header.max_record_bytes(), 6);
+        assert!(metafile.header.number_of_members_is_zero());
+        assert_eq!(metafile.computed_file_size_words().unwrap(), 12);
+        assert_eq!(metafile.computed_max_record_words().unwrap(), 3);
+        assert_eq!(metafile.computed_number_of_objects().unwrap(), 0);
+        assert!(metafile.validate_header_metrics().is_ok());
         assert_eq!(metafile.to_bytes().unwrap(), bytes);
+
+        let create_brush = WmfRecordData::CreateBrushIndirect(WmfLogBrushObject {
+            brush_style: WmfBrushStyle::Solid.raw(),
+            color_ref: ColorRef {
+                red: 1,
+                green: 2,
+                blue: 3,
+                reserved: 0,
+            },
+            brush_hatch: 0,
+        })
+        .to_record()
+        .unwrap();
+        assert_eq!(create_brush.size_words().unwrap(), 7);
+        let object_metafile = WmfMetafile {
+            placeable_header: None,
+            header: WmfHeader {
+                metafile_type: WmfMetafileType::Memory.raw(),
+                header_size_words: 9,
+                version: WmfMetafileVersion::Version300.raw(),
+                file_size_words: 19,
+                number_of_objects: 1,
+                max_record_words: 7,
+                number_of_parameters: 0,
+            },
+            records: vec![create_brush, WmfRecordData::Eof.to_record().unwrap()],
+            trailing_data: Vec::new(),
+        };
+        assert_eq!(object_metafile.header.file_size_bytes(), 38);
+        assert_eq!(object_metafile.header.max_record_bytes(), 14);
+        assert_eq!(object_metafile.computed_number_of_objects().unwrap(), 1);
+        assert!(object_metafile.validate_header_metrics().is_ok());
+        let object_bytes = object_metafile.to_bytes().unwrap();
+        assert_eq!(
+            WmfMetafile::from_bytes(&object_bytes)
+                .unwrap()
+                .computed_number_of_objects()
+                .unwrap(),
+            1
+        );
+        let mut invalid_number_of_objects = object_bytes.clone();
+        invalid_number_of_objects[10..12].copy_from_slice(&0_u16.to_le_bytes());
+        let invalid_number_of_objects_metafile =
+            WmfMetafile::from_bytes(&invalid_number_of_objects).unwrap();
+        assert!(
+            invalid_number_of_objects_metafile
+                .validate_header_metrics()
+                .is_err()
+        );
+        let mut invalid_object_metafile = object_metafile.clone();
+        invalid_object_metafile.header.number_of_objects = 0;
+        assert!(invalid_object_metafile.validate_header_metrics().is_err());
+        assert!(invalid_object_metafile.to_bytes().is_ok());
+
+        let selected_object_metafile = WmfMetafile {
+            placeable_header: None,
+            header: WmfHeader {
+                metafile_type: WmfMetafileType::Memory.raw(),
+                header_size_words: 9,
+                version: WmfMetafileVersion::Version300.raw(),
+                file_size_words: 23,
+                number_of_objects: 1,
+                max_record_words: 7,
+                number_of_parameters: 0,
+            },
+            records: vec![
+                object_metafile.records[0].clone(),
+                WmfRecordData::SelectObject(WmfObjectIndexRecord { index: 0 })
+                    .to_record()
+                    .unwrap(),
+                WmfRecordData::Eof.to_record().unwrap(),
+            ],
+            trailing_data: Vec::new(),
+        };
+        assert!(selected_object_metafile.validate_header_metrics().is_ok());
+        let mut invalid_selected_object_metafile = selected_object_metafile.clone();
+        invalid_selected_object_metafile.records[1] =
+            WmfRecordData::SelectObject(WmfObjectIndexRecord { index: 1 })
+                .to_record()
+                .unwrap();
+        assert!(
+            invalid_selected_object_metafile
+                .validate_header_metrics()
+                .is_err()
+        );
 
         let mut invalid_checksum = bytes.clone();
         invalid_checksum[PLACEABLE_HEADER_SIZE - 1] ^= 0xFF;
-        assert!(WmfMetafile::from_bytes(&invalid_checksum).is_err());
+        let invalid_checksum_metafile = WmfMetafile::from_bytes(&invalid_checksum).unwrap();
+        assert!(
+            invalid_checksum_metafile
+                .placeable_header
+                .as_ref()
+                .expect("placeable header")
+                .validate()
+                .is_err()
+        );
+        assert_eq!(
+            invalid_checksum_metafile.to_bytes().unwrap(),
+            invalid_checksum
+        );
 
         let mut invalid_reserved = placeable.clone();
         invalid_reserved.reserved = 1;
         invalid_reserved.checksum = invalid_reserved.computed_checksum();
+        assert!(invalid_reserved.validate().is_err());
         assert!(
             invalid_reserved
+                .write_to(&mut Writer::new(Cursor::new(Vec::new())))
+                .is_ok()
+        );
+
+        let mut invalid_inch = placeable.clone();
+        invalid_inch.inch = 0;
+        invalid_inch.checksum = invalid_inch.computed_checksum();
+        assert!(
+            invalid_inch
                 .write_to(&mut Writer::new(Cursor::new(Vec::new())))
                 .is_err()
         );
@@ -4710,6 +5549,37 @@ mod tests {
         let mut invalid_version = minimal_wmf();
         invalid_version[4..6].copy_from_slice(&0_u16.to_le_bytes());
         assert!(WmfMetafile::from_bytes(&invalid_version).is_err());
+
+        let mut invalid_file_size = minimal_wmf();
+        invalid_file_size[6..10].copy_from_slice(&13_u32.to_le_bytes());
+        let invalid_file_size_metafile = WmfMetafile::from_bytes(&invalid_file_size).unwrap();
+        assert!(
+            invalid_file_size_metafile
+                .validate_header_metrics()
+                .is_err()
+        );
+
+        let mut invalid_max_record = minimal_wmf();
+        invalid_max_record[12..16].copy_from_slice(&4_u32.to_le_bytes());
+        let invalid_max_record_metafile = WmfMetafile::from_bytes(&invalid_max_record).unwrap();
+        assert!(
+            invalid_max_record_metafile
+                .validate_header_metrics()
+                .is_err()
+        );
+
+        let mut trailing = minimal_wmf();
+        trailing.extend_from_slice(&[0; 2]);
+        assert_eq!(
+            WmfMetafile::from_bytes(&trailing)
+                .unwrap()
+                .to_bytes()
+                .unwrap(),
+            trailing
+        );
+
+        let missing_eof = minimal_wmf()[..18].to_vec();
+        assert!(WmfMetafile::from_bytes(&missing_eof).is_err());
 
         let mut invalid_header = metafile.header.clone();
         invalid_header.version = 0;
@@ -4729,6 +5599,35 @@ mod tests {
     fn maps_wmf_record_function_enum() {
         let record = WmfRecord::new(META_EOF, Vec::new());
         assert_eq!(record.function_kind(), Some(WmfRecordFunction::Eof));
+        assert_eq!(
+            record.normalized_function_kind(),
+            Some(WmfRecordFunction::Eof)
+        );
+        let high_byte_variant =
+            WmfRecord::new(0x9902, WmfMixMode::Opaque.raw().to_le_bytes().to_vec());
+        assert_eq!(high_byte_variant.function_kind(), None);
+        assert_eq!(
+            high_byte_variant.normalized_function_kind(),
+            Some(WmfRecordFunction::SetBkMode)
+        );
+        let WmfRecordData::SetBkMode(value) = high_byte_variant.parse_data().unwrap() else {
+            panic!("expected normalized META_SETBKMODE");
+        };
+        assert_eq!(value.mix_mode_kind(), Some(WmfMixMode::Opaque));
+        let accepted_high_byte_variant = WmfRecord::new(0x9922, Vec::new());
+        assert_eq!(
+            accepted_high_byte_variant.normalized_function_kind(),
+            Some(WmfRecordFunction::BitBlt)
+        );
+        assert_eq!(accepted_high_byte_variant.size_words().unwrap(), 3);
+        assert!(
+            accepted_high_byte_variant
+                .embedded_source_present()
+                .is_err()
+        );
+        assert!(accepted_high_byte_variant.parse_data().is_err());
+        assert_eq!(high_byte_variant.size_words().unwrap(), 4);
+        assert_eq!(high_byte_variant.embedded_source_present().unwrap(), None);
         assert_eq!(WmfRecordFunction::ExtTextOut.raw(), 0x0A32);
         assert_eq!(WmfRecordFunction::SaveDc.raw(), 0x001E);
         assert_eq!(WmfBitCount::TwentyFour.raw(), 0x0018);
@@ -4820,6 +5719,10 @@ mod tests {
             WmfRecordFunction::RealizePalette.raw(),
             Vec::new(),
         ));
+        let set_relabs = WmfRecord::new(WmfRecordFunction::SetRelabs.raw(), vec![0xAA, 0xBB]);
+        let parsed = set_relabs.parse_data().unwrap();
+        assert_eq!(parsed, WmfRecordData::SetRelabs(vec![0xAA, 0xBB]));
+        assert_eq!(parsed.to_record().unwrap(), set_relabs);
     }
 
     #[test]
@@ -5172,6 +6075,29 @@ mod tests {
             ]
             .concat(),
         ));
+        assert!(
+            WmfRecordData::Polygon(WmfPolyPointsRecord {
+                points: vec![PointS { x: 1, y: 2 }],
+            })
+            .to_record()
+            .is_err()
+        );
+        assert!(
+            WmfRecord::new(
+                WmfRecordFunction::Polygon.raw(),
+                [1i16.to_le_bytes(), 1i16.to_le_bytes(), 2i16.to_le_bytes()].concat(),
+            )
+            .parse_data()
+            .is_err()
+        );
+        assert!(
+            WmfRecord::new(
+                WmfRecordFunction::Polyline.raw(),
+                30_000i16.to_le_bytes().to_vec()
+            )
+            .parse_data()
+            .is_err()
+        );
         assert_typed_roundtrip(WmfRecord::new(
             WmfRecordFunction::PolyPolygon.raw(),
             [
@@ -5191,6 +6117,19 @@ mod tests {
             ]
             .concat(),
         ));
+        assert!(
+            WmfRecord::new(
+                WmfRecordFunction::PolyPolygon.raw(),
+                [
+                    2u16.to_le_bytes().as_slice(),
+                    u16::MAX.to_le_bytes().as_slice(),
+                    u16::MAX.to_le_bytes().as_slice(),
+                ]
+                .concat(),
+            )
+            .parse_data()
+            .is_err()
+        );
         assert_typed_roundtrip(WmfRecord::new(
             WmfRecordFunction::TextOut.raw(),
             [
@@ -5224,6 +6163,114 @@ mod tests {
             ]
             .concat(),
         ));
+        assert_typed_roundtrip(WmfRecord::new(
+            WmfRecordFunction::ExtTextOut.raw(),
+            [
+                9i16.to_le_bytes().as_slice(),
+                8i16.to_le_bytes().as_slice(),
+                2i16.to_le_bytes().as_slice(),
+                WmfExtTextOutOptions::PDY.bits().to_le_bytes().as_slice(),
+                b"ab",
+                5i16.to_le_bytes().as_slice(),
+                6i16.to_le_bytes().as_slice(),
+                7i16.to_le_bytes().as_slice(),
+                8i16.to_le_bytes().as_slice(),
+            ]
+            .concat(),
+        ));
+        assert!(
+            WmfRecordData::ExtTextOut(WmfExtTextOutRecord {
+                y: 9,
+                x: 8,
+                string_length: 3,
+                options: WmfExtTextOutOptions::empty(),
+                rectangle: None,
+                string: b"abc".to_vec(),
+                string_padding: vec![0],
+                dx: vec![5],
+                trailing_data: Vec::new(),
+            })
+            .to_record()
+            .is_err()
+        );
+        assert!(
+            WmfRecordData::ExtTextOut(WmfExtTextOutRecord {
+                y: 9,
+                x: 8,
+                string_length: 3,
+                options: WmfExtTextOutOptions::empty(),
+                rectangle: None,
+                string: b"abc".to_vec(),
+                string_padding: vec![0],
+                dx: Vec::new(),
+                trailing_data: vec![0],
+            })
+            .to_record()
+            .is_err()
+        );
+        assert!(
+            WmfRecord::new(
+                WmfRecordFunction::ExtTextOut.raw(),
+                [
+                    9i16.to_le_bytes().as_slice(),
+                    8i16.to_le_bytes().as_slice(),
+                    3i16.to_le_bytes().as_slice(),
+                    0u16.to_le_bytes().as_slice(),
+                    b"abc",
+                    &[0],
+                    5i16.to_le_bytes().as_slice(),
+                ]
+                .concat(),
+            )
+            .parse_data()
+            .is_err()
+        );
+        assert!(
+            WmfRecord::new(
+                WmfRecordFunction::ExtTextOut.raw(),
+                [
+                    9i16.to_le_bytes().as_slice(),
+                    8i16.to_le_bytes().as_slice(),
+                    3i16.to_le_bytes().as_slice(),
+                    WmfExtTextOutOptions::OPAQUE.bits().to_le_bytes().as_slice(),
+                    b"abc",
+                    &[0],
+                ]
+                .concat(),
+            )
+            .parse_data()
+            .is_err()
+        );
+        assert!(
+            WmfRecordData::ExtTextOut(WmfExtTextOutRecord {
+                y: 9,
+                x: 8,
+                string_length: 3,
+                options: WmfExtTextOutOptions::CLIPPED,
+                rectangle: None,
+                string: b"abc".to_vec(),
+                string_padding: vec![0],
+                dx: Vec::new(),
+                trailing_data: Vec::new(),
+            })
+            .to_record()
+            .is_err()
+        );
+        assert!(
+            WmfRecordData::ExtTextOut(WmfExtTextOutRecord {
+                y: 9,
+                x: 8,
+                string_length: 2,
+                options: WmfExtTextOutOptions::PDY,
+                rectangle: None,
+                string: b"ab".to_vec(),
+                string_padding: Vec::new(),
+                dx: vec![5, 6],
+                trailing_data: Vec::new(),
+            })
+            .to_record()
+            .is_err()
+        );
         assert!(
             WmfRecordData::ExtTextOut(WmfExtTextOutRecord {
                 y: 9,
@@ -5312,8 +6359,10 @@ mod tests {
             panic!("expected META_ESCAPE");
         };
         assert_eq!(value.post_script_cap_kind(), Some(WmfPostScriptCap::Round));
+        let typed = value.typed_data().unwrap();
+        assert_eq!(typed.post_script_cap_kind(), Some(WmfPostScriptCap::Round));
         assert_eq!(
-            value.typed_data().unwrap(),
+            typed,
             WmfEscapeData::SetLineCap {
                 cap: WmfPostScriptCap::Round.raw()
             }
@@ -5354,8 +6403,13 @@ mod tests {
             value.post_script_join_kind(),
             Some(WmfPostScriptJoin::Bevel)
         );
+        let typed = value.typed_data().unwrap();
         assert_eq!(
-            value.typed_data().unwrap(),
+            typed.post_script_join_kind(),
+            Some(WmfPostScriptJoin::Bevel)
+        );
+        assert_eq!(
+            typed,
             WmfEscapeData::SetLineJoin {
                 join: WmfPostScriptJoin::Bevel.raw()
             }
@@ -5383,8 +6437,13 @@ mod tests {
             value.post_script_clipping_kind(),
             Some(WmfPostScriptClipping::Inclusive)
         );
+        let typed = value.typed_data().unwrap();
         assert_eq!(
-            value.typed_data().unwrap(),
+            typed.post_script_clipping_kind(),
+            Some(WmfPostScriptClipping::Inclusive)
+        );
+        assert_eq!(
+            typed,
             WmfEscapeData::ClipToPath {
                 clip_function: WmfPostScriptClipping::Inclusive.raw(),
                 reserved: 0,
@@ -5415,13 +6474,46 @@ mod tests {
             value.post_script_feature_setting_kind(),
             Some(WmfPostScriptFeatureSetting::Protocol)
         );
+        let typed = value.typed_data().unwrap();
         assert_eq!(
-            value.typed_data().unwrap(),
+            typed.post_script_feature_setting_kind(),
+            Some(WmfPostScriptFeatureSetting::Protocol)
+        );
+        assert!(typed.is_valid_post_script_feature_setting());
+        assert_eq!(
+            typed,
             WmfEscapeData::GetPsFeatureSetting {
                 feature_setting: WmfPostScriptFeatureSetting::Protocol.raw()
             }
         );
         assert_eq!(parsed.to_record().unwrap(), feature);
+
+        let private_feature = WmfRecord::new(
+            WmfRecordFunction::Escape.raw(),
+            [
+                WmfMetafileEscape::GetPsFeatureSetting
+                    .raw()
+                    .to_le_bytes()
+                    .as_slice(),
+                4u16.to_le_bytes().as_slice(),
+                0x1001_i32.to_le_bytes().as_slice(),
+            ]
+            .concat(),
+        );
+        let parsed = private_feature.parse_data().unwrap();
+        let WmfRecordData::Escape(value) = &parsed else {
+            panic!("expected META_ESCAPE");
+        };
+        let typed = value.typed_data().unwrap();
+        assert_eq!(typed.post_script_feature_setting_kind(), None);
+        assert!(typed.is_valid_post_script_feature_setting());
+        assert_eq!(
+            typed,
+            WmfEscapeData::GetPsFeatureSetting {
+                feature_setting: 0x1001
+            }
+        );
+        assert_eq!(parsed.to_record().unwrap(), private_feature);
 
         let query = WmfRecordData::Escape(
             WmfEscapeRecord::from_typed_data(
@@ -5437,8 +6529,13 @@ mod tests {
         let WmfRecordData::Escape(value) = &parsed else {
             panic!("expected META_ESCAPE");
         };
+        let typed = value.typed_data().unwrap();
         assert_eq!(
-            value.typed_data().unwrap(),
+            typed.query_escape_kind(),
+            Some(WmfMetafileEscape::SetLineCap)
+        );
+        assert_eq!(
+            typed,
             WmfEscapeData::QueryEscSupport {
                 query: WmfMetafileEscape::SetLineCap.raw()
             }
@@ -5614,6 +6711,9 @@ mod tests {
             .unwrap(),
         );
         let record = set_color_table.to_record().unwrap();
+        record
+            .write_to(&mut Writer::new(Cursor::new(Vec::new())))
+            .unwrap();
         let parsed = record.parse_data().unwrap();
         let WmfRecordData::Escape(value) = &parsed else {
             panic!("expected META_ESCAPE");
@@ -5624,6 +6724,8 @@ mod tests {
                 color_table: &[0x01, 0x02, 0x03],
             }
         );
+        assert_eq!(value.padding, [0]);
+        assert_eq!(parsed, set_color_table);
 
         let get_color_table = WmfRecordData::Escape(
             WmfEscapeRecord::from_typed_data(
@@ -5996,6 +7098,31 @@ mod tests {
             .to_record()
             .is_err()
         );
+        assert!(
+            WmfRecordData::Escape(WmfEscapeRecord {
+                escape_function: WmfMetafileEscape::PostScriptData.raw(),
+                escape_data: vec![0xAA, 0xBB],
+                padding: vec![0],
+            })
+            .to_record()
+            .is_err()
+        );
+        assert!(
+            WmfRecord::new(
+                WmfRecordFunction::Escape.raw(),
+                [
+                    WmfMetafileEscape::PostScriptData
+                        .raw()
+                        .to_le_bytes()
+                        .as_slice(),
+                    3_u16.to_le_bytes().as_slice(),
+                    &[0xAA, 0xBB, 0xCC],
+                ]
+                .concat(),
+            )
+            .parse_data()
+            .is_err()
+        );
     }
 
     #[test]
@@ -6155,6 +7282,18 @@ mod tests {
         let mut invalid_palette_unknown = create_palette.clone();
         invalid_palette_unknown.data[11] = 0x08;
         assert!(invalid_palette_unknown.parse_data().is_err());
+        assert!(
+            WmfRecord::new(
+                WmfRecordFunction::CreatePalette.raw(),
+                [
+                    0x0300u16.to_le_bytes().as_slice(),
+                    100u16.to_le_bytes().as_slice(),
+                ]
+                .concat(),
+            )
+            .parse_data()
+            .is_err()
+        );
         let mut invalid_palette = value.clone();
         invalid_palette.entries[1].values =
             (WmfPaletteEntryFlags::RESERVED | WmfPaletteEntryFlags::EXPLICIT).bits();
@@ -6330,8 +7469,16 @@ mod tests {
         };
         let bitmap16 = value.bitmap16().unwrap();
         assert_eq!(bitmap16.header.width, 2);
+        assert_eq!(bitmap16.header.computed_width_bytes().unwrap(), 2);
         assert_eq!(bitmap16.header.computed_bits_len().unwrap(), 4);
         assert_eq!(bitmap16.bits, [0xAA, 0xBB, 0xCC, 0xDD]);
+        assert_eq!(
+            WmfBitmap16::read_from_slice(&bitmap16.to_bytes().unwrap()).unwrap(),
+            bitmap16
+        );
+        let mut truncated_bitmap16 = bitmap16.to_bytes().unwrap();
+        truncated_bitmap16.pop();
+        assert!(WmfBitmap16::read_from_slice(&truncated_bitmap16).is_err());
         assert_eq!(parsed.to_record().unwrap(), create_pattern);
         let mut invalid_bitmap16_header = create_pattern.data[..10].to_vec();
         invalid_bitmap16_header[8] = 2;
@@ -6341,6 +7488,21 @@ mod tests {
         );
         let mut invalid_bitmap16_header = bitmap16.header;
         invalid_bitmap16_header.planes = 2;
+        assert!(
+            invalid_bitmap16_header
+                .write_to(&mut Writer::new(Cursor::new(Vec::new())))
+                .is_err()
+        );
+        let mut invalid_bitmap16_width_bytes = create_pattern.data[..10].to_vec();
+        invalid_bitmap16_width_bytes[6..8].copy_from_slice(&4i16.to_le_bytes());
+        assert!(
+            WmfBitmap16Header::read_from(&mut Reader::new(Cursor::new(
+                invalid_bitmap16_width_bytes
+            )))
+            .is_err()
+        );
+        let mut invalid_bitmap16_header = bitmap16.header;
+        invalid_bitmap16_header.width_bytes = -1;
         assert!(
             invalid_bitmap16_header
                 .write_to(&mut Writer::new(Cursor::new(Vec::new())))
@@ -6466,15 +7628,39 @@ mod tests {
         let count2_offset = invalid_count2.data.len() - 2;
         invalid_count2.data[count2_offset..].copy_from_slice(&4u16.to_le_bytes());
         assert!(invalid_count2.parse_data().is_err());
+
+        let mut oversized_scan_count = create_region.clone();
+        oversized_scan_count.data.truncate(22);
+        oversized_scan_count.data[10..12].copy_from_slice(&1_000i16.to_le_bytes());
+        assert!(oversized_scan_count.parse_data().is_err());
+
+        let mut oversized_scan_lines = create_region.clone();
+        oversized_scan_lines.data.truncate(28);
+        oversized_scan_lines.data[22..24].copy_from_slice(&100u16.to_le_bytes());
+        assert!(oversized_scan_lines.parse_data().is_err());
     }
 
     #[test]
     fn typed_wmf_bitmap_transfer_records_roundtrip() {
         let core_1bpp_dib = core_1bpp_dib_bytes();
+        assert!(WmfTernaryRasterOperationCode::SRCCOPY.uses_source());
+        assert!(!WmfTernaryRasterOperationCode::PATCOPY.uses_source());
+        assert_eq!(
+            WmfTernaryRasterOperationCode::SRCCOPY.canonical_raw(),
+            0x00CC_0020
+        );
+        assert_eq!(
+            WmfTernaryRasterOperationCode::PATCOPY.canonical_raw(),
+            0x00F0_0021
+        );
+        for (index, value) in WMF_TERNARY_RASTER_OPERATION_VALUES.iter().enumerate() {
+            assert_eq!((value >> 16) as usize, index);
+            assert!(WmfTernaryRasterOperation::new(*value).is_valid());
+        }
         let bit_blt_no_source = WmfRecord::new(
             WmfRecordFunction::BitBlt.raw(),
             [
-                0x00CC_0020u32.to_le_bytes().as_slice(),
+                0x00F0_0021u32.to_le_bytes().as_slice(),
                 1i16.to_le_bytes().as_slice(),
                 2i16.to_le_bytes().as_slice(),
                 0xCAFEu16.to_le_bytes().as_slice(),
@@ -6491,10 +7677,77 @@ mod tests {
         };
         assert_eq!(
             value.raster_operation_code(),
-            WmfTernaryRasterOperationCode::SRCCOPY
+            WmfTernaryRasterOperationCode::PATCOPY
         );
-        assert_eq!(value.ternary_raster_operation().raw(), 0x00CC_0020);
+        assert_eq!(value.ternary_raster_operation().raw(), 0x00F0_0021);
+        assert!(!value.target.is_source_present());
+        assert!(value.target.source_bytes().is_none());
+        assert_eq!(value.target.bitmap16().unwrap(), None);
         assert_eq!(parsed.to_record().unwrap(), bit_blt_no_source);
+        let invalid_bit_blt_function_size = WmfRecord::new(
+            0x0822,
+            [
+                0x00F0_0021u32.to_le_bytes().as_slice(),
+                1i16.to_le_bytes().as_slice(),
+                2i16.to_le_bytes().as_slice(),
+                0xCAFEu16.to_le_bytes().as_slice(),
+                3i16.to_le_bytes().as_slice(),
+                4i16.to_le_bytes().as_slice(),
+                5i16.to_le_bytes().as_slice(),
+                6i16.to_le_bytes().as_slice(),
+            ]
+            .concat(),
+        );
+        assert!(
+            invalid_bit_blt_function_size
+                .embedded_source_present()
+                .is_err()
+        );
+        assert!(invalid_bit_blt_function_size.parse_data().is_err());
+        let source_dependent_no_source = WmfRecord::new(
+            WmfRecordFunction::BitBlt.raw(),
+            [
+                0x00CC_0020u32.to_le_bytes().as_slice(),
+                1i16.to_le_bytes().as_slice(),
+                2i16.to_le_bytes().as_slice(),
+                0xCAFEu16.to_le_bytes().as_slice(),
+                3i16.to_le_bytes().as_slice(),
+                4i16.to_le_bytes().as_slice(),
+                5i16.to_le_bytes().as_slice(),
+                6i16.to_le_bytes().as_slice(),
+            ]
+            .concat(),
+        );
+        assert!(source_dependent_no_source.parse_data().is_err());
+        let invalid_bit_blt_rop = WmfRecord::new(
+            WmfRecordFunction::BitBlt.raw(),
+            [
+                0x00F0_0020u32.to_le_bytes().as_slice(),
+                1i16.to_le_bytes().as_slice(),
+                2i16.to_le_bytes().as_slice(),
+                0xCAFEu16.to_le_bytes().as_slice(),
+                3i16.to_le_bytes().as_slice(),
+                4i16.to_le_bytes().as_slice(),
+                5i16.to_le_bytes().as_slice(),
+                6i16.to_le_bytes().as_slice(),
+            ]
+            .concat(),
+        );
+        assert!(invalid_bit_blt_rop.parse_data().is_err());
+        assert!(
+            WmfRecordData::BitBlt(WmfBitBltRecord {
+                raster_operation: 0x00CC_0020,
+                y_src: 1,
+                x_src: 2,
+                height: 3,
+                width: 4,
+                y_dest: 5,
+                x_dest: 6,
+                target: WmfBitmap16Target::NoSource { reserved: 0xCAFE },
+            })
+            .to_record()
+            .is_err()
+        );
         assert_typed_roundtrip(WmfRecord::new(
             WmfRecordFunction::BitBlt.raw(),
             [
@@ -6509,10 +7762,48 @@ mod tests {
             ]
             .concat(),
         ));
+        let valid_bitmap16_source = WmfBitmap16 {
+            header: WmfBitmap16Header {
+                bitmap_type: 0,
+                width: 2,
+                height: 1,
+                width_bytes: 2,
+                planes: 1,
+                bits_pixel: 1,
+            },
+            bits: vec![0xAA, 0xBB],
+        }
+        .to_bytes()
+        .unwrap();
+        let bit_blt_source = WmfRecord::new(
+            WmfRecordFunction::BitBlt.raw(),
+            [
+                0x00CC_0020u32.to_le_bytes().as_slice(),
+                1i16.to_le_bytes().as_slice(),
+                2i16.to_le_bytes().as_slice(),
+                3i16.to_le_bytes().as_slice(),
+                4i16.to_le_bytes().as_slice(),
+                5i16.to_le_bytes().as_slice(),
+                6i16.to_le_bytes().as_slice(),
+                valid_bitmap16_source.as_slice(),
+            ]
+            .concat(),
+        );
+        let WmfRecordData::BitBlt(value) = bit_blt_source.parse_data().unwrap() else {
+            panic!("expected META_BITBLT");
+        };
+        assert!(value.target.is_source_present());
+        assert_eq!(
+            value.target.source_bytes(),
+            Some(valid_bitmap16_source.as_slice())
+        );
+        let parsed_bitmap16 = value.target.bitmap16().unwrap().unwrap();
+        assert_eq!(parsed_bitmap16.header.height, 1);
+        assert_eq!(parsed_bitmap16.bits, [0xAA, 0xBB]);
         assert_typed_roundtrip(WmfRecord::new(
             WmfRecordFunction::DibBitBlt.raw(),
             [
-                0x00CC_0020u32.to_le_bytes().as_slice(),
+                0x00F0_0021u32.to_le_bytes().as_slice(),
                 1i16.to_le_bytes().as_slice(),
                 2i16.to_le_bytes().as_slice(),
                 0x1234u16.to_le_bytes().as_slice(),
@@ -6523,10 +7814,36 @@ mod tests {
             ]
             .concat(),
         ));
+        let dib_bit_blt_source = WmfRecord::new(
+            WmfRecordFunction::DibBitBlt.raw(),
+            [
+                0x00CC_0020u32.to_le_bytes().as_slice(),
+                1i16.to_le_bytes().as_slice(),
+                2i16.to_le_bytes().as_slice(),
+                3i16.to_le_bytes().as_slice(),
+                4i16.to_le_bytes().as_slice(),
+                5i16.to_le_bytes().as_slice(),
+                6i16.to_le_bytes().as_slice(),
+                core_1bpp_dib.as_slice(),
+            ]
+            .concat(),
+        );
+        let WmfRecordData::DibBitBlt(value) = dib_bit_blt_source.parse_data().unwrap() else {
+            panic!("expected META_DIBBITBLT");
+        };
+        assert!(value.target.is_source_present());
+        assert_eq!(value.target.source_bytes(), Some(core_1bpp_dib.as_slice()));
+        let dib = value
+            .target
+            .device_independent_bitmap(DibColorUsage::RgbColors)
+            .unwrap()
+            .unwrap();
+        assert_eq!(dib.info.header.width(), 1);
+        assert_eq!(dib.bits, [0x80, 0x00]);
         assert_typed_roundtrip(WmfRecord::new(
             WmfRecordFunction::StretchBlt.raw(),
             [
-                0x00CC_0020u32.to_le_bytes().as_slice(),
+                0x00F0_0021u32.to_le_bytes().as_slice(),
                 10i16.to_le_bytes().as_slice(),
                 20i16.to_le_bytes().as_slice(),
                 1i16.to_le_bytes().as_slice(),
@@ -6555,6 +7872,22 @@ mod tests {
             ]
             .concat(),
         ));
+        assert!(
+            WmfRecordData::DibStretchBlt(WmfDibStretchBltRecord {
+                raster_operation: 0x00CC_0020,
+                src_height: 10,
+                src_width: 20,
+                y_src: 1,
+                x_src: 2,
+                dest_height: 30,
+                dest_width: 40,
+                y_dest: 5,
+                x_dest: 6,
+                target: WmfDibTarget::NoSource { reserved: 0xBEEF },
+            })
+            .to_record()
+            .is_err()
+        );
 
         let pat_blt = WmfRecord::new(
             WmfRecordFunction::PatBlt.raw(),
@@ -6576,6 +7909,30 @@ mod tests {
             WmfTernaryRasterOperationCode::PATCOPY
         );
         assert_eq!(parsed.to_record().unwrap(), pat_blt);
+
+        let invalid_pat_blt_rop = WmfRecord::new(
+            WmfRecordFunction::PatBlt.raw(),
+            [
+                0x00F0_0020u32.to_le_bytes().as_slice(),
+                8i16.to_le_bytes().as_slice(),
+                7i16.to_le_bytes().as_slice(),
+                6i16.to_le_bytes().as_slice(),
+                5i16.to_le_bytes().as_slice(),
+            ]
+            .concat(),
+        );
+        assert!(invalid_pat_blt_rop.parse_data().is_err());
+        assert!(
+            WmfRecordData::PatBlt(WmfPatBltRecord {
+                raster_operation: 0x00F0_0020,
+                height: 8,
+                width: 7,
+                y_left: 6,
+                x_left: 5,
+            })
+            .to_record()
+            .is_err()
+        );
 
         let set_dib_to_dev = WmfRecord::new(
             WmfRecordFunction::SetDibToDev.raw(),

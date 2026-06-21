@@ -1431,6 +1431,7 @@ mod tests {
     fn metafile_with(record: EmfRecord) -> Vec<u8> {
         EmfMetafile {
             records: vec![minimal_header_record(), record, eof_record()],
+            trailing_data: Vec::new(),
         }
         .to_bytes()
         .unwrap()

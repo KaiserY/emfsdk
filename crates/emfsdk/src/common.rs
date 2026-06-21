@@ -147,6 +147,12 @@ impl<R: Read + Seek> Reader<R> {
         self.inner.read_exact(&mut buf)?;
         Ok(buf)
     }
+
+    pub fn read_array<const N: usize>(&mut self) -> Result<[u8; N]> {
+        let mut buf = [0; N];
+        self.inner.read_exact(&mut buf)?;
+        Ok(buf)
+    }
 }
 
 pub struct Writer<W> {

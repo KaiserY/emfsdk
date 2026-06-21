@@ -39,6 +39,7 @@ pub const EMFPLUS_SHARPEN_EFFECT_GUID: [u8; 16] = [
 pub const EMFPLUS_TINT_EFFECT_GUID: [u8; 16] = [
     0x00, 0xAF, 0x77, 0x10, 0x48, 0x28, 0x41, 0x44, 0x94, 0x89, 0x44, 0xAD, 0x4C, 0x2D, 0x7A, 0x2C,
 ];
+const EMFPLUS_TS_CLIP_MAX_RECTS: u16 = 0x7FFF;
 
 bitflags! {
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -803,6 +804,30 @@ pub struct EmfPlusGraphicsVersion {
 }
 
 impl EmfPlusGraphicsVersion {
+    pub fn from_parts(metafile_signature: u32, graphics_version: u16) -> Result<Self> {
+        if metafile_signature > 0x000F_FFFF {
+            return Err(Error::invalid(
+                0,
+                "EmfPlusGraphicsVersion MetafileSignature exceeds 20 bits",
+            ));
+        }
+        if graphics_version > 0x0FFF {
+            return Err(Error::invalid(
+                0,
+                "EmfPlusGraphicsVersion GraphicsVersion exceeds 12 bits",
+            ));
+        }
+        Ok(Self {
+            value: (metafile_signature << 12) | u32::from(graphics_version),
+        })
+    }
+
+    pub fn from_graphics_version(graphics_version: EmfPlusGraphicsVersionValue) -> Self {
+        Self {
+            value: (EMFPLUS_METAFILE_SIGNATURE << 12) | u32::from(graphics_version.raw()),
+        }
+    }
+
     pub fn metafile_signature(&self) -> u32 {
         self.value >> 12
     }
@@ -1348,6 +1373,7 @@ impl EmfPlusSolidBrushData {
         &self,
         writer: &mut Writer<W>,
     ) -> Result<()> {
+        validate_solid_brush_data(self)?;
         self.solid_color.write_to(writer)?;
         writer.write_all(&self.trailing_data)
     }
@@ -1486,6 +1512,7 @@ impl EmfPlusLinearGradientBrushOptionalData {
         &self,
         writer: &mut Writer<W>,
     ) -> Result<()> {
+        validate_linear_gradient_brush_optional_data(self)?;
         if let Some(transform_matrix) = &self.transform_matrix {
             transform_matrix.write_to(writer)?;
         }
@@ -1515,6 +1542,7 @@ impl EmfPlusPathGradientBrushTailData {
         &self,
         writer: &mut Writer<W>,
     ) -> Result<()> {
+        validate_path_gradient_brush_tail_data(self)?;
         if let Some(boundary_data) = &self.boundary_data {
             boundary_data.write_to(writer)?;
         }
@@ -1577,8 +1605,8 @@ impl EmfPlusBlendPattern {
                 horizontal,
                 vertical,
             } => {
-                horizontal.write_to(writer)?;
-                vertical.write_to(writer)
+                vertical.write_to(writer)?;
+                horizontal.write_to(writer)
             }
         }
     }
@@ -1603,6 +1631,7 @@ impl EmfPlusBlendColors {
             ));
         }
         validate_unit_interval_values(&self.positions, "EmfPlusBlendColors positions")?;
+        validate_empty_trailing_data(&self.trailing_data, "EmfPlusBlendColors")?;
         writer.write_u32(len_to_u32(
             self.positions.len(),
             "EMF+ blend color positions",
@@ -1636,6 +1665,7 @@ impl EmfPlusBlendFactors {
             ));
         }
         validate_blend_factors(&self.positions, &self.factors)?;
+        validate_empty_trailing_data(&self.trailing_data, "EmfPlusBlendFactors")?;
         writer.write_u32(len_to_u32(
             self.positions.len(),
             "EMF+ blend factor positions",
@@ -1679,6 +1709,7 @@ impl EmfPlusBoundaryPathData {
         &self,
         writer: &mut Writer<W>,
     ) -> Result<()> {
+        validate_empty_trailing_data(&self.trailing_data, "EmfPlusBoundaryPathData")?;
         self.path_data.write_to(writer)?;
         writer.write_all(&self.trailing_data)
     }
@@ -1695,6 +1726,7 @@ impl EmfPlusBoundaryPointData {
         &self,
         writer: &mut Writer<W>,
     ) -> Result<()> {
+        validate_empty_trailing_data(&self.trailing_data, "EmfPlusBoundaryPointData")?;
         writer.write_i32(len_to_i32(self.points.len(), "EMF+ boundary points")?)?;
         for point in &self.points {
             point.write_to(writer)?;
@@ -1809,6 +1841,7 @@ impl EmfPlusTextureBrushOptionalData {
         &self,
         writer: &mut Writer<W>,
     ) -> Result<()> {
+        validate_texture_brush_optional_data(self)?;
         if let Some(value) = &self.transform_matrix {
             value.write_to(writer)?;
         }
@@ -1897,6 +1930,13 @@ impl EmfPlusCustomLineCapObject {
         self.version.write_to(writer)?;
         writer.write_i32(self.cap_type)?;
         writer.write_all(&self.custom_line_cap_data)
+    }
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        let mut writer = Writer::new(std::io::Cursor::new(&mut bytes));
+        self.write_to(&mut writer)?;
+        Ok(bytes)
     }
 }
 
@@ -2074,6 +2114,7 @@ impl EmfPlusCustomLineCapOptionalData {
         &self,
         writer: &mut Writer<W>,
     ) -> Result<()> {
+        validate_custom_line_cap_optional_data(self)?;
         if let Some(fill_path) = &self.fill_path {
             fill_path.write_to(writer)?;
         }
@@ -2102,6 +2143,7 @@ impl EmfPlusFillPathObject {
         &self,
         writer: &mut Writer<W>,
     ) -> Result<()> {
+        validate_fill_path_object(self)?;
         self.path_data.write_to(writer)?;
         writer.write_all(&self.trailing_data)
     }
@@ -2118,6 +2160,7 @@ impl EmfPlusLinePathObject {
         &self,
         writer: &mut Writer<W>,
     ) -> Result<()> {
+        validate_line_path_object(self)?;
         self.path_data.write_to(writer)?;
         writer.write_all(&self.trailing_data)
     }
@@ -2577,6 +2620,16 @@ impl EmfPlusPathPointTypes {
         }
     }
 
+    pub fn sdk_size(&self) -> Result<usize> {
+        match self {
+            Self::Values(values) => Ok(values.len()),
+            Self::Rle(values) => values
+                .len()
+                .checked_mul(2)
+                .ok_or_else(|| Error::invalid(0, "EMF+ path point type size overflows")),
+        }
+    }
+
     pub fn write_to<W: std::io::Write + std::io::Seek>(
         &self,
         writer: &mut Writer<W>,
@@ -2630,8 +2683,29 @@ pub struct EmfPlusPathPointTypeRle {
 }
 
 impl EmfPlusPathPointTypeRle {
+    pub fn new(bezier: bool, run_count: u8, point_type: EmfPlusPathPointTypeValue) -> Result<Self> {
+        if run_count == 0 || run_count > 0x3F {
+            return Err(Error::invalid(
+                0,
+                "EmfPlusPathPointTypeRLE RunCount must be in 1..=63",
+            ));
+        }
+        let mut control = 0x40 | run_count;
+        if bezier {
+            control |= 0x80;
+        }
+        Ok(Self {
+            control,
+            point_type,
+        })
+    }
+
     pub fn bezier(self) -> bool {
         self.control & 0x80 != 0
+    }
+
+    pub fn marker_bit_set(self) -> bool {
+        self.control & 0x40 != 0
     }
 
     pub fn run_count(self) -> u8 {
@@ -2677,14 +2751,12 @@ impl EmfPlusPenObject {
             self.pen_data_and_brush_object.as_slice(),
         ));
         let data_len = self.pen_data_and_brush_object.len() as u64;
-        let mut pen_data = read_emf_plus_pen_data(&mut reader, data_len)?;
+        let pen_data = read_emf_plus_pen_data(&mut reader, data_len)?;
         let brush_object = if reader.position()? < data_len {
             let start = reader.position()?;
             let remaining = data_len - start;
             if remaining < 8 {
-                pen_data.trailing_data =
-                    read_remaining_vec(&mut reader, data_len, "EmfPlusPen trailing data")?;
-                None
+                return Err(Error::invalid(start, "EmfPlusPen BrushObject is truncated"));
             } else {
                 let version = EmfPlusGraphicsVersion::read_from(&mut reader)?;
                 let brush_type = reader.read_u32()?;
@@ -2835,6 +2907,24 @@ pub struct EmfPlusCustomStartCapData {
 }
 
 impl EmfPlusCustomStartCapData {
+    pub fn from_typed_cap(cap: &EmfPlusCustomLineCapObject) -> Result<Self> {
+        let value = Self {
+            custom_start_cap: cap.to_bytes()?,
+        };
+        value.parse_custom_start_cap()?;
+        Ok(value)
+    }
+
+    pub fn parse_custom_start_cap(&self) -> Result<EmfPlusCustomLineCapObject> {
+        read_sized_custom_line_cap(&self.custom_start_cap, "EmfPlusCustomStartCapData")
+    }
+
+    pub fn set_typed_cap(&mut self, cap: &EmfPlusCustomLineCapObject) -> Result<()> {
+        self.custom_start_cap = cap.to_bytes()?;
+        self.parse_custom_start_cap()?;
+        Ok(())
+    }
+
     pub fn write_to<W: std::io::Write + std::io::Seek>(
         &self,
         writer: &mut Writer<W>,
@@ -2860,6 +2950,24 @@ pub struct EmfPlusCustomEndCapData {
 }
 
 impl EmfPlusCustomEndCapData {
+    pub fn from_typed_cap(cap: &EmfPlusCustomLineCapObject) -> Result<Self> {
+        let value = Self {
+            custom_end_cap: cap.to_bytes()?,
+        };
+        value.parse_custom_end_cap()?;
+        Ok(value)
+    }
+
+    pub fn parse_custom_end_cap(&self) -> Result<EmfPlusCustomLineCapObject> {
+        read_sized_custom_line_cap(&self.custom_end_cap, "EmfPlusCustomEndCapData")
+    }
+
+    pub fn set_typed_cap(&mut self, cap: &EmfPlusCustomLineCapObject) -> Result<()> {
+        self.custom_end_cap = cap.to_bytes()?;
+        self.parse_custom_end_cap()?;
+        Ok(())
+    }
+
     pub fn write_to<W: std::io::Write + std::io::Seek>(
         &self,
         writer: &mut Writer<W>,
@@ -3148,6 +3256,12 @@ impl EmfPlusPenOptionalData {
                 "EmfPlusCompoundLineData",
             )?;
         }
+        if let Some(value) = &self.custom_start_cap_data {
+            value.parse_custom_start_cap()?;
+        }
+        if let Some(value) = &self.custom_end_cap_data {
+            value.parse_custom_end_cap()?;
+        }
         Ok(())
     }
 }
@@ -3170,6 +3284,13 @@ impl EmfPlusRegionObject {
             as usize;
         if expected_count == 0 || data_len == 0 {
             return Err(Error::invalid(0, "EmfPlusRegion RegionNode is missing"));
+        }
+        let max_nodes_by_size = self.region_nodes.len() / 4;
+        if expected_count > max_nodes_by_size {
+            return Err(Error::invalid(
+                0,
+                "EmfPlusRegion RegionNodeCount exceeds the node payload size",
+            ));
         }
         let node = read_emf_plus_region_node(&mut reader, data_len)?;
         validate_region_node_tree(
@@ -3209,6 +3330,7 @@ impl EmfPlusRegionNode {
         &self,
         writer: &mut Writer<W>,
     ) -> Result<()> {
+        validate_region_node_data_matches_type(self)?;
         writer.write_u32(self.node_type)?;
         self.data.write_to(writer)
     }
@@ -3325,12 +3447,50 @@ pub struct EmfPlusLanguageIdentifier {
 }
 
 impl EmfPlusLanguageIdentifier {
+    pub fn from_parts(primary_language_id: u16, sub_language_id: u8) -> Result<Self> {
+        if primary_language_id > 0x03FF {
+            return Err(Error::invalid(
+                0,
+                "EmfPlusLanguageIdentifier PrimaryLanguageId exceeds 10 bits",
+            ));
+        }
+        if sub_language_id > 0x3F {
+            return Err(Error::invalid(
+                0,
+                "EmfPlusLanguageIdentifier SubLanguageId exceeds 6 bits",
+            ));
+        }
+        Ok(Self {
+            raw: u32::from(primary_language_id) | (u32::from(sub_language_id) << 10),
+        })
+    }
+
+    pub fn language_id(self) -> u16 {
+        self.raw as u16
+    }
+
+    pub fn high_word(self) -> u16 {
+        (self.raw >> 16) as u16
+    }
+
     pub fn primary_language_id(self) -> u16 {
-        (self.raw & 0x03FF) as u16
+        self.language_id() & 0x03FF
     }
 
     pub fn sub_language_id(self) -> u8 {
-        ((self.raw >> 10) & 0x3F) as u8
+        ((self.language_id() >> 10) & 0x3F) as u8
+    }
+
+    pub fn is_vendor_primary_language_id(self) -> bool {
+        (0x0200..=0x03FF).contains(&self.primary_language_id())
+    }
+
+    pub fn is_vendor_sub_language_id(self) -> bool {
+        (0x20..=0x3F).contains(&self.sub_language_id())
+    }
+
+    pub fn is_word_sized(self) -> bool {
+        self.high_word() == 0
     }
 }
 
@@ -3360,6 +3520,14 @@ impl EmfPlusStringFormatObject {
             tab_stops: self.tab_stops.clone(),
             char_ranges: self.char_ranges.clone(),
         }
+    }
+
+    pub fn tab_stops(&self) -> &[f32] {
+        &self.tab_stops
+    }
+
+    pub fn char_ranges(&self) -> &[EmfPlusCharacterRange] {
+        &self.char_ranges
     }
 
     pub fn string_alignment_kind(&self) -> Option<EmfPlusStringAlignment> {
@@ -3500,6 +3668,23 @@ impl EmfPlusSerializableObjectData {
     pub fn parse_effect(&self) -> Result<EmfPlusImageEffect> {
         let mut reader = Reader::new(std::io::Cursor::new(self.buffer.as_slice()));
         read_emf_plus_image_effect(&mut reader, self.buffer.len() as u64, self.object_guid)
+    }
+
+    pub fn validate_known_effect_buffer(&self) -> Result<()> {
+        if !self.buffer.len().is_multiple_of(4) {
+            return Err(Error::invalid(
+                0,
+                "EmfPlusSerializableObject BufferSize must be 32-bit aligned",
+            ));
+        }
+        if self.effect_kind().is_none() {
+            return Err(Error::invalid(
+                0,
+                "EmfPlusSerializableObject ObjectGUID is not an ImageEffects identifier",
+            ));
+        }
+        self.parse_effect()?;
+        Ok(())
     }
 }
 
@@ -3703,6 +3888,7 @@ impl EmfPlusColorLookupTableEffect {
         &self,
         writer: &mut Writer<W>,
     ) -> Result<()> {
+        validate_color_lookup_table_effect(self)?;
         writer.write_all(&self.blue_lookup_table)?;
         writer.write_all(&self.green_lookup_table)?;
         writer.write_all(&self.red_lookup_table)?;
@@ -3785,6 +3971,7 @@ impl EmfPlusRedEyeCorrectionEffect {
         &self,
         writer: &mut Writer<W>,
     ) -> Result<()> {
+        validate_red_eye_correction_effect(self)?;
         writer.write_i32(len_to_i32(self.areas.len(), "EMF+ red eye areas")?)?;
         for area in &self.areas {
             area.write_to(writer)?;
@@ -4209,6 +4396,11 @@ impl EmfPlusRecord {
     }
 
     pub fn parse_data(&self) -> Result<EmfPlusRecordData<'_>> {
+        validate_emf_plus_fixed_payload_shape(
+            self.record_kind(),
+            self.data.len(),
+            self.padding.len(),
+        )?;
         let mut reader = Reader::new(std::io::Cursor::new(self.data.as_slice()));
         let flags = self.flags();
 
@@ -4275,12 +4467,24 @@ impl EmfPlusRecord {
                 let count = reader.read_u32()? as usize;
                 require_count_at_least(count, 3, "EmfPlusFillPolygon point")?;
                 let points = read_points(&mut reader, count, flags, self.data.len() as u64)?;
+                finish_record_point_array(
+                    &mut reader,
+                    self.data.len() as u64,
+                    &points,
+                    "EmfPlusFillPolygon PointData",
+                )?;
                 EmfPlusRecordData::FillPolygon(EmfPlusFillPolygonData { brush, points })
             }
             Some(EmfPlusRecordType::DrawLines) if self.data.len() >= 4 => {
                 let count = reader.read_u32()? as usize;
                 require_count_at_least(count, 2, "EmfPlusDrawLines point")?;
                 let points = read_points(&mut reader, count, flags, self.data.len() as u64)?;
+                finish_record_point_array(
+                    &mut reader,
+                    self.data.len() as u64,
+                    &points,
+                    "EmfPlusDrawLines PointData",
+                )?;
                 EmfPlusRecordData::DrawLines(EmfPlusDrawLinesData {
                     pen_id: flags.object_id(),
                     close_shape: flags.contains(EmfPlusRecordFlags::CLOSE_SHAPE),
@@ -4357,6 +4561,12 @@ impl EmfPlusRecord {
                 let count = reader.read_u32()? as usize;
                 require_count_at_least(count, 3, "EmfPlusFillClosedCurve point")?;
                 let points = read_points(&mut reader, count, flags, self.data.len() as u64)?;
+                finish_record_point_array(
+                    &mut reader,
+                    self.data.len() as u64,
+                    &points,
+                    "EmfPlusFillClosedCurve PointData",
+                )?;
                 EmfPlusRecordData::FillClosedCurve(EmfPlusFillClosedCurveData {
                     brush,
                     winding_fill: flags.contains(EmfPlusRecordFlags::WINDING_FILL),
@@ -4369,6 +4579,12 @@ impl EmfPlusRecord {
                 let count = reader.read_u32()? as usize;
                 require_count_at_least(count, 3, "EmfPlusDrawClosedCurve point")?;
                 let points = read_points(&mut reader, count, flags, self.data.len() as u64)?;
+                finish_record_point_array(
+                    &mut reader,
+                    self.data.len() as u64,
+                    &points,
+                    "EmfPlusDrawClosedCurve PointData",
+                )?;
                 EmfPlusRecordData::DrawClosedCurve(EmfPlusClosedCurveData {
                     pen_id: flags.object_id(),
                     tension,
@@ -4383,6 +4599,12 @@ impl EmfPlusRecord {
                 require_count_at_least(count, 2, "EmfPlusDrawCurve point")?;
                 let points =
                     read_absolute_points(&mut reader, count, flags, self.data.len() as u64)?;
+                finish_record_point_array(
+                    &mut reader,
+                    self.data.len() as u64,
+                    &points,
+                    "EmfPlusDrawCurve PointData",
+                )?;
                 EmfPlusRecordData::DrawCurve(EmfPlusDrawCurveData {
                     pen_id: flags.object_id(),
                     tension,
@@ -4393,8 +4615,14 @@ impl EmfPlusRecord {
             }
             Some(EmfPlusRecordType::DrawBeziers) if self.data.len() >= 4 => {
                 let count = reader.read_u32()? as usize;
-                require_count_at_least(count, 4, "EmfPlusDrawBeziers point")?;
+                validate_draw_beziers_point_count(count)?;
                 let points = read_points(&mut reader, count, flags, self.data.len() as u64)?;
+                finish_record_point_array(
+                    &mut reader,
+                    self.data.len() as u64,
+                    &points,
+                    "EmfPlusDrawBeziers PointData",
+                )?;
                 EmfPlusRecordData::DrawBeziers(EmfPlusDrawPointsData {
                     pen_id: flags.object_id(),
                     points,
@@ -4425,6 +4653,12 @@ impl EmfPlusRecord {
                     ));
                 }
                 let points = read_points(&mut reader, count, flags, self.data.len() as u64)?;
+                finish_record_point_array(
+                    &mut reader,
+                    self.data.len() as u64,
+                    &points,
+                    "EmfPlusDrawImagePoints PointData",
+                )?;
                 EmfPlusRecordData::DrawImagePoints(EmfPlusDrawImagePointsData {
                     image_id: flags.object_id(),
                     apply_effect: flags.contains(EmfPlusRecordFlags::EFFECT),
@@ -4442,6 +4676,12 @@ impl EmfPlusRecord {
                 let string_len = length.checked_mul(2).ok_or_else(|| {
                     Error::invalid(0, "EmfPlusDrawString string length overflows")
                 })?;
+                ensure_remaining(
+                    &mut reader,
+                    self.data.len() as u64,
+                    string_len,
+                    "EmfPlusDrawString string",
+                )?;
                 let string = SdkString::raw(reader.read_vec(string_len)?, SdkEncoding::Utf16Le);
                 let position = reader.position()? as usize;
                 let padding = self
@@ -4608,12 +4848,34 @@ impl EmfPlusRecord {
                     EmfPlusDriverStringOptionsFlags::all().bits(),
                     "EmfPlusDrawDriverString DriverStringOptionsFlags",
                 )?;
+                let glyph_bytes = glyph_count.checked_mul(2).ok_or_else(|| {
+                    Error::invalid(0, "EmfPlusDrawDriverString glyph size overflows usize")
+                })?;
+                ensure_remaining(
+                    &mut reader,
+                    self.data.len() as u64,
+                    glyph_bytes,
+                    "EmfPlusDrawDriverString glyphs",
+                )?;
                 let mut glyphs = Vec::with_capacity(glyph_count);
                 for _ in 0..glyph_count {
                     glyphs.push(reader.read_u16()?);
                 }
                 let glyph_position_count =
                     driver_string_glyph_position_count(glyph_count, driver_string_options);
+                let glyph_position_bytes =
+                    glyph_position_count.checked_mul(8).ok_or_else(|| {
+                        Error::invalid(
+                            0,
+                            "EmfPlusDrawDriverString glyph position size overflows usize",
+                        )
+                    })?;
+                ensure_remaining(
+                    &mut reader,
+                    self.data.len() as u64,
+                    glyph_position_bytes,
+                    "EmfPlusDrawDriverString glyph positions",
+                )?;
                 let mut glyph_positions = Vec::with_capacity(glyph_position_count);
                 for _ in 0..glyph_position_count {
                     glyph_positions.push(PointF::read_from(&mut reader)?);
@@ -4621,6 +4883,12 @@ impl EmfPlusRecord {
                 let transform_matrix = if matrix_present == 0 {
                     None
                 } else {
+                    ensure_remaining(
+                        &mut reader,
+                        self.data.len() as u64,
+                        24,
+                        "EmfPlusDrawDriverString TransformMatrix",
+                    )?;
                     Some(XForm::read_from(&mut reader)?)
                 };
                 ensure_reader_end(
@@ -4642,9 +4910,14 @@ impl EmfPlusRecord {
                 EmfPlusRecordData::StrokeFillPath
             }
             Some(EmfPlusRecordType::SerializableObject) if self.data.len() >= 20 => {
-                let mut object_guid = [0; 16];
-                object_guid.copy_from_slice(&reader.read_vec(16)?);
+                let object_guid = reader.read_array::<16>()?;
                 let buffer_size = reader.read_u32()? as usize;
+                ensure_remaining(
+                    &mut reader,
+                    self.data.len() as u64,
+                    buffer_size,
+                    "EmfPlusSerializableObject Buffer",
+                )?;
                 let buffer = reader.read_vec(buffer_size)?;
                 ensure_reader_end(
                     &mut reader,
@@ -4756,17 +5029,17 @@ impl EmfPlusRecord {
                     require_count_at_least(value.points.len(), 3, "EmfPlusFillPolygon point")?;
                     write_brush_ref(&mut writer, value.brush)?;
                     writer.write_u32(len_to_u32(value.points.len(), "EMF+ point count")?)?;
-                    write_points(&mut writer, &value.points)?;
+                    write_record_points(&mut writer, &value.points)?;
                 }
                 EmfPlusRecordData::DrawLines(value) => {
                     require_count_at_least(value.points.len(), 2, "EmfPlusDrawLines point")?;
                     writer.write_u32(len_to_u32(value.points.len(), "EMF+ point count")?)?;
-                    write_points(&mut writer, &value.points)?;
+                    write_record_points(&mut writer, &value.points)?;
                 }
                 EmfPlusRecordData::DrawBeziers(value) => {
-                    require_count_at_least(value.points.len(), 4, "EmfPlusDrawBeziers point")?;
+                    validate_draw_beziers_point_count(value.points.len())?;
                     writer.write_u32(len_to_u32(value.points.len(), "EMF+ point count")?)?;
-                    write_points(&mut writer, &value.points)?;
+                    write_record_points(&mut writer, &value.points)?;
                 }
                 EmfPlusRecordData::FillEllipse(value) => {
                     write_brush_ref(&mut writer, value.brush)?;
@@ -4795,13 +5068,13 @@ impl EmfPlusRecord {
                     write_brush_ref(&mut writer, value.brush)?;
                     writer.write_f32(value.tension)?;
                     writer.write_u32(len_to_u32(value.points.len(), "EMF+ point count")?)?;
-                    write_points(&mut writer, &value.points)?;
+                    write_record_points(&mut writer, &value.points)?;
                 }
                 EmfPlusRecordData::DrawClosedCurve(value) => {
                     require_count_at_least(value.points.len(), 3, "EmfPlusDrawClosedCurve point")?;
                     writer.write_f32(value.tension)?;
                     writer.write_u32(len_to_u32(value.points.len(), "EMF+ point count")?)?;
-                    write_points(&mut writer, &value.points)?;
+                    write_record_points(&mut writer, &value.points)?;
                 }
                 EmfPlusRecordData::DrawCurve(value) => {
                     require_count_at_least(value.points.len(), 2, "EmfPlusDrawCurve point")?;
@@ -4809,7 +5082,7 @@ impl EmfPlusRecord {
                     writer.write_u32(value.offset)?;
                     writer.write_u32(value.num_segments)?;
                     writer.write_u32(len_to_u32(value.points.len(), "EMF+ point count")?)?;
-                    write_points(&mut writer, &value.points)?;
+                    write_record_points(&mut writer, &value.points)?;
                 }
                 EmfPlusRecordData::DrawImage(value) => {
                     writer.write_u32(value.image_attributes_id)?;
@@ -4828,7 +5101,7 @@ impl EmfPlusRecord {
                     writer.write_i32(value.src_unit)?;
                     value.src_rect.write_to(&mut writer)?;
                     writer.write_u32(len_to_u32(value.points.len(), "EMF+ point count")?)?;
-                    write_points(&mut writer, &value.points)?;
+                    write_record_points(&mut writer, &value.points)?;
                 }
                 EmfPlusRecordData::DrawString(value) => {
                     write_brush_ref(&mut writer, value.brush)?;
@@ -4957,10 +5230,24 @@ impl EmfPlusRecord {
                 "EMF+ record size is smaller than its header",
             ));
         }
+        if !size.is_multiple_of(4) {
+            return Err(Error::invalid(
+                offset,
+                "EMF+ record size is not 32-bit aligned",
+            ));
+        }
         if data_size > size - header_size {
             return Err(Error::invalid(
                 offset,
                 "EMF+ record data size exceeds record size",
+            ));
+        }
+        if let Some(total_object_size) = total_object_size
+            && total_object_size < data_size
+        {
+            return Err(Error::invalid(
+                offset,
+                "EmfPlusObject TotalObjectSize is smaller than ObjectData",
             ));
         }
         let end = offset
@@ -4974,7 +5261,9 @@ impl EmfPlusRecord {
         }
 
         let data = reader.read_vec(data_size as usize)?;
-        let padding = reader.read_vec(size as usize - header_size as usize - data_size as usize)?;
+        let padding_len = size as usize - header_size as usize - data_size as usize;
+        validate_emf_plus_record_padding_len(padding_len)?;
+        let padding = reader.read_vec(padding_len)?;
 
         Ok(Self {
             record_type,
@@ -4997,6 +5286,15 @@ impl EmfPlusRecord {
                 "EmfPlusObject continued header and TotalObjectSize disagree",
             ));
         }
+        if let Some(total_object_size) = self.total_object_size
+            && (total_object_size as usize) < self.data.len()
+        {
+            return Err(Error::invalid(
+                writer.position().unwrap_or(0),
+                "EmfPlusObject TotalObjectSize is smaller than ObjectData",
+            ));
+        }
+        validate_emf_plus_record_padding_len(self.padding.len())?;
 
         let payload_size = self
             .data
@@ -5019,6 +5317,17 @@ impl EmfPlusRecord {
                 "EMF+ record size exceeds u32::MAX",
             ));
         }
+        if !size.is_multiple_of(4) {
+            return Err(Error::invalid(
+                writer.position()?,
+                "EMF+ record size must be 32-bit aligned",
+            ));
+        }
+        validate_emf_plus_fixed_payload_shape(
+            self.record_kind(),
+            self.data.len(),
+            self.padding.len(),
+        )?;
 
         writer.write_u16(self.record_type)?;
         writer.write_u16(self.flags)?;
@@ -5177,20 +5486,20 @@ impl EmfPlusRecordData<'_> {
             Self::DrawRects(value) => {
                 4 + value.rects.iter().map(EmfPlusRect::sdk_size).sum::<u64>()
             }
-            Self::FillPolygon(value) => 8 + value.points.sdk_size(),
-            Self::DrawLines(value) => 4 + value.points.sdk_size(),
-            Self::DrawBeziers(value) => 4 + value.points.sdk_size(),
+            Self::FillPolygon(value) => record_point_payload_size(8, &value.points),
+            Self::DrawLines(value) => record_point_payload_size(4, &value.points),
+            Self::DrawBeziers(value) => record_point_payload_size(4, &value.points),
             Self::FillEllipse(value) => 4 + value.rect.sdk_size(),
             Self::DrawEllipse(value) => value.rect.sdk_size(),
             Self::FillPie(value) => 12 + value.rect.sdk_size(),
             Self::DrawPie(value) | Self::DrawArc(value) => 8 + value.rect.sdk_size(),
             Self::FillRegion(_) | Self::FillPath(_) => 4,
             Self::DrawPath(_) => 4,
-            Self::FillClosedCurve(value) => 12 + value.points.sdk_size(),
-            Self::DrawClosedCurve(value) => 8 + value.points.sdk_size(),
-            Self::DrawCurve(value) => 16 + value.points.sdk_size(),
+            Self::FillClosedCurve(value) => record_point_payload_size(12, &value.points),
+            Self::DrawClosedCurve(value) => record_point_payload_size(8, &value.points),
+            Self::DrawCurve(value) => record_point_payload_size(16, &value.points),
             Self::DrawImage(value) => 24 + value.dest_rect.sdk_size(),
-            Self::DrawImagePoints(value) => 28 + value.points.sdk_size(),
+            Self::DrawImagePoints(value) => record_point_payload_size(28, &value.points),
             Self::DrawString(value) => {
                 28 + sdk_string_current_size(&value.string) + value.padding.len() as u64
             }
@@ -5392,6 +5701,75 @@ fn ensure_reader_end<R: std::io::Read + std::io::Seek>(
     Ok(())
 }
 
+fn validate_emf_plus_fixed_payload_shape(
+    record_kind: Option<EmfPlusRecordType>,
+    data_len: usize,
+    padding_len: usize,
+) -> Result<()> {
+    let Some(expected_data_len) = emf_plus_fixed_payload_len(record_kind) else {
+        return Ok(());
+    };
+    if data_len != expected_data_len {
+        return Err(Error::invalid(
+            0,
+            "EMF+ fixed-size record DataSize does not match the record type",
+        ));
+    }
+    if padding_len != 0 {
+        return Err(Error::invalid(
+            0,
+            "EMF+ fixed-size record Size does not match the record type",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_emf_plus_record_padding_len(padding_len: usize) -> Result<()> {
+    if padding_len > 3 {
+        return Err(Error::invalid(0, "EMF+ record padding exceeds 3 bytes"));
+    }
+    Ok(())
+}
+
+fn emf_plus_fixed_payload_len(record_kind: Option<EmfPlusRecordType>) -> Option<usize> {
+    match record_kind? {
+        EmfPlusRecordType::Header => Some(16),
+        EmfPlusRecordType::Eof | EmfPlusRecordType::GetDc => Some(0),
+        EmfPlusRecordType::Clear => Some(4),
+        EmfPlusRecordType::FillRegion
+        | EmfPlusRecordType::FillPath
+        | EmfPlusRecordType::DrawPath => Some(4),
+        EmfPlusRecordType::ResetClip
+        | EmfPlusRecordType::SetClipPath
+        | EmfPlusRecordType::SetClipRegion => Some(0),
+        EmfPlusRecordType::OffsetClip => Some(8),
+        EmfPlusRecordType::SetClipRect => Some(16),
+        EmfPlusRecordType::StrokeFillPath => Some(0),
+        EmfPlusRecordType::SetRenderingOrigin => Some(8),
+        EmfPlusRecordType::SetAntiAliasMode
+        | EmfPlusRecordType::SetTextRenderingHint
+        | EmfPlusRecordType::SetTextContrast
+        | EmfPlusRecordType::SetInterpolationMode
+        | EmfPlusRecordType::SetPixelOffsetMode
+        | EmfPlusRecordType::SetCompositingMode
+        | EmfPlusRecordType::SetCompositingQuality => Some(0),
+        EmfPlusRecordType::Save
+        | EmfPlusRecordType::Restore
+        | EmfPlusRecordType::BeginContainerNoParams
+        | EmfPlusRecordType::EndContainer => Some(4),
+        EmfPlusRecordType::BeginContainer => Some(36),
+        EmfPlusRecordType::SetWorldTransform | EmfPlusRecordType::MultiplyWorldTransform => {
+            Some(24)
+        }
+        EmfPlusRecordType::ResetWorldTransform => Some(0),
+        EmfPlusRecordType::TranslateWorldTransform | EmfPlusRecordType::ScaleWorldTransform => {
+            Some(8)
+        }
+        EmfPlusRecordType::RotateWorldTransform | EmfPlusRecordType::SetPageTransform => Some(4),
+        _ => None,
+    }
+}
+
 fn read_emf_plus_brush_object<R: std::io::Read + std::io::Seek>(
     reader: &mut Reader<R>,
     data_len: u64,
@@ -5412,10 +5790,12 @@ fn read_emf_plus_solid_brush_data<R: std::io::Read + std::io::Seek>(
     data_len: u64,
 ) -> Result<EmfPlusSolidBrushData> {
     let solid_color = EmfPlusArgb::read_from(reader)?;
-    Ok(EmfPlusSolidBrushData {
+    let value = EmfPlusSolidBrushData {
         solid_color,
         trailing_data: read_remaining_vec(reader, data_len, "EmfPlusSolidBrushData trailing data")?,
-    })
+    };
+    validate_solid_brush_data(&value)?;
+    Ok(value)
 }
 
 fn read_emf_plus_hatch_brush_data<R: std::io::Read + std::io::Seek>(
@@ -5577,6 +5957,16 @@ fn read_emf_plus_blend_pattern<R: std::io::Read + std::io::Seek>(
     data_len: u64,
     flags: EmfPlusBrushDataFlags,
 ) -> Result<Option<EmfPlusBlendPattern>> {
+    if flags.contains(EmfPlusBrushDataFlags::PRESET_COLORS)
+        && flags.intersects(
+            EmfPlusBrushDataFlags::BLEND_FACTORS_H | EmfPlusBrushDataFlags::BLEND_FACTORS_V,
+        )
+    {
+        return Err(Error::invalid(
+            0,
+            "EMF+ BrushData flags must not request both preset colors and blend factors",
+        ));
+    }
     if flags.contains(EmfPlusBrushDataFlags::PRESET_COLORS) {
         return Ok(Some(EmfPlusBlendPattern::Colors(
             read_emf_plus_blend_colors(reader, data_len)?,
@@ -5590,8 +5980,8 @@ fn read_emf_plus_blend_pattern<R: std::io::Read + std::io::Seek>(
             read_emf_plus_blend_factors(reader, data_len)?,
         ))),
         (true, true) => {
-            let horizontal = read_emf_plus_blend_factors(reader, data_len)?;
             let vertical = read_emf_plus_blend_factors(reader, data_len)?;
+            let horizontal = read_emf_plus_blend_factors(reader, data_len)?;
             Ok(Some(EmfPlusBlendPattern::FactorsHV {
                 horizontal,
                 vertical,
@@ -5606,7 +5996,7 @@ fn read_emf_plus_blend_colors<R: std::io::Read + std::io::Seek>(
 ) -> Result<EmfPlusBlendColors> {
     ensure_remaining(reader, data_len, 4, "EmfPlusBlendColors PositionCount")?;
     let count = reader.read_u32()? as usize;
-    let mut positions = read_f32_array_body(reader, data_len, count, "EmfPlusBlendColors")?;
+    let positions = read_f32_array_body(reader, data_len, count, "EmfPlusBlendColors")?;
     validate_unit_interval_values(&positions, "EmfPlusBlendColors positions")?;
     let color_bytes = count
         .checked_mul(4)
@@ -5617,7 +6007,7 @@ fn read_emf_plus_blend_colors<R: std::io::Read + std::io::Seek>(
         colors.push(EmfPlusArgb::read_from(reader)?);
     }
     Ok(EmfPlusBlendColors {
-        positions: std::mem::take(&mut positions),
+        positions,
         colors,
         trailing_data: Vec::new(),
     })
@@ -5699,6 +6089,7 @@ fn read_emf_plus_palette<R: std::io::Read + std::io::Seek>(
 ) -> Result<EmfPlusPalette> {
     let mut palette = read_emf_plus_palette_prefix(reader, data_len, "EmfPlusPalette")?;
     palette.trailing_data = read_remaining_vec(reader, data_len, "EmfPlusPalette trailing data")?;
+    validate_palette(&palette)?;
     Ok(palette)
 }
 
@@ -5798,6 +6189,14 @@ fn read_emf_plus_custom_line_cap_object<R: std::io::Read + std::io::Seek>(
     };
     validate_custom_line_cap_object(&value)?;
     Ok(value)
+}
+
+fn read_sized_custom_line_cap(data: &[u8], name: &str) -> Result<EmfPlusCustomLineCapObject> {
+    let mut reader = Reader::new(std::io::Cursor::new(data));
+    let cap = read_emf_plus_custom_line_cap_object(&mut reader, data.len() as u64)?;
+    cap.parse_cap_data()
+        .map_err(|err| Error::invalid(0, format!("{name} CustomLineCapData is invalid: {err}")))?;
+    Ok(cap)
 }
 
 fn read_emf_plus_custom_line_cap_arrow_data<R: std::io::Read + std::io::Seek>(
@@ -6467,7 +6866,7 @@ fn read_emf_plus_color_lookup_table_effect<R: std::io::Read + std::io::Seek>(
     reader: &mut Reader<R>,
     data_len: u64,
 ) -> Result<EmfPlusColorLookupTableEffect> {
-    Ok(EmfPlusColorLookupTableEffect {
+    let value = EmfPlusColorLookupTableEffect {
         blue_lookup_table: read_u8_array_256(reader, data_len, "BlueLookupTable")?,
         green_lookup_table: read_u8_array_256(reader, data_len, "GreenLookupTable")?,
         red_lookup_table: read_u8_array_256(reader, data_len, "RedLookupTable")?,
@@ -6477,7 +6876,9 @@ fn read_emf_plus_color_lookup_table_effect<R: std::io::Read + std::io::Seek>(
             data_len,
             "ColorLookupTableEffect trailing data",
         )?,
-    })
+    };
+    validate_color_lookup_table_effect(&value)?;
+    Ok(value)
 }
 
 fn read_emf_plus_color_matrix_effect<R: std::io::Read + std::io::Seek>(
@@ -6545,14 +6946,16 @@ fn read_emf_plus_red_eye_correction_effect<R: std::io::Read + std::io::Seek>(
     for _ in 0..area_count {
         areas.push(RectL::read_from(reader)?);
     }
-    Ok(EmfPlusRedEyeCorrectionEffect {
+    let value = EmfPlusRedEyeCorrectionEffect {
         areas,
         trailing_data: read_remaining_vec(
             reader,
             data_len,
             "RedEyeCorrectionEffect trailing data",
         )?,
-    })
+    };
+    validate_red_eye_correction_effect(&value)?;
+    Ok(value)
 }
 
 fn read_emf_plus_sharpen_effect<R: std::io::Read + std::io::Seek>(
@@ -6587,10 +6990,7 @@ fn read_u8_array_256<R: std::io::Read + std::io::Seek>(
     name: &str,
 ) -> Result<[u8; 256]> {
     ensure_remaining(reader, data_len, 256, name)?;
-    reader
-        .read_vec(256)?
-        .try_into()
-        .map_err(|_| Error::invalid(0, format!("{name} size mismatch")))
+    reader.read_array::<256>()
 }
 
 fn validate_path_object(value: &EmfPlusPathObject) -> Result<()> {
@@ -6607,6 +7007,17 @@ fn validate_path_object(value: &EmfPlusPathObject) -> Result<()> {
             format!(
                 "EmfPlusPath AlignmentPadding has {} bytes; expected at most 3",
                 value.alignment_padding.len()
+            ),
+        ));
+    }
+    let expected_padding = expected_path_alignment_padding(value)?;
+    if value.alignment_padding.len() != expected_padding {
+        return Err(Error::invalid(
+            0,
+            format!(
+                "EmfPlusPath AlignmentPadding has {} bytes; expected {}",
+                value.alignment_padding.len(),
+                expected_padding
             ),
         ));
     }
@@ -6641,6 +7052,17 @@ fn validate_path_object(value: &EmfPlusPathObject) -> Result<()> {
     }
 
     validate_path_point_types(value.points.len(), &value.point_types)
+}
+
+fn expected_path_alignment_padding(value: &EmfPlusPathObject) -> Result<usize> {
+    let points_size = usize::try_from(value.points.sdk_size())
+        .map_err(|_| Error::invalid(0, "EmfPlusPath point data size overflows usize"))?;
+    let point_types_size = value.point_types.sdk_size()?;
+    let unpadded_size = 12usize
+        .checked_add(points_size)
+        .and_then(|size| size.checked_add(point_types_size))
+        .ok_or_else(|| Error::invalid(0, "EmfPlusPath size overflows"))?;
+    Ok((4 - (unpadded_size % 4)) % 4)
 }
 
 fn validate_path_point_types(
@@ -6715,6 +7137,30 @@ fn validate_path_point_type_byte(value: u8) -> Result<()> {
 fn validate_region_object(value: &EmfPlusRegionObject) -> Result<()> {
     validate_graphics_version(&value.version, "EmfPlusRegion")?;
     value.parse_region_nodes().map(|_| ())
+}
+
+fn validate_region_node_data_matches_type(value: &EmfPlusRegionNode) -> Result<()> {
+    match (value.node_type_kind(), &value.data) {
+        (
+            Some(
+                EmfPlusRegionNodeDataType::And
+                | EmfPlusRegionNodeDataType::Or
+                | EmfPlusRegionNodeDataType::Xor
+                | EmfPlusRegionNodeDataType::Exclude
+                | EmfPlusRegionNodeDataType::Complement,
+            ),
+            EmfPlusRegionNodeData::ChildNodes(_),
+        )
+        | (Some(EmfPlusRegionNodeDataType::Rect), EmfPlusRegionNodeData::Rect(_))
+        | (Some(EmfPlusRegionNodeDataType::Path), EmfPlusRegionNodeData::Path(_))
+        | (Some(EmfPlusRegionNodeDataType::Empty), EmfPlusRegionNodeData::Empty)
+        | (Some(EmfPlusRegionNodeDataType::Infinite), EmfPlusRegionNodeData::Infinite)
+        | (None, EmfPlusRegionNodeData::Raw(_)) => Ok(()),
+        _ => Err(Error::invalid(
+            0,
+            "EmfPlusRegionNode Type does not match RegionNodeData",
+        )),
+    }
 }
 
 fn validate_region_node_tree(
@@ -6869,6 +7315,7 @@ fn read_rects<R: std::io::Read + std::io::Seek>(
             EmfPlusRect::Float(RectF::read_from(reader)?)
         });
     }
+    ensure_reader_end(reader, data_len, "EMF+ rectangle payload")?;
     Ok(rects)
 }
 
@@ -6877,8 +7324,28 @@ fn read_single_rect<R: std::io::Read + std::io::Seek>(
     flags: EmfPlusRecordFlags,
     data_len: u64,
 ) -> Result<EmfPlusRect> {
-    let mut rects = read_rects(reader, 1, flags, data_len)?;
-    Ok(rects.remove(0))
+    let offset = reader.position()?;
+    let rect_size = if flags.contains(EmfPlusRecordFlags::COMPRESSED) {
+        8u64
+    } else {
+        16u64
+    };
+    if offset
+        .checked_add(rect_size)
+        .is_none_or(|end| end > data_len)
+    {
+        return Err(Error::invalid(
+            offset,
+            "EMF+ rectangle payload extends past record data",
+        ));
+    }
+    let rect = if flags.contains(EmfPlusRecordFlags::COMPRESSED) {
+        EmfPlusRect::Compressed(EmfPlusRectS::read_from(reader)?)
+    } else {
+        EmfPlusRect::Float(RectF::read_from(reader)?)
+    };
+    ensure_reader_end(reader, data_len, "EMF+ rectangle payload")?;
+    Ok(rect)
 }
 
 fn read_points<R: std::io::Read + std::io::Seek>(
@@ -6888,6 +7355,15 @@ fn read_points<R: std::io::Read + std::io::Seek>(
     data_len: u64,
 ) -> Result<EmfPlusPointData> {
     if flags.contains(EmfPlusRecordFlags::RELATIVE_POSITION) {
+        let minimum_required = count
+            .checked_mul(2)
+            .ok_or_else(|| Error::invalid(0, "EMF+ relative point payload size overflows usize"))?;
+        ensure_remaining(
+            reader,
+            data_len,
+            minimum_required,
+            "EMF+ relative point payload",
+        )?;
         let mut points = Vec::with_capacity(count);
         for _ in 0..count {
             points.push(EmfPlusPointR {
@@ -6934,6 +7410,37 @@ fn read_absolute_points<R: std::io::Read + std::io::Seek>(
     read_points(reader, count, flags, data_len)
 }
 
+fn finish_record_point_array<R: std::io::Read + std::io::Seek>(
+    reader: &mut Reader<R>,
+    data_len: u64,
+    points: &EmfPlusPointData,
+    name: &str,
+) -> Result<()> {
+    if !matches!(points, EmfPlusPointData::Relative(_)) {
+        return ensure_reader_end(reader, data_len, name);
+    }
+
+    let position = reader.position()?;
+    let expected_padding = (4 - (position as usize % 4)) % 4;
+    let remaining = data_len
+        .checked_sub(position)
+        .ok_or_else(|| Error::invalid(position, format!("{name} extends past record data")))?;
+    if remaining as usize != expected_padding {
+        return Err(Error::invalid(
+            position,
+            format!("{name} alignment padding length does not match DataSize"),
+        ));
+    }
+    let padding = reader.read_vec(expected_padding)?;
+    if padding.iter().any(|value| *value != 0) {
+        return Err(Error::invalid(
+            position,
+            format!("{name} alignment padding must be zero"),
+        ));
+    }
+    Ok(())
+}
+
 fn write_points<W: std::io::Write + std::io::Seek>(
     writer: &mut Writer<W>,
     points: &EmfPlusPointData,
@@ -6957,6 +7464,37 @@ fn write_points<W: std::io::Write + std::io::Seek>(
         }
     }
     Ok(())
+}
+
+fn write_record_points<W: std::io::Write + std::io::Seek>(
+    writer: &mut Writer<W>,
+    points: &EmfPlusPointData,
+) -> Result<()> {
+    write_points(writer, points)?;
+    write_record_point_alignment_padding(writer, points)
+}
+
+fn write_record_point_alignment_padding<W: std::io::Write + std::io::Seek>(
+    writer: &mut Writer<W>,
+    points: &EmfPlusPointData,
+) -> Result<()> {
+    if !matches!(points, EmfPlusPointData::Relative(_)) {
+        return Ok(());
+    }
+    let padding_len = (4 - (writer.position()? as usize % 4)) % 4;
+    if padding_len > 0 {
+        writer.write_all(&[0; 3][..padding_len])?;
+    }
+    Ok(())
+}
+
+fn record_point_payload_size(prefix_len: u64, points: &EmfPlusPointData) -> u64 {
+    let unpadded = prefix_len + points.sdk_size();
+    if matches!(points, EmfPlusPointData::Relative(_)) {
+        unpadded + ((4 - (unpadded as usize % 4)) % 4) as u64
+    } else {
+        unpadded
+    }
 }
 
 fn read_emf_plus_integer<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<i16> {
@@ -7179,14 +7717,19 @@ fn validate_flag_bits(value: u32, allowed: u32, name: &str) -> Result<()> {
 }
 
 fn validate_graphics_version(value: &EmfPlusGraphicsVersion, name: &str) -> Result<()> {
-    if value.is_emf_plus_signature() {
-        Ok(())
-    } else {
-        Err(Error::invalid(
+    if !value.is_emf_plus_signature() {
+        return Err(Error::invalid(
             0,
             format!("{name} MetafileSignature must be 0xDBC01"),
-        ))
+        ));
     }
+    if value.graphics_version().is_none() {
+        return Err(Error::invalid(
+            0,
+            format!("{name} GraphicsVersion is invalid"),
+        ));
+    }
+    Ok(())
 }
 
 fn require_count_at_least(count: usize, min: usize, name: &str) -> Result<()> {
@@ -7194,6 +7737,17 @@ fn require_count_at_least(count: usize, min: usize, name: &str) -> Result<()> {
         return Err(Error::invalid(
             0,
             format!("{name} count must be at least {min}"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_draw_beziers_point_count(count: usize) -> Result<()> {
+    require_count_at_least(count, 4, "EmfPlusDrawBeziers point")?;
+    if !(count - 1).is_multiple_of(3) {
+        return Err(Error::invalid(
+            0,
+            "EmfPlusDrawBeziers point count must be 3n + 1",
         ));
     }
     Ok(())
@@ -7229,6 +7783,37 @@ fn validate_draw_curve_data(value: &EmfPlusDrawCurveData) -> Result<()> {
         ));
     }
 
+    Ok(())
+}
+
+fn validate_draw_string_data(value: &EmfPlusDrawStringData) -> Result<()> {
+    let string_bytes = value.string.encoded_bytes()?;
+    if !string_bytes.len().is_multiple_of(2) {
+        return Err(Error::invalid(
+            0,
+            "EmfPlusDrawString UTF-16 byte length is odd",
+        ));
+    }
+    if value.padding.len() > 3 {
+        return Err(Error::invalid(
+            0,
+            "EmfPlusDrawString AlignmentPadding has more than 3 bytes",
+        ));
+    }
+    let unpadded_size = 28usize
+        .checked_add(string_bytes.len())
+        .ok_or_else(|| Error::invalid(0, "EmfPlusDrawString DataSize overflows"))?;
+    let expected_padding = (4 - (unpadded_size % 4)) % 4;
+    if value.padding.len() != expected_padding {
+        return Err(Error::invalid(
+            0,
+            format!(
+                "EmfPlusDrawString AlignmentPadding has {} bytes; expected {}",
+                value.padding.len(),
+                expected_padding
+            ),
+        ));
+    }
     Ok(())
 }
 
@@ -7274,6 +7859,40 @@ fn validate_blend_factors(positions: &[f32], factors: &[f32]) -> Result<()> {
     Ok(())
 }
 
+fn validate_blend_pattern(value: &EmfPlusBlendPattern) -> Result<()> {
+    fn validate_factors_object(factors: &EmfPlusBlendFactors) -> Result<()> {
+        if factors.positions.len() != factors.factors.len() {
+            return Err(Error::invalid(
+                0,
+                "EmfPlusBlendFactors position and factor counts differ",
+            ));
+        }
+        validate_blend_factors(&factors.positions, &factors.factors)?;
+        validate_empty_trailing_data(&factors.trailing_data, "EmfPlusBlendFactors")
+    }
+
+    match value {
+        EmfPlusBlendPattern::Colors(colors) => {
+            if colors.positions.len() != colors.colors.len() {
+                return Err(Error::invalid(
+                    0,
+                    "EmfPlusBlendColors position and color counts differ",
+                ));
+            }
+            validate_unit_interval_values(&colors.positions, "EmfPlusBlendColors positions")?;
+            validate_empty_trailing_data(&colors.trailing_data, "EmfPlusBlendColors")
+        }
+        EmfPlusBlendPattern::Factors(factors) => validate_factors_object(factors),
+        EmfPlusBlendPattern::FactorsHV {
+            horizontal,
+            vertical,
+        } => {
+            validate_factors_object(horizontal)?;
+            validate_factors_object(vertical)
+        }
+    }
+}
+
 fn validate_focus_scale_data(value: &EmfPlusFocusScaleData) -> Result<()> {
     if value.focus_scale_count != 2 {
         return Err(Error::invalid(
@@ -7287,7 +7906,7 @@ fn validate_focus_scale_data(value: &EmfPlusFocusScaleData) -> Result<()> {
             "EmfPlusFocusScaleData values must be in 0..1",
         ));
     }
-    Ok(())
+    validate_empty_trailing_data(&value.trailing_data, "EmfPlusFocusScaleData")
 }
 
 fn validate_emf_plus_bitmap_object(value: &EmfPlusBitmapObject) -> Result<()> {
@@ -7323,6 +7942,14 @@ fn validate_emf_plus_bitmap_object(value: &EmfPlusBitmapObject) -> Result<()> {
                 "EmfPlusBitmap Pixel stride must be a multiple of 4",
             ));
         }
+        if (value.stride.unsigned_abs() as usize)
+            < minimum_emf_plus_bitmap_stride_abs(value.width, pixel_format.bits_per_pixel())?
+        {
+            return Err(Error::invalid(
+                0,
+                "EmfPlusBitmap Pixel stride is too small for Width and PixelFormat",
+            ));
+        }
         let EmfPlusBitmapPayload::Pixel(payload) = read_emf_plus_bitmap_payload(value)? else {
             return Err(Error::invalid(0, "EmfPlusBitmap Pixel data is invalid"));
         };
@@ -7352,6 +7979,17 @@ fn expected_emf_plus_bitmap_pixel_data_len(value: &EmfPlusBitmapObject) -> Resul
         .ok_or_else(|| Error::invalid(0, "EmfPlusBitmap PixelData size overflows"))
 }
 
+fn minimum_emf_plus_bitmap_stride_abs(width: i32, bits_per_pixel: u8) -> Result<usize> {
+    let width =
+        usize::try_from(width).map_err(|_| Error::invalid(0, "EmfPlusBitmap width is invalid"))?;
+    let bits = width
+        .checked_mul(usize::from(bits_per_pixel))
+        .ok_or_else(|| Error::invalid(0, "EmfPlusBitmap scan-line size overflows"))?;
+    bits.checked_add(7)
+        .map(|bits| bits / 8)
+        .ok_or_else(|| Error::invalid(0, "EmfPlusBitmap scan-line size overflows"))
+}
+
 fn validate_emf_plus_image_attributes_object(value: &EmfPlusImageAttributesObject) -> Result<()> {
     validate_graphics_version(&value.version, "EmfPlusImageAttributes")?;
     if value.wrap_mode_kind().is_none() {
@@ -7376,6 +8014,7 @@ fn validate_string_format_object(value: &EmfPlusStringFormatObject) -> Result<()
         EmfPlusStringFormatFlags::all().bits(),
         "EmfPlusStringFormat StringFormatFlags",
     )?;
+    validate_language_identifier(value.language_identifier(), "EmfPlusStringFormat Language")?;
     if value.string_alignment_kind().is_none() {
         return Err(Error::invalid(
             0,
@@ -7394,6 +8033,10 @@ fn validate_string_format_object(value: &EmfPlusStringFormatObject) -> Result<()
             "EmfPlusStringFormat DigitSubstitution is invalid",
         ));
     }
+    validate_language_identifier(
+        value.digit_language_identifier(),
+        "EmfPlusStringFormat DigitLanguage",
+    )?;
     if value.hotkey_prefix_kind().is_none() {
         return Err(Error::invalid(
             0,
@@ -7406,7 +8049,18 @@ fn validate_string_format_object(value: &EmfPlusStringFormatObject) -> Result<()
     for range in &value.char_ranges {
         validate_character_range(range)?;
     }
-    Ok(())
+    validate_empty_trailing_data(&value.trailing_data, "EmfPlusStringFormat")
+}
+
+fn validate_language_identifier(value: EmfPlusLanguageIdentifier, name: &str) -> Result<()> {
+    if value.is_word_sized() {
+        Ok(())
+    } else {
+        Err(Error::invalid(
+            0,
+            format!("{name} high 16 bits must be zero"),
+        ))
+    }
 }
 
 fn validate_character_range(value: &EmfPlusCharacterRange) -> Result<()> {
@@ -7434,7 +8088,7 @@ fn validate_pen_data(value: &EmfPlusPenData) -> Result<()> {
     if value.pen_unit_kind().is_none() {
         return Err(Error::invalid(0, "EmfPlusPenData PenUnit is invalid"));
     }
-    Ok(())
+    validate_empty_trailing_data(&value.trailing_data, "EmfPlusPenData")
 }
 
 fn validate_pen_object(value: &EmfPlusPenObject) -> Result<()> {
@@ -7455,6 +8109,33 @@ fn validate_font_object(value: &EmfPlusFontObject) -> Result<()> {
     if value.size_unit_kind().is_none() {
         return Err(Error::invalid(0, "EmfPlusFont SizeUnit is invalid"));
     }
+    let family_name = value.family_name.encoded_bytes()?;
+    if !family_name.len().is_multiple_of(2) {
+        return Err(Error::invalid(
+            0,
+            "EmfPlusFont FamilyName byte length is odd",
+        ));
+    }
+    if value.padding.len() > 3 {
+        return Err(Error::invalid(
+            0,
+            "EmfPlusFont AlignmentPadding has more than 3 bytes",
+        ));
+    }
+    let unpadded_size = 24usize
+        .checked_add(family_name.len())
+        .ok_or_else(|| Error::invalid(0, "EmfPlusFont DataSize overflows"))?;
+    let expected_padding = (4 - (unpadded_size % 4)) % 4;
+    if value.padding.len() != expected_padding {
+        return Err(Error::invalid(
+            0,
+            format!(
+                "EmfPlusFont AlignmentPadding has {} bytes; expected {}",
+                value.padding.len(),
+                expected_padding
+            ),
+        ));
+    }
     Ok(())
 }
 
@@ -7463,7 +8144,27 @@ fn validate_palette(value: &EmfPlusPalette) -> Result<()> {
         value.palette_style_flags,
         EmfPlusPaletteStyleFlags::all().bits(),
         "EmfPlusPalette PaletteStyleFlags",
-    )
+    )?;
+    if value.flags().contains(EmfPlusPaletteStyleFlags::GRAYSCALE)
+        && value
+            .entries
+            .iter()
+            .any(|entry| entry.red != entry.green || entry.green != entry.blue)
+    {
+        return Err(Error::invalid(
+            0,
+            "EmfPlusPalette PaletteStyleGrayScale requires grayscale entries",
+        ));
+    }
+    if value.flags().contains(EmfPlusPaletteStyleFlags::HAS_ALPHA)
+        && !value.entries.iter().any(|entry| entry.alpha != 0xFF)
+    {
+        return Err(Error::invalid(
+            0,
+            "EmfPlusPalette PaletteStyleHasAlpha requires alpha transparency entries",
+        ));
+    }
+    validate_empty_trailing_data(&value.trailing_data, "EmfPlusPalette")
 }
 
 fn validate_image_object(value: &EmfPlusImageObject) -> Result<()> {
@@ -7471,14 +8172,14 @@ fn validate_image_object(value: &EmfPlusImageObject) -> Result<()> {
     if value.image_data_type().is_none() {
         return Err(Error::invalid(0, "EmfPlusImage Type is invalid"));
     }
-    Ok(())
+    value.parse_image_data().map(|_| ())
 }
 
 fn validate_metafile_object(value: &EmfPlusMetafileObject) -> Result<()> {
     if value.metafile_data_type_kind().is_none() {
         return Err(Error::invalid(0, "EmfPlusMetafile MetafileType is invalid"));
     }
-    Ok(())
+    validate_empty_trailing_data(&value.trailing_data, "EmfPlusMetafile")
 }
 
 fn validate_brush_object(value: &EmfPlusBrushObject) -> Result<()> {
@@ -7486,7 +8187,7 @@ fn validate_brush_object(value: &EmfPlusBrushObject) -> Result<()> {
     if value.brush_kind().is_none() {
         return Err(Error::invalid(0, "EmfPlusBrush Type is invalid"));
     }
-    Ok(())
+    value.parse_brush_data().map(|_| ())
 }
 
 fn validate_hatch_brush_data(value: &EmfPlusHatchBrushData) -> Result<()> {
@@ -7496,7 +8197,11 @@ fn validate_hatch_brush_data(value: &EmfPlusHatchBrushData) -> Result<()> {
             "EmfPlusHatchBrushData HatchStyle is invalid",
         ));
     }
-    Ok(())
+    validate_empty_trailing_data(&value.trailing_data, "EmfPlusHatchBrushData")
+}
+
+fn validate_solid_brush_data(value: &EmfPlusSolidBrushData) -> Result<()> {
+    validate_empty_trailing_data(&value.trailing_data, "EmfPlusSolidBrushData")
 }
 
 fn validate_texture_brush_data(value: &EmfPlusTextureBrushData) -> Result<()> {
@@ -7514,8 +8219,19 @@ fn validate_texture_brush_data(value: &EmfPlusTextureBrushData) -> Result<()> {
             "EmfPlusTextureBrushData WrapMode is invalid",
         ));
     }
-    value.parse_optional_data()?;
+    let optional_data = value.parse_optional_data()?;
+    ensure_no_unparsed_optional_data(
+        &optional_data.trailing_data,
+        "EmfPlusTextureBrushData OptionalData",
+    )?;
     Ok(())
+}
+
+fn validate_texture_brush_optional_data(value: &EmfPlusTextureBrushOptionalData) -> Result<()> {
+    if let Some(image_object) = &value.image_object {
+        validate_image_object(image_object)?;
+    }
+    ensure_no_unparsed_optional_data(&value.trailing_data, "EmfPlusTextureBrushOptionalData")
 }
 
 fn validate_linear_gradient_brush_data(value: &EmfPlusLinearGradientBrushData) -> Result<()> {
@@ -7535,8 +8251,24 @@ fn validate_linear_gradient_brush_data(value: &EmfPlusLinearGradientBrushData) -
             "EmfPlusLinearGradientBrushData WrapMode is invalid",
         ));
     }
-    value.parse_optional_data()?;
+    let optional_data = value.parse_optional_data()?;
+    ensure_no_unparsed_optional_data(
+        &optional_data.trailing_data,
+        "EmfPlusLinearGradientBrushData OptionalData",
+    )?;
     Ok(())
+}
+
+fn validate_linear_gradient_brush_optional_data(
+    value: &EmfPlusLinearGradientBrushOptionalData,
+) -> Result<()> {
+    if let Some(blend_pattern) = &value.blend_pattern {
+        validate_blend_pattern(blend_pattern)?;
+    }
+    ensure_no_unparsed_optional_data(
+        &value.trailing_data,
+        "EmfPlusLinearGradientBrushOptionalData",
+    )
 }
 
 fn validate_path_gradient_brush_data(value: &EmfPlusPathGradientBrushData) -> Result<()> {
@@ -7557,8 +8289,47 @@ fn validate_path_gradient_brush_data(value: &EmfPlusPathGradientBrushData) -> Re
             "EmfPlusPathGradientBrushData WrapMode is invalid",
         ));
     }
-    value.parse_tail_data()?;
+    let tail_data = value.parse_tail_data()?;
+    ensure_no_unparsed_optional_data(
+        &tail_data.trailing_data,
+        "EmfPlusPathGradientBrushData OptionalData",
+    )?;
     Ok(())
+}
+
+fn validate_path_gradient_brush_tail_data(value: &EmfPlusPathGradientBrushTailData) -> Result<()> {
+    match &value.boundary_data {
+        Some(EmfPlusBoundaryData::Path(path)) => {
+            validate_empty_trailing_data(&path.trailing_data, "EmfPlusBoundaryPathData")?;
+        }
+        Some(EmfPlusBoundaryData::Points(points)) => {
+            validate_empty_trailing_data(&points.trailing_data, "EmfPlusBoundaryPointData")?;
+        }
+        None => {
+            return Err(Error::invalid(
+                0,
+                "EmfPlusPathGradientBrushTailData BoundaryData is missing",
+            ));
+        }
+    }
+    if let Some(blend_pattern) = &value.optional_data.blend_pattern {
+        validate_blend_pattern(blend_pattern)?;
+    }
+    if let Some(focus_scale_data) = &value.optional_data.focus_scale_data {
+        validate_focus_scale_data(focus_scale_data)?;
+    }
+    ensure_no_unparsed_optional_data(&value.trailing_data, "EmfPlusPathGradientBrushTailData")
+}
+
+fn ensure_no_unparsed_optional_data(trailing_data: &[u8], name: &str) -> Result<()> {
+    if trailing_data.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::invalid(
+            0,
+            format!("{name} has {} unparsed bytes", trailing_data.len()),
+        ))
+    }
 }
 
 fn validate_emf_plus_record_data(
@@ -7566,9 +8337,15 @@ fn validate_emf_plus_record_data(
     flags: EmfPlusRecordFlags,
 ) -> Result<()> {
     match value {
-        EmfPlusRecordData::Header(value) => validate_header_data(value)?,
+        EmfPlusRecordData::Header(value) => validate_header_data(value, flags)?,
         EmfPlusRecordData::Object(value) => {
             validate_object_id_u8(value.object_id, "EmfPlusObject ObjectID")?;
+            if value.continues != value.total_object_size.is_some() {
+                return Err(Error::invalid(
+                    0,
+                    "EmfPlusObject continued flag requires TotalObjectSize",
+                ));
+            }
             if let Some(total_object_size) = value.total_object_size
                 && u64::from(total_object_size) < value.object_data.len() as u64
             {
@@ -7582,6 +8359,9 @@ fn validate_emf_plus_record_data(
                     return Err(Error::invalid(0, "EmfPlusObject ObjectType is invalid"));
                 }
                 Some(_) => {}
+            }
+            if !value.continues {
+                value.parse_object_data()?;
             }
         }
         EmfPlusRecordData::MultiFormatStart(_)
@@ -7642,6 +8422,7 @@ fn validate_emf_plus_record_data(
         }
         EmfPlusRecordData::DrawBeziers(value) => {
             validate_object_id_u8(value.pen_id, "EmfPlusDrawBeziers ObjectID")?;
+            validate_draw_beziers_point_count(value.points.len())?;
         }
         EmfPlusRecordData::DrawImage(value) => {
             validate_object_id_u8(value.image_id, "EmfPlusDrawImage ObjectID")?;
@@ -7663,16 +8444,9 @@ fn validate_emf_plus_record_data(
             validate_object_id_u8(value.font_id, "EmfPlusDrawString ObjectID")?;
             validate_brush_ref(value.brush, "EmfPlusDrawString BrushId")?;
             validate_object_id_u32(value.format_id, "EmfPlusDrawString FormatID")?;
+            validate_draw_string_data(value)?;
         }
         EmfPlusRecordData::DrawDriverString(value) => {
-            let allowed_flags =
-                EmfPlusRecordFlags::OBJECT_ID_MASK.bits() | EmfPlusRecordFlags::SOLID_COLOR.bits();
-            if flags.bits() & !allowed_flags != 0 {
-                return Err(Error::invalid(
-                    0,
-                    "EmfPlusDrawDriverString Flags contains reserved bits",
-                ));
-            }
             validate_object_id_u8(value.font_id, "EmfPlusDrawDriverString ObjectID")?;
             validate_brush_ref(value.brush, "EmfPlusDrawDriverString BrushId")?;
             validate_flag_bits(
@@ -7764,12 +8538,13 @@ fn validate_emf_plus_record_data(
                 ));
             }
         }
-        EmfPlusRecordData::SetPageTransform(_) if flags.page_unit().is_none() => {
-            return Err(Error::invalid(
-                0,
-                "EmfPlusSetPageTransform PageUnit is invalid",
-            ));
+        EmfPlusRecordData::BeginContainer(_) => {
+            validate_page_unit_flags(flags, "EmfPlusBeginContainer")?;
         }
+        EmfPlusRecordData::SetPageTransform(_) => {
+            validate_page_unit_flags(flags, "EmfPlusSetPageTransform")?;
+        }
+        EmfPlusRecordData::SerializableObject(value) => value.validate_known_effect_buffer()?,
         EmfPlusRecordData::SetTsGraphics(value) => validate_set_ts_graphics(value, flags)?,
         EmfPlusRecordData::SetTsClip(value) => validate_set_ts_clip(value)?,
         _ => {}
@@ -7777,8 +8552,22 @@ fn validate_emf_plus_record_data(
     Ok(())
 }
 
-fn validate_header_data(value: &EmfPlusHeaderData) -> Result<()> {
-    validate_graphics_version(&value.graphics_version, "EmfPlusHeader")
+fn validate_page_unit_flags(flags: EmfPlusRecordFlags, name: &str) -> Result<()> {
+    if flags.bits() & !0x00FF != 0 {
+        return Err(Error::invalid(
+            0,
+            format!("{name} Flags contains nonzero reserved bits"),
+        ));
+    }
+    if flags.page_unit().is_none() {
+        return Err(Error::invalid(0, format!("{name} PageUnit is invalid")));
+    }
+    Ok(())
+}
+
+fn validate_header_data(value: &EmfPlusHeaderData, _flags: EmfPlusRecordFlags) -> Result<()> {
+    validate_graphics_version(&value.graphics_version, "EmfPlusHeader")?;
+    Ok(())
 }
 
 fn validate_draw_image_src_unit(value: i32, name: &str) -> Result<()> {
@@ -7852,6 +8641,24 @@ fn validate_set_ts_graphics(
             "EmfPlusSetTSGraphics Palette presence disagrees with flags",
         ));
     }
+    if flags.ts_graphics_basic_vga() {
+        let Some(palette) = &value.palette else {
+            return Err(Error::invalid(
+                0,
+                "EmfPlusSetTSGraphics BasicVGA flag requires Palette data",
+            ));
+        };
+        if palette
+            .entries
+            .iter()
+            .any(|entry| !is_basic_vga_argb(entry))
+        {
+            return Err(Error::invalid(
+                0,
+                "EmfPlusSetTSGraphics BasicVGA palette contains non-VGA colors",
+            ));
+        }
+    }
     if let Some(palette) = &value.palette
         && !palette.trailing_data.is_empty()
     {
@@ -7864,6 +8671,12 @@ fn validate_set_ts_graphics(
 }
 
 fn validate_set_ts_clip(value: &EmfPlusSetTsClipData) -> Result<()> {
+    if value.rect_count > EMFPLUS_TS_CLIP_MAX_RECTS {
+        return Err(Error::invalid(
+            0,
+            "EmfPlusSetTSClip NumRects exceeds 15-bit field",
+        ));
+    }
     match &value.rects {
         EmfPlusSetTsClipRects::Rects(rects) => {
             if value.compressed {
@@ -7909,9 +8722,32 @@ fn validate_set_ts_clip(value: &EmfPlusSetTsClipData) -> Result<()> {
     Ok(())
 }
 
+fn is_basic_vga_argb(entry: &EmfPlusArgb) -> bool {
+    matches!(
+        (entry.red, entry.green, entry.blue),
+        (0x00, 0x00, 0x00)
+            | (0x00, 0x00, 0x80)
+            | (0x00, 0x80, 0x00)
+            | (0x00, 0x80, 0x80)
+            | (0x80, 0x00, 0x00)
+            | (0x80, 0x00, 0x80)
+            | (0x80, 0x80, 0x00)
+            | (0xC0, 0xC0, 0xC0)
+            | (0x80, 0x80, 0x80)
+            | (0x00, 0x00, 0xFF)
+            | (0x00, 0xFF, 0x00)
+            | (0x00, 0xFF, 0xFF)
+            | (0xFF, 0x00, 0x00)
+            | (0xFF, 0x00, 0xFF)
+            | (0xFF, 0xFF, 0x00)
+            | (0xFF, 0xFF, 0xFF)
+    )
+}
+
 fn validate_blur_effect(value: &EmfPlusBlurEffect) -> Result<()> {
     validate_f32_range(value.blur_radius, 0.0..=255.0, "BlurEffect BlurRadius")?;
-    validate_bool_u32(value.expand_edge, "BlurEffect ExpandEdge")
+    validate_bool_u32(value.expand_edge, "BlurEffect ExpandEdge")?;
+    validate_empty_trailing_data(&value.trailing_data, "BlurEffect")
 }
 
 fn validate_brightness_contrast_effect(value: &EmfPlusBrightnessContrastEffect) -> Result<()> {
@@ -7924,7 +8760,8 @@ fn validate_brightness_contrast_effect(value: &EmfPlusBrightnessContrastEffect) 
         value.contrast_level,
         -100..=100,
         "BrightnessContrastEffect ContrastLevel",
-    )
+    )?;
+    validate_empty_trailing_data(&value.trailing_data, "BrightnessContrastEffect")
 }
 
 fn validate_color_balance_effect(value: &EmfPlusColorBalanceEffect) -> Result<()> {
@@ -7938,7 +8775,8 @@ fn validate_color_balance_effect(value: &EmfPlusColorBalanceEffect) -> Result<()
         value.yellow_blue,
         -100..=100,
         "ColorBalanceEffect YellowBlue",
-    )
+    )?;
+    validate_empty_trailing_data(&value.trailing_data, "ColorBalanceEffect")
 }
 
 fn validate_color_curve_effect(value: &EmfPlusColorCurveEffect) -> Result<()> {
@@ -7967,7 +8805,11 @@ fn validate_color_curve_effect(value: &EmfPlusColorCurveEffect) -> Result<()> {
             "ColorCurveEffect AdjustmentIntensity is outside the valid range",
         ));
     }
-    Ok(())
+    validate_empty_trailing_data(&value.trailing_data, "ColorCurveEffect")
+}
+
+fn validate_color_lookup_table_effect(value: &EmfPlusColorLookupTableEffect) -> Result<()> {
+    validate_empty_trailing_data(&value.trailing_data, "ColorLookupTableEffect")
 }
 
 fn validate_color_matrix_effect(value: &EmfPlusColorMatrixEffect) -> Result<()> {
@@ -7979,7 +8821,7 @@ fn validate_color_matrix_effect(value: &EmfPlusColorMatrixEffect) -> Result<()> 
             ));
         }
     }
-    Ok(())
+    validate_empty_trailing_data(&value.trailing_data, "ColorMatrixEffect")
 }
 
 fn validate_hue_saturation_lightness_effect(
@@ -7999,22 +8841,41 @@ fn validate_hue_saturation_lightness_effect(
         value.lightness_level,
         -100..=100,
         "HueSaturationLightnessEffect LightnessLevel",
-    )
+    )?;
+    validate_empty_trailing_data(&value.trailing_data, "HueSaturationLightnessEffect")
 }
 
 fn validate_levels_effect(value: &EmfPlusLevelsEffect) -> Result<()> {
     validate_i32_range(value.highlight, 0..=100, "LevelsEffect Highlight")?;
     validate_i32_range(value.mid_tone, -100..=100, "LevelsEffect MidTone")?;
-    validate_i32_range(value.shadow, 0..=100, "LevelsEffect Shadow")
+    validate_i32_range(value.shadow, 0..=100, "LevelsEffect Shadow")?;
+    validate_empty_trailing_data(&value.trailing_data, "LevelsEffect")
+}
+
+fn validate_red_eye_correction_effect(value: &EmfPlusRedEyeCorrectionEffect) -> Result<()> {
+    validate_empty_trailing_data(&value.trailing_data, "RedEyeCorrectionEffect")
 }
 
 fn validate_sharpen_effect(value: &EmfPlusSharpenEffect) -> Result<()> {
-    validate_f32_range(value.amount, 0.0..=100.0, "SharpenEffect Amount")
+    validate_f32_range(value.amount, 0.0..=100.0, "SharpenEffect Amount")?;
+    validate_empty_trailing_data(&value.trailing_data, "SharpenEffect")
 }
 
 fn validate_tint_effect(value: &EmfPlusTintEffect) -> Result<()> {
     validate_i32_range(value.hue, -180..=180, "TintEffect Hue")?;
-    validate_i32_range(value.amount, -100..=100, "TintEffect Amount")
+    validate_i32_range(value.amount, -100..=100, "TintEffect Amount")?;
+    validate_empty_trailing_data(&value.trailing_data, "TintEffect")
+}
+
+fn validate_empty_trailing_data(data: &[u8], name: &str) -> Result<()> {
+    if data.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::invalid(
+            0,
+            format!("{name} must not contain trailing data"),
+        ))
+    }
 }
 
 fn validate_custom_line_cap_object(value: &EmfPlusCustomLineCapObject) -> Result<()> {
@@ -8022,7 +8883,7 @@ fn validate_custom_line_cap_object(value: &EmfPlusCustomLineCapObject) -> Result
     if value.cap_data_type().is_none() {
         return Err(Error::invalid(0, "EmfPlusCustomLineCap Type is invalid"));
     }
-    Ok(())
+    value.parse_cap_data().map(|_| ())
 }
 
 fn validate_custom_line_cap_arrow_data(value: &EmfPlusCustomLineCapArrowData) -> Result<()> {
@@ -8052,7 +8913,8 @@ fn validate_custom_line_cap_arrow_data(value: &EmfPlusCustomLineCapArrowData) ->
     validate_zero_point_f(
         value.line_hot_spot,
         "EmfPlusCustomLineCapArrowData LineHotSpot",
-    )
+    )?;
+    validate_empty_trailing_data(&value.trailing_data, "EmfPlusCustomLineCapArrowData")
 }
 
 fn validate_custom_line_cap_default_data(value: &EmfPlusCustomLineCapDefaultData) -> Result<()> {
@@ -8089,7 +8951,28 @@ fn validate_custom_line_cap_default_data(value: &EmfPlusCustomLineCapDefaultData
     validate_zero_point_f(
         value.stroke_hot_spot,
         "EmfPlusCustomLineCapData StrokeHotSpot",
-    )
+    )?;
+    let optional_data = value.parse_optional_data()?;
+    validate_custom_line_cap_optional_data(&optional_data)?;
+    Ok(())
+}
+
+fn validate_custom_line_cap_optional_data(value: &EmfPlusCustomLineCapOptionalData) -> Result<()> {
+    if let Some(fill_path) = &value.fill_path {
+        validate_fill_path_object(fill_path)?;
+    }
+    if let Some(line_path) = &value.line_path {
+        validate_line_path_object(line_path)?;
+    }
+    validate_empty_trailing_data(&value.trailing_data, "EmfPlusCustomLineCapOptionalData")
+}
+
+fn validate_fill_path_object(value: &EmfPlusFillPathObject) -> Result<()> {
+    validate_empty_trailing_data(&value.trailing_data, "EmfPlusFillPath")
+}
+
+fn validate_line_path_object(value: &EmfPlusLinePathObject) -> Result<()> {
+    validate_empty_trailing_data(&value.trailing_data, "EmfPlusLinePath")
 }
 
 fn validate_zero_point_f(value: PointF, name: &str) -> Result<()> {
@@ -8174,7 +9057,7 @@ mod tests {
     #[test]
     fn emf_plus_record_roundtrip_preserves_padding() {
         let bytes = [
-            0x01, 0x40, // Type
+            0x03, 0x40, // Type: Comment
             0x00, 0x00, // Flags
             0x10, 0x00, 0x00, 0x00, // Size
             0x02, 0x00, 0x00, 0x00, // DataSize
@@ -8188,15 +9071,37 @@ mod tests {
         let mut writer = Writer::new(std::io::Cursor::new(Vec::new()));
         records[0].write_to(&mut writer).unwrap();
         assert_eq!(writer.into_inner().into_inner(), bytes);
-        assert_eq!(records[0].record_kind(), Some(EmfPlusRecordType::Header));
+        assert_eq!(records[0].record_kind(), Some(EmfPlusRecordType::Comment));
+
+        let excessive_padding = [
+            0x03, 0x40, // Type: Comment
+            0x00, 0x00, // Flags
+            0x10, 0x00, 0x00, 0x00, // Size
+            0x00, 0x00, 0x00, 0x00, // DataSize
+            0x00, 0x00, 0x00, 0x00, // Padding
+        ];
+        assert!(read_records(&excessive_padding).is_err());
+
+        let excessive_padding_record = EmfPlusRecord {
+            record_type: EmfPlusRecordType::Comment.raw(),
+            flags: 0,
+            total_object_size: None,
+            data: Vec::new(),
+            padding: vec![0; 4],
+        };
+        assert!(
+            excessive_padding_record
+                .write_to(&mut Writer::new(std::io::Cursor::new(Vec::new())))
+                .is_err()
+        );
     }
 
     #[test]
     fn derived_emf_plus_header_data_roundtrips() {
         let header = EmfPlusHeaderData {
-            graphics_version: EmfPlusGraphicsVersion {
-                value: (EMFPLUS_METAFILE_SIGNATURE << 12) | 0x0002,
-            },
+            graphics_version: EmfPlusGraphicsVersion::from_graphics_version(
+                EmfPlusGraphicsVersionValue::Version1_1,
+            ),
             emf_plus_flags: 1,
             logical_dpi_x: 96,
             logical_dpi_y: 96,
@@ -8211,6 +9116,17 @@ mod tests {
             header.graphics_version.graphics_version(),
             Some(EmfPlusGraphicsVersionValue::Version1_1)
         );
+        assert_eq!(header.graphics_version.graphics_version_raw(), 0x0002);
+        assert_eq!(
+            EmfPlusGraphicsVersion::from_parts(EMFPLUS_METAFILE_SIGNATURE, 0x0002).unwrap(),
+            header.graphics_version
+        );
+        assert!(EmfPlusGraphicsVersion::from_parts(0x0010_0000, 0x0002).is_err());
+        assert!(EmfPlusGraphicsVersion::from_parts(EMFPLUS_METAFILE_SIGNATURE, 0x1000).is_err());
+        let vendor_graphics_version =
+            EmfPlusGraphicsVersion::from_parts(EMFPLUS_METAFILE_SIGNATURE, 0x0FFF).unwrap();
+        assert_eq!(vendor_graphics_version.graphics_version_raw(), 0x0FFF);
+        assert_eq!(vendor_graphics_version.graphics_version(), None);
         assert!(header.video_display());
         assert_eq!(header.emf_plus_reserved_flags(), 0);
         assert_eq!(header.sdk_size(), 16);
@@ -8234,11 +9150,11 @@ mod tests {
         );
         let dual_record = EmfPlusRecord::from_data(
             &EmfPlusRecordData::Header(header.clone()),
-            EmfPlusRecordFlags::from_bits_retain(0x8001),
+            EmfPlusRecordFlags::from_bits_retain(0x0001),
         )
         .unwrap();
         assert!(dual_record.flags().header_dual());
-        assert_eq!(dual_record.flags().header_reserved_bits(), 0x8000);
+        assert_eq!(dual_record.flags().header_reserved_bits(), 0);
 
         let mut invalid_header = header.clone();
         invalid_header.graphics_version.value = 0x0000_0002;
@@ -8263,6 +9179,78 @@ mod tests {
             }
             .parse_data()
             .is_err()
+        );
+        let mut invalid_graphics_version = header.clone();
+        invalid_graphics_version.graphics_version.value = (EMFPLUS_METAFILE_SIGNATURE << 12) | 3;
+        assert!(
+            EmfPlusRecord::from_data(
+                &EmfPlusRecordData::Header(invalid_graphics_version.clone()),
+                EmfPlusRecordFlags::empty(),
+            )
+            .is_err()
+        );
+        let mut invalid_graphics_version_bytes = Vec::new();
+        invalid_graphics_version
+            .write_to(&mut Writer::new(std::io::Cursor::new(
+                &mut invalid_graphics_version_bytes,
+            )))
+            .unwrap();
+        assert!(
+            EmfPlusRecord {
+                record_type: EmfPlusRecordType::Header.raw(),
+                flags: 0,
+                total_object_size: None,
+                data: invalid_graphics_version_bytes,
+                padding: Vec::new(),
+            }
+            .parse_data()
+            .is_err()
+        );
+        let reserved_flags_record = EmfPlusRecord::from_data(
+            &EmfPlusRecordData::Header(header.clone()),
+            EmfPlusRecordFlags::from_bits_retain(0x8001),
+        )
+        .unwrap();
+        assert!(reserved_flags_record.flags().header_dual());
+        assert_eq!(reserved_flags_record.flags().header_reserved_bits(), 0x8000);
+        assert_eq!(
+            reserved_flags_record.parse_data().unwrap(),
+            EmfPlusRecordData::Header(header.clone())
+        );
+        let mut parsed_reserved_flags_record = record.clone();
+        parsed_reserved_flags_record.flags = 0x8001;
+        assert_eq!(
+            parsed_reserved_flags_record.parse_data().unwrap(),
+            EmfPlusRecordData::Header(header.clone())
+        );
+        let mut reserved_emf_plus_flags = header.clone();
+        reserved_emf_plus_flags.emf_plus_flags = 0x8000_0001;
+        let reserved_emf_plus_flags_record = EmfPlusRecord::from_data(
+            &EmfPlusRecordData::Header(reserved_emf_plus_flags.clone()),
+            EmfPlusRecordFlags::empty(),
+        )
+        .unwrap();
+        assert_eq!(
+            reserved_emf_plus_flags_record.parse_data().unwrap(),
+            EmfPlusRecordData::Header(reserved_emf_plus_flags.clone())
+        );
+        let mut reserved_emf_plus_flags_bytes = Vec::new();
+        reserved_emf_plus_flags
+            .write_to(&mut Writer::new(std::io::Cursor::new(
+                &mut reserved_emf_plus_flags_bytes,
+            )))
+            .unwrap();
+        assert_eq!(
+            EmfPlusRecord {
+                record_type: EmfPlusRecordType::Header.raw(),
+                flags: 0,
+                total_object_size: None,
+                data: reserved_emf_plus_flags_bytes,
+                padding: Vec::new(),
+            }
+            .parse_data()
+            .unwrap(),
+            EmfPlusRecordData::Header(reserved_emf_plus_flags)
         );
         let mut invalid_record = record.clone();
         invalid_record.data.extend_from_slice(&[0, 0, 0, 0]);
@@ -8347,6 +9335,62 @@ mod tests {
         assert_eq!(written.record_type, record.record_type);
         assert_eq!(written.flags, record.flags);
         assert_eq!(written.data, record.data);
+
+        assert!(
+            EmfPlusRecord {
+                record_type: EmfPlusRecordType::FillRects.raw(),
+                flags: EmfPlusRecordFlags::SOLID_COLOR.bits(),
+                total_object_size: None,
+                data: vec![
+                    0x33, 0x22, 0x11, 0xFF, // ARGB
+                    0x00, 0x00, 0x00, 0x00, // Count
+                ],
+                padding: Vec::new(),
+            }
+            .parse_data()
+            .is_err()
+        );
+        assert!(
+            EmfPlusRecord {
+                record_type: EmfPlusRecordType::FillRects.raw(),
+                flags: EmfPlusRecordFlags::COMPRESSED.bits(),
+                total_object_size: None,
+                data: vec![
+                    0x40, 0x00, 0x00, 0x00, // BrushId outside object table
+                    0x01, 0x00, 0x00, 0x00, // Count
+                    0x01, 0x00, // x
+                    0x02, 0x00, // y
+                    0x03, 0x00, // width
+                    0x04, 0x00, // height
+                ],
+                padding: Vec::new(),
+            }
+            .parse_data()
+            .is_err()
+        );
+        assert!(
+            EmfPlusRecord::from_data(
+                &EmfPlusRecordData::FillRects(EmfPlusFillRectsData {
+                    brush: EmfPlusBrushRef::ObjectId(2),
+                    rects: vec![
+                        EmfPlusRect::Compressed(EmfPlusRectS {
+                            x: 1,
+                            y: 2,
+                            width: 3,
+                            height: 4,
+                        }),
+                        EmfPlusRect::Float(RectF {
+                            x: 1.0,
+                            y: 2.0,
+                            width: 3.0,
+                            height: 4.0,
+                        }),
+                    ],
+                }),
+                EmfPlusRecordFlags::empty(),
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -8366,6 +9410,58 @@ mod tests {
         assert_eq!(record.flags().object_id(), 7);
         assert!(!record.flags().contains(EmfPlusRecordFlags::COMPRESSED));
         assert_eq!(record.parse_data().unwrap(), data);
+
+        assert!(
+            EmfPlusRecord {
+                record_type: EmfPlusRecordType::DrawRects.raw(),
+                flags: 7,
+                total_object_size: None,
+                data: vec![0x00, 0x00, 0x00, 0x00],
+                padding: Vec::new(),
+            }
+            .parse_data()
+            .is_err()
+        );
+        assert!(
+            EmfPlusRecord {
+                record_type: EmfPlusRecordType::DrawRects.raw(),
+                flags: EmfPlusRecordFlags::COMPRESSED.bits() | 64,
+                total_object_size: None,
+                data: vec![
+                    0x01, 0x00, 0x00, 0x00, // Count
+                    0x01, 0x00, // x
+                    0x02, 0x00, // y
+                    0x03, 0x00, // width
+                    0x04, 0x00, // height
+                ],
+                padding: Vec::new(),
+            }
+            .parse_data()
+            .is_err()
+        );
+        assert!(
+            EmfPlusRecord::from_data(
+                &EmfPlusRecordData::DrawRects(EmfPlusDrawRectsData {
+                    pen_id: 7,
+                    rects: vec![
+                        EmfPlusRect::Compressed(EmfPlusRectS {
+                            x: 1,
+                            y: 2,
+                            width: 3,
+                            height: 4,
+                        }),
+                        EmfPlusRect::Float(RectF {
+                            x: 1.0,
+                            y: 2.0,
+                            width: 3.0,
+                            height: 4.0,
+                        }),
+                    ],
+                }),
+                EmfPlusRecordFlags::empty(),
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -8440,6 +9536,37 @@ mod tests {
     fn emf_plus_control_comment_and_clear_records_roundtrip() {
         assert_emf_plus_data_roundtrip(EmfPlusRecordData::Eof, EmfPlusRecordFlags::empty());
         assert_emf_plus_data_roundtrip(EmfPlusRecordData::GetDc, EmfPlusRecordFlags::empty());
+        for record_type in [EmfPlusRecordType::Eof, EmfPlusRecordType::GetDc] {
+            let ignored_flags = EmfPlusRecord {
+                record_type: record_type.raw(),
+                flags: 0xFFFF,
+                total_object_size: None,
+                data: Vec::new(),
+                padding: Vec::new(),
+            };
+            assert!(matches!(
+                ignored_flags.parse_data().unwrap(),
+                EmfPlusRecordData::Eof | EmfPlusRecordData::GetDc
+            ));
+
+            let unexpected_payload = EmfPlusRecord {
+                data: vec![0, 0, 0, 0],
+                ..ignored_flags
+            };
+            assert!(unexpected_payload.parse_data().is_err());
+        }
+
+        let comment_record = EmfPlusRecord::from_data(
+            &EmfPlusRecordData::Comment(vec![1, 2, 3, 4]),
+            EmfPlusRecordFlags::from_bits_retain(0xFFFF),
+        )
+        .unwrap();
+        assert_eq!(comment_record.record_type, EmfPlusRecordType::Comment.raw());
+        assert_eq!(comment_record.flags, 0xFFFF);
+        assert_eq!(
+            comment_record.parse_data().unwrap(),
+            EmfPlusRecordData::Comment(vec![1, 2, 3, 4])
+        );
         assert_emf_plus_data_roundtrip(
             EmfPlusRecordData::Comment(vec![1, 2, 3, 4]),
             EmfPlusRecordFlags::empty(),
@@ -8455,11 +9582,53 @@ mod tests {
             }),
             EmfPlusRecordFlags::empty(),
         );
+        let clear_with_ignored_flags = EmfPlusRecord {
+            record_type: EmfPlusRecordType::Clear.raw(),
+            flags: 0xFFFF,
+            total_object_size: None,
+            data: vec![1, 2, 3, 4],
+            padding: Vec::new(),
+        };
+        assert_eq!(
+            clear_with_ignored_flags.parse_data().unwrap(),
+            EmfPlusRecordData::Clear(EmfPlusClearData {
+                color: EmfPlusArgb {
+                    blue: 1,
+                    green: 2,
+                    red: 3,
+                    alpha: 4,
+                },
+            })
+        );
+        assert!(
+            EmfPlusRecord {
+                data: vec![1, 2, 3, 4, 5, 6, 7, 8],
+                ..clear_with_ignored_flags
+            }
+            .parse_data()
+            .is_err()
+        );
     }
 
     #[test]
     fn emf_plus_clip_and_property_records_roundtrip() {
         assert_emf_plus_data_roundtrip(EmfPlusRecordData::ResetClip, EmfPlusRecordFlags::empty());
+        let reset_clip_with_reserved_flags = EmfPlusRecord {
+            record_type: EmfPlusRecordType::ResetClip.raw(),
+            flags: 0xFFFF,
+            total_object_size: None,
+            data: Vec::new(),
+            padding: Vec::new(),
+        };
+        assert_eq!(
+            reset_clip_with_reserved_flags.parse_data().unwrap(),
+            EmfPlusRecordData::ResetClip
+        );
+        let reset_clip_with_payload = EmfPlusRecord {
+            data: vec![0, 0, 0, 0],
+            ..reset_clip_with_reserved_flags
+        };
+        assert!(reset_clip_with_payload.parse_data().is_err());
         assert_emf_plus_data_roundtrip(
             EmfPlusRecordData::SetClipRect(EmfPlusSetClipRectData {
                 combine_mode: EmfPlusCombineMode::Union.raw() as u8,
@@ -8487,6 +9656,21 @@ mod tests {
         assert_eq!(
             clip_rect.combine_mode_kind(),
             Some(EmfPlusCombineMode::Union)
+        );
+        let mut clip_rect_bytes = Vec::new();
+        clip_rect
+            .write_to(&mut Writer::new(std::io::Cursor::new(&mut clip_rect_bytes)))
+            .unwrap();
+        assert!(
+            EmfPlusRecord {
+                record_type: EmfPlusRecordType::SetClipRect.raw(),
+                flags: 0x0F00,
+                total_object_size: None,
+                data: clip_rect_bytes,
+                padding: Vec::new(),
+            }
+            .parse_data()
+            .is_err()
         );
         assert_emf_plus_data_roundtrip(
             EmfPlusRecordData::SetClipPath(EmfPlusClipObjectData {
@@ -8546,6 +9730,17 @@ mod tests {
             .is_err()
         );
         assert!(
+            EmfPlusRecord {
+                record_type: EmfPlusRecordType::SetClipPath.raw(),
+                flags: 0x0040,
+                total_object_size: None,
+                data: Vec::new(),
+                padding: Vec::new(),
+            }
+            .parse_data()
+            .is_err()
+        );
+        assert!(
             EmfPlusRecord::from_data(
                 &EmfPlusRecordData::SetClipRegion(EmfPlusClipObjectData {
                     combine_mode: EmfPlusCombineMode::Intersect.raw() as u8,
@@ -8574,9 +9769,30 @@ mod tests {
         )
         .unwrap();
         assert_eq!(clip_region_record.record_type, 0x4034);
+        let mut clip_region_with_payload = clip_region_record.clone();
+        clip_region_with_payload
+            .data
+            .extend_from_slice(&[0, 0, 0, 0]);
+        assert!(clip_region_with_payload.parse_data().is_err());
         assert_emf_plus_data_roundtrip(
             EmfPlusRecordData::OffsetClip(EmfPlusTranslateWorldTransformData { dx: 5.0, dy: 6.0 }),
             EmfPlusRecordFlags::empty(),
+        );
+        assert_eq!(
+            EmfPlusRecord {
+                record_type: EmfPlusRecordType::OffsetClip.raw(),
+                flags: 0xFFFF,
+                total_object_size: None,
+                data: 5.0f32
+                    .to_le_bytes()
+                    .into_iter()
+                    .chain(6.0f32.to_le_bytes())
+                    .collect(),
+                padding: Vec::new(),
+            }
+            .parse_data()
+            .unwrap(),
+            EmfPlusRecordData::OffsetClip(EmfPlusTranslateWorldTransformData { dx: 5.0, dy: 6.0 })
         );
         assert_emf_plus_data_roundtrip(
             EmfPlusRecordData::SetAntiAliasMode(EmfPlusSetAntiAliasModeData {
@@ -8714,6 +9930,47 @@ mod tests {
                 stack_index: 11,
             }),
             EmfPlusRecordFlags::from_bits_retain(0x0002),
+        );
+        let begin_container = EmfPlusRecordData::BeginContainer(EmfPlusBeginContainerData {
+            dest_rect: RectF {
+                x: 0.0,
+                y: 1.0,
+                width: 2.0,
+                height: 3.0,
+            },
+            src_rect: RectF {
+                x: 4.0,
+                y: 5.0,
+                width: 6.0,
+                height: 7.0,
+            },
+            stack_index: 11,
+        });
+        assert!(
+            EmfPlusRecord::from_data(
+                &begin_container,
+                EmfPlusRecordFlags::from_bits_retain(0x0102),
+            )
+            .is_err()
+        );
+        assert!(
+            EmfPlusRecord {
+                record_type: EmfPlusRecordType::BeginContainer.raw(),
+                flags: 0x0102,
+                total_object_size: None,
+                data: {
+                    let mut bytes = Vec::new();
+                    if let EmfPlusRecordData::BeginContainer(value) = begin_container {
+                        value
+                            .write_to(&mut Writer::new(std::io::Cursor::new(&mut bytes)))
+                            .unwrap();
+                    }
+                    bytes
+                },
+                padding: Vec::new(),
+            }
+            .parse_data()
+            .is_err()
         );
         assert_emf_plus_data_roundtrip(
             EmfPlusRecordData::EndContainer(EmfPlusStackIndexData { stack_index: 11 }),
@@ -8857,6 +10114,26 @@ mod tests {
             .parse_data()
             .is_err()
         );
+        assert!(
+            EmfPlusRecord::from_data(
+                &EmfPlusRecordData::SetPageTransform(EmfPlusSetPageTransformData {
+                    page_scale: 1.0
+                }),
+                EmfPlusRecordFlags::from_bits_retain(0x0102),
+            )
+            .is_err()
+        );
+        assert!(
+            EmfPlusRecord {
+                record_type: EmfPlusRecordType::SetPageTransform.raw(),
+                flags: 0x0102,
+                total_object_size: None,
+                data: 1.0f32.to_le_bytes().to_vec(),
+                padding: Vec::new(),
+            }
+            .parse_data()
+            .is_err()
+        );
     }
 
     #[test]
@@ -8894,12 +10171,26 @@ mod tests {
             EmfPlusRecordData::FillPie(EmfPlusFillPieData {
                 brush: EmfPlusBrushRef::ObjectId(3),
                 start_angle: 45.0,
-                sweep_angle: 90.0,
+                sweep_angle: 720.0,
                 rect: EmfPlusRect::Compressed(EmfPlusRectS {
                     x: 5,
                     y: 6,
                     width: 7,
                     height: 8,
+                }),
+            }),
+            EmfPlusRecordFlags::empty(),
+        );
+        assert_emf_plus_data_roundtrip(
+            EmfPlusRecordData::DrawPie(EmfPlusDrawArcData {
+                pen_id: 4,
+                start_angle: 10.0,
+                sweep_angle: -720.0,
+                rect: EmfPlusRect::Float(RectF {
+                    x: 9.0,
+                    y: 10.0,
+                    width: 11.0,
+                    height: 12.0,
                 }),
             }),
             EmfPlusRecordFlags::empty(),
@@ -8935,6 +10226,28 @@ mod tests {
             )
             .is_err()
         );
+        assert!(
+            EmfPlusRecord::from_data(
+                &EmfPlusRecordData::FillPie(EmfPlusFillPieData {
+                    brush: EmfPlusBrushRef::Color(EmfPlusArgb {
+                        blue: 1,
+                        green: 2,
+                        red: 3,
+                        alpha: 4,
+                    }),
+                    start_angle: -1.0,
+                    sweep_angle: 90.0,
+                    rect: EmfPlusRect::Compressed(EmfPlusRectS {
+                        x: 5,
+                        y: 6,
+                        width: 7,
+                        height: 8,
+                    }),
+                }),
+                EmfPlusRecordFlags::empty(),
+            )
+            .is_err()
+        );
         let mut invalid_arc_record = EmfPlusRecord::from_data(
             &EmfPlusRecordData::DrawArc(EmfPlusDrawArcData {
                 pen_id: 4,
@@ -8952,6 +10265,72 @@ mod tests {
         .unwrap();
         invalid_arc_record.data[0..4].copy_from_slice(&(-1.0f32).to_le_bytes());
         assert!(invalid_arc_record.parse_data().is_err());
+        let mut invalid_fill_pie_record = EmfPlusRecord::from_data(
+            &EmfPlusRecordData::FillPie(EmfPlusFillPieData {
+                brush: EmfPlusBrushRef::ObjectId(3),
+                start_angle: 10.0,
+                sweep_angle: 90.0,
+                rect: EmfPlusRect::Compressed(EmfPlusRectS {
+                    x: 5,
+                    y: 6,
+                    width: 7,
+                    height: 8,
+                }),
+            }),
+            EmfPlusRecordFlags::empty(),
+        )
+        .unwrap();
+        invalid_fill_pie_record.data[4..8].copy_from_slice(&(-1.0f32).to_le_bytes());
+        assert!(invalid_fill_pie_record.parse_data().is_err());
+        assert!(
+            EmfPlusRecord {
+                record_type: EmfPlusRecordType::DrawEllipse.raw(),
+                flags: 4,
+                total_object_size: None,
+                data: vec![0; 8],
+                padding: Vec::new(),
+            }
+            .parse_data()
+            .is_err()
+        );
+        let mut draw_ellipse_with_trailing_data = EmfPlusRecord::from_data(
+            &EmfPlusRecordData::DrawEllipse(EmfPlusDrawRectShapeData {
+                pen_id: 4,
+                rect: EmfPlusRect::Compressed(EmfPlusRectS {
+                    x: 1,
+                    y: 2,
+                    width: 3,
+                    height: 4,
+                }),
+            }),
+            EmfPlusRecordFlags::empty(),
+        )
+        .unwrap();
+        draw_ellipse_with_trailing_data
+            .data
+            .extend_from_slice(&[0, 0, 0, 0]);
+        assert!(draw_ellipse_with_trailing_data.parse_data().is_err());
+        let mut truncated_draw_image = Vec::new();
+        truncated_draw_image.extend_from_slice(&0u32.to_le_bytes());
+        truncated_draw_image
+            .extend_from_slice(&(EmfPlusUnitType::Pixel.raw() as i32).to_le_bytes());
+        for value in [1.0f32, 2.0, 3.0, 4.0] {
+            truncated_draw_image.extend_from_slice(&value.to_le_bytes());
+        }
+        truncated_draw_image.extend_from_slice(&1i16.to_le_bytes());
+        truncated_draw_image.extend_from_slice(&2i16.to_le_bytes());
+        assert_eq!(truncated_draw_image.len(), 28);
+        assert!(
+            EmfPlusRecord {
+                record_type: EmfPlusRecordType::DrawImage.raw(),
+                flags: EmfPlusRecordFlags::COMPRESSED.bits() | 4,
+                total_object_size: None,
+                data: truncated_draw_image,
+                padding: Vec::new(),
+            }
+            .parse_data()
+            .is_err()
+        );
         assert_emf_plus_data_roundtrip(
             EmfPlusRecordData::FillPath(EmfPlusBrushObjectData {
                 object_id: 3,
@@ -9005,6 +10384,48 @@ mod tests {
         );
         assert!(
             EmfPlusRecord::from_data(
+                &EmfPlusRecordData::FillRegion(EmfPlusBrushObjectData {
+                    object_id: 64,
+                    brush: EmfPlusBrushRef::ObjectId(2),
+                }),
+                EmfPlusRecordFlags::empty(),
+            )
+            .is_err()
+        );
+        assert!(
+            EmfPlusRecord::from_data(
+                &EmfPlusRecordData::DrawPath(EmfPlusDrawObjectData {
+                    object_id: 3,
+                    pen_id: 64,
+                }),
+                EmfPlusRecordFlags::empty(),
+            )
+            .is_err()
+        );
+        assert!(
+            EmfPlusRecord {
+                record_type: EmfPlusRecordType::FillRegion.raw(),
+                flags: 0x0040,
+                total_object_size: None,
+                data: 2_u32.to_le_bytes().to_vec(),
+                padding: Vec::new(),
+            }
+            .parse_data()
+            .is_err()
+        );
+        assert!(
+            EmfPlusRecord {
+                record_type: EmfPlusRecordType::DrawPath.raw(),
+                flags: 0x0003,
+                total_object_size: None,
+                data: 64_u32.to_le_bytes().to_vec(),
+                padding: Vec::new(),
+            }
+            .parse_data()
+            .is_err()
+        );
+        assert!(
+            EmfPlusRecord::from_data(
                 &EmfPlusRecordData::FillPolygon(EmfPlusFillPolygonData {
                     brush: EmfPlusBrushRef::ObjectId(64),
                     points: EmfPlusPointData::Compressed(vec![
@@ -9023,6 +10444,32 @@ mod tests {
                 flags: 0x0040,
                 total_object_size: None,
                 data: 2_u32.to_le_bytes().to_vec(),
+                padding: Vec::new(),
+            }
+            .parse_data()
+            .is_err()
+        );
+        let stroke_fill = EmfPlusRecordData::StrokeFillPath;
+        let record = EmfPlusRecord::from_data(&stroke_fill, EmfPlusRecordFlags::empty()).unwrap();
+        assert_eq!(record.record_type, EmfPlusRecordType::StrokeFillPath.raw());
+        assert_eq!(record.parse_data().unwrap(), stroke_fill);
+        assert!(
+            EmfPlusRecord {
+                record_type: EmfPlusRecordType::StrokeFillPath.raw(),
+                flags: 0xFFFF,
+                total_object_size: None,
+                data: Vec::new(),
+                padding: vec![0, 0, 0, 0],
+            }
+            .parse_data()
+            .is_err()
+        );
+        assert!(
+            EmfPlusRecord {
+                record_type: EmfPlusRecordType::StrokeFillPath.raw(),
+                flags: 0xFFFF,
+                total_object_size: None,
+                data: vec![0, 0, 0, 0],
                 padding: Vec::new(),
             }
             .parse_data()
@@ -9141,11 +10588,102 @@ mod tests {
         assert!(record.flags().contains(EmfPlusRecordFlags::WINDING_FILL));
         assert_eq!(record.parse_data().unwrap(), fill_closed_curve);
 
+        let relative_draw_lines = EmfPlusRecordData::DrawLines(EmfPlusDrawLinesData {
+            pen_id: 8,
+            close_shape: false,
+            points: EmfPlusPointData::Relative(vec![
+                EmfPlusPointR { x: 1, y: 2 },
+                EmfPlusPointR { x: 3, y: 4 },
+                EmfPlusPointR { x: 5, y: 6 },
+            ]),
+        });
+        let record =
+            EmfPlusRecord::from_data(&relative_draw_lines, EmfPlusRecordFlags::empty()).unwrap();
+        assert_eq!(record.data.len(), 12);
+        assert_eq!(&record.data[10..12], &[0, 0]);
+        record
+            .write_to(&mut Writer::new(std::io::Cursor::new(Vec::new())))
+            .unwrap();
+        assert_eq!(record.parse_data().unwrap(), relative_draw_lines);
+        let mut nonzero_relative_padding = record.clone();
+        nonzero_relative_padding.data[11] = 0xAA;
+        assert!(nonzero_relative_padding.parse_data().is_err());
+
+        assert!(
+            EmfPlusRecord {
+                record_type: EmfPlusRecordType::FillPolygon.raw(),
+                flags: EmfPlusRecordFlags::SOLID_COLOR.bits(),
+                total_object_size: None,
+                data: vec![
+                    0x04, 0x03, 0x02, 0x01, // ARGB
+                    0x02, 0x00, 0x00, 0x00, // Count
+                ],
+                padding: Vec::new(),
+            }
+            .parse_data()
+            .is_err()
+        );
+        assert!(
+            EmfPlusRecord {
+                record_type: EmfPlusRecordType::DrawLines.raw(),
+                flags: EmfPlusRecordFlags::COMPRESSED.bits() | 3,
+                total_object_size: None,
+                data: vec![0x01, 0x00, 0x00, 0x00],
+                padding: Vec::new(),
+            }
+            .parse_data()
+            .is_err()
+        );
+        assert!(
+            EmfPlusRecord {
+                record_type: EmfPlusRecordType::FillClosedCurve.raw(),
+                flags: 0,
+                total_object_size: None,
+                data: [
+                    2_u32.to_le_bytes().as_slice(),   // BrushId
+                    0.5_f32.to_le_bytes().as_slice(), // Tension
+                    2_u32.to_le_bytes().as_slice(),   // Count
+                ]
+                .concat(),
+                padding: Vec::new(),
+            }
+            .parse_data()
+            .is_err()
+        );
+        assert!(
+            EmfPlusRecord {
+                record_type: EmfPlusRecordType::DrawClosedCurve.raw(),
+                flags: 5,
+                total_object_size: None,
+                data: [
+                    0.5_f32.to_le_bytes().as_slice(), // Tension
+                    2_u32.to_le_bytes().as_slice(),   // Count
+                ]
+                .concat(),
+                padding: Vec::new(),
+            }
+            .parse_data()
+            .is_err()
+        );
         assert!(
             EmfPlusRecord::from_data(
                 &EmfPlusRecordData::DrawRects(EmfPlusDrawRectsData {
                     pen_id: 1,
                     rects: Vec::new(),
+                }),
+                EmfPlusRecordFlags::empty(),
+            )
+            .is_err()
+        );
+        assert!(
+            EmfPlusRecord::from_data(
+                &EmfPlusRecordData::DrawLines(EmfPlusDrawLinesData {
+                    pen_id: 64,
+                    close_shape: false,
+                    points: EmfPlusPointData::Compressed(vec![
+                        PointS { x: 1, y: 2 },
+                        PointS { x: 3, y: 4 },
+                    ]),
                 }),
                 EmfPlusRecordFlags::empty(),
             )
@@ -9189,6 +10727,127 @@ mod tests {
             )
             .is_err()
         );
+        let invalid_draw_beziers_count = EmfPlusRecordData::DrawBeziers(EmfPlusDrawPointsData {
+            pen_id: 4,
+            points: EmfPlusPointData::Compressed(vec![
+                PointS { x: 1, y: 2 },
+                PointS { x: 3, y: 4 },
+                PointS { x: 5, y: 6 },
+                PointS { x: 7, y: 8 },
+                PointS { x: 9, y: 10 },
+            ]),
+        });
+        assert!(
+            EmfPlusRecord::from_data(&invalid_draw_beziers_count, EmfPlusRecordFlags::empty())
+                .is_err()
+        );
+
+        let mut invalid_draw_beziers_data = Vec::new();
+        invalid_draw_beziers_data.extend_from_slice(&5_u32.to_le_bytes());
+        for point in [
+            PointS { x: 1, y: 2 },
+            PointS { x: 3, y: 4 },
+            PointS { x: 5, y: 6 },
+            PointS { x: 7, y: 8 },
+            PointS { x: 9, y: 10 },
+        ] {
+            invalid_draw_beziers_data.extend_from_slice(&point.x.to_le_bytes());
+            invalid_draw_beziers_data.extend_from_slice(&point.y.to_le_bytes());
+        }
+        assert!(
+            EmfPlusRecord {
+                record_type: EmfPlusRecordType::DrawBeziers.raw(),
+                flags: EmfPlusRecordFlags::COMPRESSED.bits() | 4,
+                total_object_size: None,
+                data: invalid_draw_beziers_data,
+                padding: Vec::new(),
+            }
+            .parse_data()
+            .is_err()
+        );
+        assert!(
+            EmfPlusRecord {
+                record_type: EmfPlusRecordType::DrawBeziers.raw(),
+                flags: EmfPlusRecordFlags::COMPRESSED.bits() | 64,
+                total_object_size: None,
+                data: {
+                    let mut data = Vec::new();
+                    data.extend_from_slice(&4_u32.to_le_bytes());
+                    for point in [
+                        PointS { x: 1, y: 2 },
+                        PointS { x: 3, y: 4 },
+                        PointS { x: 5, y: 6 },
+                        PointS { x: 7, y: 8 },
+                    ] {
+                        data.extend_from_slice(&point.x.to_le_bytes());
+                        data.extend_from_slice(&point.y.to_le_bytes());
+                    }
+                    data
+                },
+                padding: Vec::new(),
+            }
+            .parse_data()
+            .is_err()
+        );
+        assert!(
+            EmfPlusRecord {
+                record_type: EmfPlusRecordType::DrawClosedCurve.raw(),
+                flags: EmfPlusRecordFlags::COMPRESSED.bits() | 64,
+                total_object_size: None,
+                data: {
+                    let mut data = Vec::new();
+                    data.extend_from_slice(&0.5_f32.to_le_bytes());
+                    data.extend_from_slice(&3_u32.to_le_bytes());
+                    for point in [
+                        PointS { x: 1, y: 2 },
+                        PointS { x: 3, y: 4 },
+                        PointS { x: 5, y: 6 },
+                    ] {
+                        data.extend_from_slice(&point.x.to_le_bytes());
+                        data.extend_from_slice(&point.y.to_le_bytes());
+                    }
+                    data
+                },
+                padding: Vec::new(),
+            }
+            .parse_data()
+            .is_err()
+        );
+        assert!(
+            EmfPlusRecord {
+                record_type: EmfPlusRecordType::DrawCurve.raw(),
+                flags: EmfPlusRecordFlags::COMPRESSED.bits() | 64,
+                total_object_size: None,
+                data: {
+                    let mut data = Vec::new();
+                    data.extend_from_slice(&0.5_f32.to_le_bytes());
+                    data.extend_from_slice(&0_u32.to_le_bytes());
+                    data.extend_from_slice(&1_u32.to_le_bytes());
+                    data.extend_from_slice(&2_u32.to_le_bytes());
+                    for point in [PointS { x: 1, y: 2 }, PointS { x: 3, y: 4 }] {
+                        data.extend_from_slice(&point.x.to_le_bytes());
+                        data.extend_from_slice(&point.y.to_le_bytes());
+                    }
+                    data
+                },
+                padding: Vec::new(),
+            }
+            .parse_data()
+            .is_err()
+        );
+        let mut oversized_relative_points_data = Vec::new();
+        oversized_relative_points_data.extend_from_slice(&1_000_000_u32.to_le_bytes());
+        assert!(
+            EmfPlusRecord {
+                record_type: EmfPlusRecordType::DrawLines.raw(),
+                flags: EmfPlusRecordFlags::RELATIVE_POSITION.bits() | 4,
+                total_object_size: None,
+                data: oversized_relative_points_data,
+                padding: Vec::new(),
+            }
+            .parse_data()
+            .is_err()
+        );
         assert!(
             EmfPlusRecord::from_data(
                 &EmfPlusRecordData::DrawCurve(EmfPlusDrawCurveData {
@@ -9203,6 +10862,28 @@ mod tests {
                 }),
                 EmfPlusRecordFlags::empty(),
             )
+            .is_err()
+        );
+        assert!(
+            EmfPlusRecord {
+                record_type: EmfPlusRecordType::DrawCurve.raw(),
+                flags: EmfPlusRecordFlags::COMPRESSED.bits() | 5,
+                total_object_size: None,
+                data: {
+                    let mut data = Vec::new();
+                    data.extend_from_slice(&0.5_f32.to_le_bytes());
+                    data.extend_from_slice(&2_u32.to_le_bytes());
+                    data.extend_from_slice(&0_u32.to_le_bytes());
+                    data.extend_from_slice(&2_u32.to_le_bytes());
+                    for point in [PointS { x: 1, y: 2 }, PointS { x: 3, y: 4 }] {
+                        data.extend_from_slice(&point.x.to_le_bytes());
+                        data.extend_from_slice(&point.y.to_le_bytes());
+                    }
+                    data
+                },
+                padding: Vec::new(),
+            }
+            .parse_data()
             .is_err()
         );
         assert!(
@@ -9385,6 +11066,13 @@ mod tests {
         let mut invalid_record = record.clone();
         invalid_record.data[0..4].copy_from_slice(&64_u32.to_le_bytes());
         assert!(invalid_record.parse_data().is_err());
+        let mut invalid_record = record.clone();
+        invalid_record.flags = EmfPlusRecordFlags::RELATIVE_POSITION.bits() | 64;
+        assert!(invalid_record.parse_data().is_err());
+        let mut invalid_count_record = record.clone();
+        invalid_count_record.data[24..28].copy_from_slice(&2_u32.to_le_bytes());
+        invalid_count_record.data.truncate(32);
+        assert!(invalid_count_record.parse_data().is_err());
 
         let invalid_draw_image_points =
             EmfPlusRecordData::DrawImagePoints(EmfPlusDrawImagePointsData {
@@ -9431,6 +11119,42 @@ mod tests {
         assert!(record.flags().contains(EmfPlusRecordFlags::SOLID_COLOR));
         assert_eq!(record.flags().object_id(), 4);
         assert_eq!(record.parse_data().unwrap(), draw_string);
+        let odd_length_draw_string = EmfPlusDrawStringData {
+            font_id: 4,
+            brush: EmfPlusBrushRef::Color(EmfPlusArgb {
+                alpha: 0xFF,
+                red: 10,
+                green: 20,
+                blue: 30,
+            }),
+            format_id: 8,
+            layout_rect: RectF {
+                x: 1.0,
+                y: 2.0,
+                width: 100.0,
+                height: 20.0,
+            },
+            string: SdkString::raw(vec![b'H', 0], SdkEncoding::Utf16Le),
+            padding: vec![0, 0],
+        };
+        let record = EmfPlusRecord::from_data(
+            &EmfPlusRecordData::DrawString(odd_length_draw_string.clone()),
+            EmfPlusRecordFlags::empty(),
+        )
+        .unwrap();
+        assert_eq!(
+            record.parse_data().unwrap(),
+            EmfPlusRecordData::DrawString(odd_length_draw_string.clone())
+        );
+        let mut invalid_draw_string_padding = odd_length_draw_string.clone();
+        invalid_draw_string_padding.padding = vec![0];
+        assert!(
+            EmfPlusRecord::from_data(
+                &EmfPlusRecordData::DrawString(invalid_draw_string_padding),
+                EmfPlusRecordFlags::empty(),
+            )
+            .is_err()
+        );
         assert!(
             EmfPlusRecord::from_data(
                 &EmfPlusRecordData::DrawString(EmfPlusDrawStringData {
@@ -9458,6 +11182,39 @@ mod tests {
         let mut invalid_record = record.clone();
         invalid_record.data[4..8].copy_from_slice(&64_u32.to_le_bytes());
         assert!(invalid_record.parse_data().is_err());
+        let mut invalid_record = record.clone();
+        invalid_record.flags = 64;
+        assert!(invalid_record.parse_data().is_err());
+        assert!(
+            EmfPlusRecord::from_data(
+                &EmfPlusRecordData::DrawString(EmfPlusDrawStringData {
+                    font_id: 4,
+                    brush: EmfPlusBrushRef::Color(EmfPlusArgb {
+                        alpha: 0xFF,
+                        red: 10,
+                        green: 20,
+                        blue: 30,
+                    }),
+                    format_id: 8,
+                    layout_rect: RectF {
+                        x: 1.0,
+                        y: 2.0,
+                        width: 100.0,
+                        height: 20.0,
+                    },
+                    string: SdkString::raw(vec![b'H', 0], SdkEncoding::Utf16Le),
+                    padding: vec![0, 0, 0, 0],
+                }),
+                EmfPlusRecordFlags::empty(),
+            )
+            .is_err()
+        );
+        let mut invalid_record = record.clone();
+        invalid_record.data.extend_from_slice(&[0, 0, 0, 0]);
+        assert!(invalid_record.parse_data().is_err());
+        let mut oversized_draw_string = record.clone();
+        oversized_draw_string.data[8..12].copy_from_slice(&1_000_000_u32.to_le_bytes());
+        assert!(oversized_draw_string.parse_data().is_err());
 
         let driver_string = EmfPlusRecordData::DrawDriverString(EmfPlusDrawDriverStringData {
             font_id: 6,
@@ -9500,9 +11257,20 @@ mod tests {
         let reserved_flags_record =
             EmfPlusRecord::from_data(&driver_string, EmfPlusRecordFlags::POST_MULTIPLY).unwrap();
         assert_eq!(reserved_flags_record.flags, record.flags);
-        let mut invalid_flags_record = record.clone();
-        invalid_flags_record.flags |= 0x2000;
-        assert!(invalid_flags_record.parse_data().is_err());
+        let mut reserved_flags_record = record.clone();
+        reserved_flags_record.flags |= EmfPlusRecordFlags::POST_MULTIPLY.bits();
+        assert_eq!(reserved_flags_record.parse_data().unwrap(), driver_string);
+        assert_emf_plus_data_roundtrip(
+            EmfPlusRecordData::DrawDriverString(EmfPlusDrawDriverStringData {
+                font_id: 6,
+                brush: EmfPlusBrushRef::ObjectId(3),
+                driver_string_options_flags: EmfPlusDriverStringOptionsFlags::CMAP_LOOKUP.bits(),
+                glyphs: vec![65, 66],
+                glyph_positions: vec![PointF { x: 1.0, y: 2.0 }, PointF { x: 3.0, y: 4.0 }],
+                transform_matrix: None,
+            }),
+            EmfPlusRecordFlags::empty(),
+        );
         assert!(
             EmfPlusRecord::from_data(
                 &EmfPlusRecordData::DrawDriverString(EmfPlusDrawDriverStringData {
@@ -9552,6 +11320,30 @@ mod tests {
         let mut invalid_record = record.clone();
         invalid_record.data[8..12].copy_from_slice(&2_u32.to_le_bytes());
         assert!(invalid_record.parse_data().is_err());
+        let mut invalid_record = record.clone();
+        invalid_record.flags = 64;
+        assert!(invalid_record.parse_data().is_err());
+        let mut truncated_matrix_record = record.clone();
+        truncated_matrix_record
+            .data
+            .truncate(truncated_matrix_record.data.len() - 4);
+        assert!(truncated_matrix_record.parse_data().is_err());
+        let mut oversized_driver_string_data = Vec::new();
+        oversized_driver_string_data.extend_from_slice(&3_u32.to_le_bytes());
+        oversized_driver_string_data.extend_from_slice(&0_u32.to_le_bytes());
+        oversized_driver_string_data.extend_from_slice(&0_u32.to_le_bytes());
+        oversized_driver_string_data.extend_from_slice(&1_000_000_u32.to_le_bytes());
+        assert!(
+            EmfPlusRecord {
+                record_type: EmfPlusRecordType::DrawDriverString.raw(),
+                flags: 6,
+                total_object_size: None,
+                data: oversized_driver_string_data,
+                padding: Vec::new(),
+            }
+            .parse_data()
+            .is_err()
+        );
     }
 
     #[test]
@@ -9587,8 +11379,8 @@ mod tests {
             EmfPlusRecordData::Object(EmfPlusObjectRecordData {
                 object_id: 1,
                 object_type_raw: EmfPlusObjectType::Pen.raw() as u8,
-                continues: false,
-                total_object_size: None,
+                continues: true,
+                total_object_size: Some(4),
                 object_data: vec![0xAA, 0xBB, 0xCC, 0xDD],
             }),
             EmfPlusRecordData::SetTsClip(EmfPlusSetTsClipData {
@@ -9657,6 +11449,26 @@ mod tests {
             )
             .is_err()
         );
+        let empty_ts_clip = EmfPlusRecordData::SetTsClip(EmfPlusSetTsClipData {
+            compressed: false,
+            rect_count: 0,
+            rects: EmfPlusSetTsClipRects::Rects(Vec::new()),
+        });
+        let record = EmfPlusRecord::from_data(&empty_ts_clip, EmfPlusRecordFlags::empty()).unwrap();
+        assert_eq!(record.flags, 0);
+        assert!(record.data.is_empty());
+        assert_eq!(record.parse_data().unwrap(), empty_ts_clip);
+        assert!(
+            EmfPlusRecord::from_data(
+                &EmfPlusRecordData::SetTsClip(EmfPlusSetTsClipData {
+                    compressed: false,
+                    rect_count: 0x8000,
+                    rects: EmfPlusSetTsClipRects::Raw(Vec::new()),
+                }),
+                EmfPlusRecordFlags::empty(),
+            )
+            .is_err()
+        );
 
         let continued_object = EmfPlusRecordData::Object(EmfPlusObjectRecordData {
             object_id: 5,
@@ -9696,6 +11508,28 @@ mod tests {
         assert!(
             EmfPlusRecord::from_data(&invalid_object_type, EmfPlusRecordFlags::empty()).is_err()
         );
+        let invalid_known_object_payload = EmfPlusRecordData::Object(EmfPlusObjectRecordData {
+            object_id: 1,
+            object_type_raw: EmfPlusObjectType::Brush.raw() as u8,
+            continues: false,
+            total_object_size: None,
+            object_data: vec![1, 2, 3, 4],
+        });
+        assert!(
+            EmfPlusRecord::from_data(&invalid_known_object_payload, EmfPlusRecordFlags::empty())
+                .is_err()
+        );
+        assert!(
+            EmfPlusRecord {
+                record_type: EmfPlusRecordType::Object.raw(),
+                flags: (EmfPlusObjectType::Brush.raw() << 8) | 1,
+                total_object_size: None,
+                data: vec![1, 2, 3, 4],
+                padding: Vec::new(),
+            }
+            .parse_data()
+            .is_err()
+        );
         let invalid_total_object_size = EmfPlusRecordData::Object(EmfPlusObjectRecordData {
             object_id: 5,
             object_type_raw: EmfPlusObjectType::Path.raw() as u8,
@@ -9710,37 +11544,214 @@ mod tests {
         let mut invalid_total_object_size_record = record.clone();
         invalid_total_object_size_record.total_object_size = Some(3);
         assert!(invalid_total_object_size_record.parse_data().is_err());
+        assert!(
+            invalid_total_object_size_record
+                .write_to(&mut Writer::new(std::io::Cursor::new(Vec::new())))
+                .is_err()
+        );
+        let invalid_total_object_size_bytes = vec![
+            0x08, 0x40, // Type
+            0x05, 0x83, // Flags: C + ObjectTypePath + ObjectID 5
+            0x14, 0x00, 0x00, 0x00, // Size
+            0x03, 0x00, 0x00, 0x00, // TotalObjectSize
+            0x04, 0x00, 0x00, 0x00, // DataSize
+            1, 2, 3, 4, // ObjectData
+        ];
+        assert!(
+            EmfPlusRecord::read_from(
+                &mut Reader::new(std::io::Cursor::new(
+                    invalid_total_object_size_bytes.as_slice()
+                )),
+                invalid_total_object_size_bytes.len() as u64,
+            )
+            .is_err()
+        );
         let mut invalid_object_record = record.clone();
         invalid_object_record.flags = 1;
         invalid_object_record.total_object_size = None;
         assert!(invalid_object_record.parse_data().is_err());
+        let mut continued_without_total_size = record.clone();
+        continued_without_total_size.total_object_size = None;
+        assert!(continued_without_total_size.parse_data().is_err());
+        let mut noncontinued_with_total_size = record.clone();
+        noncontinued_with_total_size.flags = EmfPlusObjectType::Path.raw() << 8 | 5;
+        assert!(noncontinued_with_total_size.parse_data().is_err());
+        assert!(
+            EmfPlusRecord::from_data(
+                &EmfPlusRecordData::Object(EmfPlusObjectRecordData {
+                    object_id: 64,
+                    object_type_raw: EmfPlusObjectType::Path.raw() as u8,
+                    continues: true,
+                    total_object_size: Some(4),
+                    object_data: vec![1, 2, 3, 4],
+                }),
+                EmfPlusRecordFlags::empty(),
+            )
+            .is_err()
+        );
+        assert!(
+            EmfPlusRecord {
+                record_type: EmfPlusRecordType::Object.raw(),
+                flags: 0x8340,
+                total_object_size: Some(4),
+                data: vec![1, 2, 3, 4],
+                padding: Vec::new(),
+            }
+            .parse_data()
+            .is_err()
+        );
+        assert!(
+            EmfPlusRecord::from_data(
+                &EmfPlusRecordData::Object(EmfPlusObjectRecordData {
+                    object_id: 1,
+                    object_type_raw: 10,
+                    continues: true,
+                    total_object_size: Some(4),
+                    object_data: vec![1, 2, 3, 4],
+                }),
+                EmfPlusRecordFlags::empty(),
+            )
+            .is_err()
+        );
+        assert!(
+            EmfPlusRecord {
+                record_type: EmfPlusRecordType::Object.raw(),
+                flags: 0x8A01,
+                total_object_size: Some(4),
+                data: vec![1, 2, 3, 4],
+                padding: Vec::new(),
+            }
+            .parse_data()
+            .is_err()
+        );
 
-        let serializable = EmfPlusRecordData::SerializableObject(EmfPlusSerializableObjectData {
+        let mut unaligned_size = vec![
+            0x03, 0x40, // Type: Comment
+            0x00, 0x00, // Flags
+            0x0D, 0x00, 0x00, 0x00, // Size
+            0x00, 0x00, 0x00, 0x00, // DataSize
+            0x00, // Padding
+        ];
+        assert!(
+            EmfPlusRecord::read_from(
+                &mut Reader::new(std::io::Cursor::new(&mut unaligned_size)),
+                13,
+            )
+            .is_err()
+        );
+
+        let unaligned_write_data = EmfPlusRecord {
+            record_type: EmfPlusRecordType::Comment.raw(),
+            flags: EmfPlusRecordFlags::empty().bits(),
+            total_object_size: None,
+            data: vec![0xAA, 0xBB, 0xCC, 0xDD],
+            padding: vec![0],
+        };
+        assert!(
+            unaligned_write_data
+                .write_to(&mut Writer::new(std::io::Cursor::new(Vec::new())))
+                .is_err()
+        );
+        let fixed_record_with_padding = EmfPlusRecord {
+            record_type: EmfPlusRecordType::SetRenderingOrigin.raw(),
+            flags: EmfPlusRecordFlags::empty().bits(),
+            total_object_size: None,
+            data: vec![0; 8],
+            padding: vec![0; 4],
+        };
+        assert!(fixed_record_with_padding.parse_data().is_err());
+        assert!(
+            fixed_record_with_padding
+                .write_to(&mut Writer::new(std::io::Cursor::new(Vec::new())))
+                .is_err()
+        );
+        let fixed_record_with_short_data = EmfPlusRecord {
+            record_type: EmfPlusRecordType::SetRenderingOrigin.raw(),
+            flags: EmfPlusRecordFlags::empty().bits(),
+            total_object_size: None,
+            data: vec![0; 4],
+            padding: vec![0; 4],
+        };
+        assert!(
+            fixed_record_with_short_data
+                .write_to(&mut Writer::new(std::io::Cursor::new(Vec::new())))
+                .is_err()
+        );
+        let header_record_with_short_data = EmfPlusRecord {
+            record_type: EmfPlusRecordType::Header.raw(),
+            flags: EmfPlusRecordFlags::empty().bits(),
+            total_object_size: None,
+            data: vec![0; 12],
+            padding: Vec::new(),
+        };
+        assert!(header_record_with_short_data.parse_data().is_err());
+        assert!(
+            header_record_with_short_data
+                .write_to(&mut Writer::new(std::io::Cursor::new(Vec::new())))
+                .is_err()
+        );
+        let set_clip_rect_record_with_padding = EmfPlusRecord {
+            record_type: EmfPlusRecordType::SetClipRect.raw(),
+            flags: EmfPlusRecordFlags::empty().bits(),
+            total_object_size: None,
+            data: vec![0; 16],
+            padding: vec![0],
+        };
+        assert!(set_clip_rect_record_with_padding.parse_data().is_err());
+        assert!(
+            set_clip_rect_record_with_padding
+                .write_to(&mut Writer::new(std::io::Cursor::new(Vec::new())))
+                .is_err()
+        );
+
+        let unknown_serializable = EmfPlusSerializableObjectData {
             object_guid: [0x11; 16],
             buffer: vec![1, 2, 3, 4],
-        });
-        let record = EmfPlusRecord::from_data(&serializable, EmfPlusRecordFlags::empty()).unwrap();
-        assert_eq!(
-            record.record_type,
-            EmfPlusRecordType::SerializableObject.raw()
-        );
-        assert_eq!(record.parse_data().unwrap(), serializable);
-        let EmfPlusRecordData::SerializableObject(parsed_serializable) =
-            record.parse_data().unwrap()
-        else {
-            panic!("expected serializable object");
         };
-        assert_eq!(parsed_serializable.effect_kind(), None);
+        assert_eq!(unknown_serializable.effect_kind(), None);
         assert_eq!(
-            parsed_serializable.parse_effect().unwrap(),
+            unknown_serializable.parse_effect().unwrap(),
             EmfPlusImageEffect::Unknown {
                 object_guid: [0x11; 16],
                 buffer: vec![1, 2, 3, 4],
             }
         );
-        let mut invalid_serializable = record.clone();
-        invalid_serializable.data.push(0xEE);
-        assert!(invalid_serializable.parse_data().is_err());
+        let unknown_serializable_record =
+            EmfPlusRecordData::SerializableObject(unknown_serializable.clone());
+        assert!(
+            EmfPlusRecord::from_data(&unknown_serializable_record, EmfPlusRecordFlags::empty())
+                .is_err()
+        );
+        let mut unknown_serializable_record_data = Vec::new();
+        unknown_serializable_record_data.extend_from_slice(&[0x11; 16]);
+        unknown_serializable_record_data.extend_from_slice(&4_u32.to_le_bytes());
+        unknown_serializable_record_data.extend_from_slice(&[1, 2, 3, 4]);
+        assert!(
+            EmfPlusRecord {
+                record_type: EmfPlusRecordType::SerializableObject.raw(),
+                flags: 0,
+                total_object_size: None,
+                data: unknown_serializable_record_data,
+                padding: Vec::new(),
+            }
+            .parse_data()
+            .is_err()
+        );
+        let mut oversized_buffer_record_data = Vec::new();
+        oversized_buffer_record_data.extend_from_slice(&[0x11; 16]);
+        oversized_buffer_record_data.extend_from_slice(&8_u32.to_le_bytes());
+        oversized_buffer_record_data.extend_from_slice(&[1, 2, 3, 4]);
+        assert!(
+            EmfPlusRecord {
+                record_type: EmfPlusRecordType::SerializableObject.raw(),
+                flags: 0,
+                total_object_size: None,
+                data: oversized_buffer_record_data,
+                padding: Vec::new(),
+            }
+            .parse_data()
+            .is_err()
+        );
         assert!(
             EmfPlusSerializableObjectData {
                 object_guid: EmfPlusImageEffectKind::Blur.guid(),
@@ -9749,16 +11760,70 @@ mod tests {
             .parse_effect()
             .is_err()
         );
+        let invalid_known_effect =
+            EmfPlusRecordData::SerializableObject(EmfPlusSerializableObjectData {
+                object_guid: EmfPlusImageEffectKind::Blur.guid(),
+                buffer: vec![1, 2, 3, 4],
+            });
+        assert!(
+            EmfPlusRecord::from_data(&invalid_known_effect, EmfPlusRecordFlags::empty()).is_err()
+        );
+        let mut invalid_known_effect_record_data = Vec::new();
+        invalid_known_effect_record_data.extend_from_slice(&EmfPlusImageEffectKind::Blur.guid());
+        invalid_known_effect_record_data.extend_from_slice(&4_u32.to_le_bytes());
+        invalid_known_effect_record_data.extend_from_slice(&[1, 2, 3, 4]);
+        assert!(
+            EmfPlusRecord {
+                record_type: EmfPlusRecordType::SerializableObject.raw(),
+                flags: 0,
+                total_object_size: None,
+                data: invalid_known_effect_record_data,
+                padding: Vec::new(),
+            }
+            .parse_data()
+            .is_err()
+        );
+        let mut unaligned_buffer_record_data = Vec::new();
+        unaligned_buffer_record_data.extend_from_slice(&[0x11; 16]);
+        unaligned_buffer_record_data.extend_from_slice(&1_u32.to_le_bytes());
+        unaligned_buffer_record_data.push(0xAA);
+        assert!(
+            EmfPlusRecord {
+                record_type: EmfPlusRecordType::SerializableObject.raw(),
+                flags: 0,
+                total_object_size: None,
+                data: unaligned_buffer_record_data,
+                padding: vec![0, 0, 0],
+            }
+            .parse_data()
+            .is_err()
+        );
 
         let blur_effect = EmfPlusImageEffect::Blur(EmfPlusBlurEffect {
             blur_radius: 2.5,
             expand_edge: 1,
-            trailing_data: vec![0xAA],
+            trailing_data: Vec::new(),
         });
         let blur_serializable = EmfPlusSerializableObjectData {
             object_guid: EmfPlusImageEffectKind::Blur.guid(),
             buffer: blur_effect.to_bytes().unwrap(),
         };
+        let serializable = EmfPlusRecordData::SerializableObject(blur_serializable.clone());
+        let record = EmfPlusRecord::from_data(&serializable, EmfPlusRecordFlags::empty()).unwrap();
+        assert_eq!(
+            record.record_type,
+            EmfPlusRecordType::SerializableObject.raw()
+        );
+        assert_eq!(record.parse_data().unwrap(), serializable);
+        let serializable_with_ignored_flags =
+            EmfPlusRecord::from_data(&serializable, EmfPlusRecordFlags::POST_MULTIPLY).unwrap();
+        assert_eq!(
+            serializable_with_ignored_flags.parse_data().unwrap(),
+            serializable
+        );
+        let mut invalid_serializable = record.clone();
+        invalid_serializable.data.push(0xEE);
+        assert!(invalid_serializable.parse_data().is_err());
         assert_eq!(
             blur_serializable.effect_kind(),
             Some(EmfPlusImageEffectKind::Blur)
@@ -9785,6 +11850,27 @@ mod tests {
                     let mut data = Vec::new();
                     data.extend_from_slice(&2.5_f32.to_le_bytes());
                     data.extend_from_slice(&2_u32.to_le_bytes());
+                    data
+                },
+            }
+            .parse_effect()
+            .is_err()
+        );
+        assert!(
+            EmfPlusImageEffect::Blur(EmfPlusBlurEffect {
+                blur_radius: 2.5,
+                expand_edge: 1,
+                trailing_data: vec![0, 0, 0, 0],
+            })
+            .to_bytes()
+            .is_err()
+        );
+        assert!(
+            EmfPlusSerializableObjectData {
+                object_guid: EmfPlusImageEffectKind::Blur.guid(),
+                buffer: {
+                    let mut data = blur_serializable.buffer.clone();
+                    data.extend_from_slice(&[0, 0, 0, 0]);
                     data
                 },
             }
@@ -9986,7 +12072,7 @@ mod tests {
                 right: 3,
                 bottom: 4,
             }],
-            trailing_data: vec![0xCC],
+            trailing_data: Vec::new(),
         });
         let red_eye_serializable = EmfPlusSerializableObjectData {
             object_guid: EmfPlusImageEffectKind::RedEyeCorrection.guid(),
@@ -9998,6 +12084,26 @@ mod tests {
             parsed_red_eye_effect.to_bytes().unwrap(),
             red_eye_serializable.buffer
         );
+        assert!(
+            EmfPlusImageEffect::RedEyeCorrection(EmfPlusRedEyeCorrectionEffect {
+                areas: Vec::new(),
+                trailing_data: vec![0, 0, 0, 0],
+            })
+            .to_bytes()
+            .is_err()
+        );
+        let negative_red_eye_area_count = EmfPlusSerializableObjectData {
+            object_guid: EmfPlusImageEffectKind::RedEyeCorrection.guid(),
+            buffer: (-1_i32).to_le_bytes().to_vec(),
+        };
+        assert!(negative_red_eye_area_count.parse_effect().is_err());
+        let mut truncated_red_eye_area = 1_i32.to_le_bytes().to_vec();
+        truncated_red_eye_area.extend_from_slice(&[0; 15]);
+        let truncated_red_eye_area = EmfPlusSerializableObjectData {
+            object_guid: EmfPlusImageEffectKind::RedEyeCorrection.guid(),
+            buffer: truncated_red_eye_area,
+        };
+        assert!(truncated_red_eye_area.parse_effect().is_err());
 
         let lookup_effect =
             EmfPlusImageEffect::ColorLookupTable(Box::new(EmfPlusColorLookupTableEffect {
@@ -10005,7 +12111,7 @@ mod tests {
                 green_lookup_table: [2; 256],
                 red_lookup_table: [3; 256],
                 alpha_lookup_table: [4; 256],
-                trailing_data: vec![0xDD],
+                trailing_data: Vec::new(),
             }));
         let lookup_serializable = EmfPlusSerializableObjectData {
             object_guid: EmfPlusImageEffectKind::ColorLookupTable.guid(),
@@ -10016,6 +12122,17 @@ mod tests {
         assert_eq!(
             parsed_lookup_effect.to_bytes().unwrap(),
             lookup_serializable.buffer
+        );
+        assert!(
+            EmfPlusImageEffect::ColorLookupTable(Box::new(EmfPlusColorLookupTableEffect {
+                blue_lookup_table: [1; 256],
+                green_lookup_table: [2; 256],
+                red_lookup_table: [3; 256],
+                alpha_lookup_table: [4; 256],
+                trailing_data: vec![0, 0, 0, 0],
+            }))
+            .to_bytes()
+            .is_err()
         );
 
         let sharpen_effect = EmfPlusImageEffect::Sharpen(EmfPlusSharpenEffect {
@@ -10162,8 +12279,70 @@ mod tests {
             .is_err()
         );
 
+        let mut invalid_ts_graphics = ts_graphics_data.clone();
+        invalid_ts_graphics.text_render_hint = 0xFF;
+        assert!(
+            EmfPlusRecord::from_data(
+                &EmfPlusRecordData::SetTsGraphics(invalid_ts_graphics),
+                EmfPlusRecordFlags::empty(),
+            )
+            .is_err()
+        );
+
+        let mut invalid_ts_graphics = ts_graphics_data.clone();
+        invalid_ts_graphics.compositing_mode = 0xFF;
+        assert!(
+            EmfPlusRecord::from_data(
+                &EmfPlusRecordData::SetTsGraphics(invalid_ts_graphics),
+                EmfPlusRecordFlags::empty(),
+            )
+            .is_err()
+        );
+
+        let mut invalid_ts_graphics = ts_graphics_data.clone();
+        invalid_ts_graphics.compositing_quality = 0xFF;
+        assert!(
+            EmfPlusRecord::from_data(
+                &EmfPlusRecordData::SetTsGraphics(invalid_ts_graphics),
+                EmfPlusRecordFlags::empty(),
+            )
+            .is_err()
+        );
+
+        let mut invalid_ts_graphics = ts_graphics_data.clone();
+        invalid_ts_graphics.filter_type = 0xFF;
+        assert!(
+            EmfPlusRecord::from_data(
+                &EmfPlusRecordData::SetTsGraphics(invalid_ts_graphics),
+                EmfPlusRecordFlags::empty(),
+            )
+            .is_err()
+        );
+
+        let mut invalid_ts_graphics = ts_graphics_data.clone();
+        invalid_ts_graphics.pixel_offset = 0xFF;
+        assert!(
+            EmfPlusRecord::from_data(
+                &EmfPlusRecordData::SetTsGraphics(invalid_ts_graphics),
+                EmfPlusRecordFlags::empty(),
+            )
+            .is_err()
+        );
+
         let mut invalid_record = record.clone();
         invalid_record.data[3] = 0xFF;
+        assert!(invalid_record.parse_data().is_err());
+        let mut invalid_record = record.clone();
+        invalid_record.data[1] = 0xFF;
+        assert!(invalid_record.parse_data().is_err());
+        let mut invalid_record = record.clone();
+        invalid_record.data[2] = 0xFF;
+        assert!(invalid_record.parse_data().is_err());
+        let mut invalid_record = record.clone();
+        invalid_record.data[10] = 0xFF;
+        assert!(invalid_record.parse_data().is_err());
+        let mut invalid_record = record.clone();
+        invalid_record.data[11] = 0xFF;
         assert!(invalid_record.parse_data().is_err());
 
         let mut missing_palette_flag = record.clone();
@@ -10196,6 +12375,47 @@ mod tests {
         assert_eq!(
             record_without_palette.parse_data().unwrap(),
             ts_graphics_without_palette
+        );
+        assert!(
+            EmfPlusRecord::from_data(
+                &ts_graphics_without_palette,
+                EmfPlusRecordFlags::TS_GRAPHICS_BASIC_VGA,
+            )
+            .is_err()
+        );
+
+        let ts_graphics_basic_vga = EmfPlusRecordData::SetTsGraphics(EmfPlusSetTsGraphicsData {
+            palette: Some(EmfPlusPalette {
+                palette_style_flags: 0,
+                entries: vec![
+                    EmfPlusArgb {
+                        blue: 0x00,
+                        green: 0x00,
+                        red: 0x00,
+                        alpha: 0xFF,
+                    },
+                    EmfPlusArgb {
+                        blue: 0xFF,
+                        green: 0xFF,
+                        red: 0xFF,
+                        alpha: 0xFF,
+                    },
+                ],
+                trailing_data: Vec::new(),
+            }),
+            ..ts_graphics_data.clone()
+        });
+        let record = EmfPlusRecord::from_data(
+            &ts_graphics_basic_vga,
+            EmfPlusRecordFlags::TS_GRAPHICS_BASIC_VGA,
+        )
+        .unwrap();
+        assert!(record.flags().ts_graphics_palette_present());
+        assert!(record.flags().ts_graphics_basic_vga());
+        assert_eq!(record.parse_data().unwrap(), ts_graphics_basic_vga);
+        assert!(
+            EmfPlusRecord::from_data(&ts_graphics, EmfPlusRecordFlags::TS_GRAPHICS_BASIC_VGA,)
+                .is_err()
         );
 
         let stroke_fill = EmfPlusRecordData::StrokeFillPath;
@@ -10294,6 +12514,7 @@ mod tests {
             brush_data: vec![1, 2],
         };
         assert!(brush.parse_brush_data().is_err());
+        assert!(EmfPlusObjectData::Brush(brush.clone()).to_bytes().is_err());
         let unknown_brush = EmfPlusBrushObject {
             brush_type: 0xFFFF,
             ..brush.clone()
@@ -10324,6 +12545,7 @@ mod tests {
             image_data: vec![1, 2, 3, 4],
         };
         assert!(image.parse_image_data().is_err());
+        assert!(EmfPlusObjectData::Image(image.clone()).to_bytes().is_err());
         let unknown_image = EmfPlusImageObject {
             image_type: EmfPlusImageDataType::Unknown.raw(),
             ..image
@@ -10382,8 +12604,24 @@ mod tests {
             EmfPlusObjectType::CustomLineCap,
             EmfPlusObjectData::CustomLineCap(EmfPlusCustomLineCapObject {
                 version: test_graphics_version(),
-                cap_type: 1,
-                custom_line_cap_data: vec![1, 2, 3, 4],
+                cap_type: EmfPlusCustomLineCapDataType::Default.raw(),
+                custom_line_cap_data: EmfPlusCustomLineCapData::Default(
+                    EmfPlusCustomLineCapDefaultData {
+                        custom_line_cap_data_flags: 0,
+                        base_cap: EmfPlusLineCapType::Flat.raw() as u32,
+                        base_inset: 0.0,
+                        stroke_start_cap: EmfPlusLineCapType::Flat.raw() as u32,
+                        stroke_end_cap: EmfPlusLineCapType::Flat.raw() as u32,
+                        stroke_join: EmfPlusLineJoinType::Miter.raw() as u32,
+                        stroke_miter_limit: 1.0,
+                        width_scale: 1.0,
+                        fill_hot_spot: PointF { x: 0.0, y: 0.0 },
+                        stroke_hot_spot: PointF { x: 0.0, y: 0.0 },
+                        optional_data: Vec::new(),
+                    },
+                )
+                .to_bytes()
+                .unwrap(),
             }),
         );
         assert!(
@@ -10395,21 +12633,45 @@ mod tests {
             .to_bytes()
             .is_err()
         );
+        let font_object = EmfPlusFontObject {
+            version: test_graphics_version(),
+            em_size: 12.5,
+            size_unit: 3,
+            font_style_flags: 1,
+            reserved: 0x1234,
+            family_name: SdkString::raw(
+                vec![b'A', 0, b'r', 0, b'i', 0, b'a', 0, b'l', 0],
+                SdkEncoding::Utf16Le,
+            ),
+            padding: vec![0, 0],
+        };
         assert_object_data_roundtrip(
             EmfPlusObjectType::Font,
-            EmfPlusObjectData::Font(EmfPlusFontObject {
-                version: test_graphics_version(),
-                em_size: 12.5,
-                size_unit: 3,
-                font_style_flags: 1,
-                reserved: 0x1234,
-                family_name: SdkString::raw(
-                    vec![b'A', 0, b'r', 0, b'i', 0, b'a', 0, b'l', 0],
-                    SdkEncoding::Utf16Le,
-                ),
-                padding: vec![0, 0],
-            }),
+            EmfPlusObjectData::Font(font_object.clone()),
         );
+        let invalid_font_padding = EmfPlusFontObject {
+            padding: vec![0],
+            ..font_object.clone()
+        };
+        assert!(
+            EmfPlusObjectData::Font(invalid_font_padding)
+                .to_bytes()
+                .is_err()
+        );
+        let invalid_font_padding_record = EmfPlusObjectRecordData {
+            object_id: 1,
+            object_type_raw: EmfPlusObjectType::Font.raw() as u8,
+            continues: false,
+            total_object_size: None,
+            object_data: {
+                let mut data = EmfPlusObjectData::Font(font_object.clone())
+                    .to_bytes()
+                    .unwrap();
+                data.pop();
+                data
+            },
+        };
+        assert!(invalid_font_padding_record.parse_object_data().is_err());
         assert!(
             EmfPlusObjectData::Font(EmfPlusFontObject {
                 version: test_graphics_version(),
@@ -10458,8 +12720,17 @@ mod tests {
             EmfPlusObjectType::Image,
             EmfPlusObjectData::Image(EmfPlusImageObject {
                 version: test_graphics_version(),
-                image_type: 1,
-                image_data: vec![0x10, 0x20, 0x30],
+                image_type: EmfPlusImageDataType::Bitmap.raw(),
+                image_data: EmfPlusImageData::Bitmap(EmfPlusBitmapObject {
+                    width: 1,
+                    height: 1,
+                    stride: 4,
+                    pixel_format: EmfPlusPixelFormat::Format32bppArgb.raw(),
+                    bitmap_data_type: EmfPlusBitmapDataType::Pixel.raw(),
+                    bitmap_data: vec![0, 0, 0, 0],
+                })
+                .to_bytes()
+                .unwrap(),
             }),
         );
         assert!(
@@ -10616,7 +12887,7 @@ mod tests {
                     first: 1,
                     length: 5,
                 }],
-                trailing_data: vec![0, 0],
+                trailing_data: Vec::new(),
             }),
         );
         assert!(
@@ -10654,8 +12925,21 @@ mod tests {
                     red: 3,
                     alpha: 4,
                 },
-                trailing_data: vec![0xAA],
+                trailing_data: Vec::new(),
             }),
+        );
+        assert!(
+            EmfPlusBrushData::Solid(EmfPlusSolidBrushData {
+                solid_color: EmfPlusArgb {
+                    blue: 1,
+                    green: 2,
+                    red: 3,
+                    alpha: 4,
+                },
+                trailing_data: vec![0xAA],
+            })
+            .to_bytes()
+            .is_err()
         );
 
         let hatch = EmfPlusBrushData::Hatch(EmfPlusHatchBrushData {
@@ -10681,6 +12965,13 @@ mod tests {
         assert_eq!(
             parsed_hatch.hatch_style_kind(),
             Some(EmfPlusHatchStyle::DashedHorizontal)
+        );
+        let mut hatch_with_trailing_data = parsed_hatch.clone();
+        hatch_with_trailing_data.trailing_data.push(0xAA);
+        assert!(
+            EmfPlusBrushData::Hatch(hatch_with_trailing_data)
+                .to_bytes()
+                .is_err()
         );
         assert!(
             EmfPlusBrushData::Hatch(EmfPlusHatchBrushData {
@@ -10757,6 +13048,9 @@ mod tests {
             Some(EmfPlusWrapMode::TileFlipX)
         );
         assert!(parsed_linear.parse_optional_data().is_ok());
+        let mut invalid_linear_optional = parsed_linear.parse_optional_data().unwrap();
+        invalid_linear_optional.trailing_data.push(0xAA);
+        assert!(invalid_linear_optional.to_bytes().is_err());
         assert!(
             EmfPlusBrushData::LinearGradient(EmfPlusLinearGradientBrushData {
                 brush_data_flags: EmfPlusBrushDataFlags::TRANSFORM.bits(),
@@ -10796,6 +13090,15 @@ mod tests {
         let mut invalid_linear_flags = parsed_linear.clone();
         invalid_linear_flags.brush_data_flags =
             (EmfPlusBrushDataFlags::TRANSFORM | EmfPlusBrushDataFlags::DO_NOT_TRANSFORM).bits();
+        assert!(
+            EmfPlusBrushData::LinearGradient(invalid_linear_flags)
+                .to_bytes()
+                .is_err()
+        );
+        let mut invalid_linear_flags = parsed_linear.clone();
+        invalid_linear_flags.brush_data_flags =
+            (EmfPlusBrushDataFlags::PRESET_COLORS | EmfPlusBrushDataFlags::BLEND_FACTORS_H).bits();
+        invalid_linear_flags.optional_data = Vec::new();
         assert!(
             EmfPlusBrushData::LinearGradient(invalid_linear_flags)
                 .to_bytes()
@@ -10867,9 +13170,27 @@ mod tests {
             Some(EmfPlusWrapMode::Clamp)
         );
         assert!(parsed_path_gradient.parse_tail_data().is_ok());
+        let invalid_path_tail = EmfPlusPathGradientBrushTailData {
+            boundary_data: None,
+            optional_data: EmfPlusPathGradientBrushOptionalData {
+                transform_matrix: None,
+                blend_pattern: None,
+                focus_scale_data: None,
+            },
+            trailing_data: Vec::new(),
+        };
+        assert!(invalid_path_tail.to_bytes().is_err());
         let mut invalid_path_gradient_flags = parsed_path_gradient.clone();
         invalid_path_gradient_flags.brush_data_flags =
             EmfPlusBrushDataFlags::BLEND_FACTORS_V.bits();
+        assert!(
+            EmfPlusBrushData::PathGradient(invalid_path_gradient_flags)
+                .to_bytes()
+                .is_err()
+        );
+        let mut invalid_path_gradient_flags = parsed_path_gradient.clone();
+        invalid_path_gradient_flags.brush_data_flags =
+            (EmfPlusBrushDataFlags::PRESET_COLORS | EmfPlusBrushDataFlags::BLEND_FACTORS_H).bits();
         assert!(
             EmfPlusBrushData::PathGradient(invalid_path_gradient_flags)
                 .to_bytes()
@@ -10896,7 +13217,7 @@ mod tests {
         let texture = EmfPlusBrushData::Texture(EmfPlusTextureBrushData {
             brush_data_flags: EmfPlusBrushDataFlags::DO_NOT_TRANSFORM.bits(),
             wrap_mode: EmfPlusWrapMode::TileFlipXY.raw() as i32,
-            optional_data: vec![0x33, 0x44],
+            optional_data: Vec::new(),
         });
         assert_brush_data_roundtrip(EmfPlusBrushType::TextureFill, texture.clone());
         let EmfPlusBrushData::Texture(parsed_texture) = texture else {
@@ -10918,6 +13239,12 @@ mod tests {
                 .to_bytes()
                 .is_err()
         );
+        let invalid_texture_trailing_data = EmfPlusBrushData::Texture(EmfPlusTextureBrushData {
+            brush_data_flags: EmfPlusBrushDataFlags::DO_NOT_TRANSFORM.bits(),
+            wrap_mode: EmfPlusWrapMode::TileFlipXY.raw() as i32,
+            optional_data: vec![0x33, 0x44],
+        });
+        assert!(invalid_texture_trailing_data.to_bytes().is_err());
         let texture_transform = XForm {
             m11: 1.0,
             m12: 0.0,
@@ -10949,6 +13276,9 @@ mod tests {
         assert_eq!(parsed_optional.transform_matrix, Some(texture_transform));
         assert_eq!(parsed_optional.image_object, Some(texture_image));
         assert!(parsed_optional.trailing_data.is_empty());
+        let mut invalid_texture_optional = parsed_optional.clone();
+        invalid_texture_optional.trailing_data.push(0xAA);
+        assert!(invalid_texture_optional.to_bytes().is_err());
         assert!(
             EmfPlusBrushData::Texture(EmfPlusTextureBrushData {
                 brush_data_flags: EmfPlusBrushDataFlags::TRANSFORM.bits(),
@@ -11004,6 +13334,20 @@ mod tests {
                 alignment_padding: vec![0, 0],
             }),
         );
+        assert!(
+            EmfPlusObjectData::Path(EmfPlusPathObject {
+                version: test_graphics_version(),
+                path_point_flags: EmfPlusRecordFlags::COMPRESSED.bits() as u32,
+                points: EmfPlusPointData::Compressed(vec![
+                    PointS { x: 1, y: 2 },
+                    PointS { x: 3, y: 4 },
+                ]),
+                point_types: EmfPlusPathPointTypes::Values(path_point_types(&[0x00, 0x81])),
+                alignment_padding: vec![0],
+            })
+            .to_bytes()
+            .is_err()
+        );
         assert_object_data_roundtrip(
             EmfPlusObjectType::Path,
             EmfPlusObjectData::Path(EmfPlusPathObject {
@@ -11013,11 +13357,10 @@ mod tests {
                     EmfPlusPointR { x: 1, y: 2 },
                     EmfPlusPointR { x: 3, y: 4 },
                 ]),
-                point_types: EmfPlusPathPointTypes::Rle(vec![EmfPlusPathPointTypeRle {
-                    control: 0x42,
-                    point_type: path_point_type(0x01),
-                }]),
-                alignment_padding: Vec::new(),
+                point_types: EmfPlusPathPointTypes::Rle(vec![
+                    EmfPlusPathPointTypeRle::new(false, 2, path_point_type(0x01)).unwrap(),
+                ]),
+                alignment_padding: vec![0, 0],
             }),
         );
         let small_relative = EmfPlusPointR { x: 63, y: -64 };
@@ -11126,6 +13469,25 @@ mod tests {
             },
         };
         assert!(invalid_path_record.parse_object_data().is_err());
+
+        let invalid_path_padding_record = EmfPlusObjectRecordData {
+            object_id: 1,
+            object_type_raw: EmfPlusObjectType::Path.raw() as u8,
+            continues: false,
+            total_object_size: None,
+            object_data: {
+                let mut data = Vec::new();
+                data.extend_from_slice(&test_graphics_version().value.to_le_bytes());
+                data.extend_from_slice(&1_u32.to_le_bytes());
+                data.extend_from_slice(&0_u32.to_le_bytes());
+                data.extend_from_slice(&1.0_f32.to_le_bytes());
+                data.extend_from_slice(&2.0_f32.to_le_bytes());
+                data.push(0x00);
+                data.extend_from_slice(&[0, 0]);
+                data
+            },
+        };
+        assert!(invalid_path_padding_record.parse_object_data().is_err());
     }
 
     #[test]
@@ -11206,11 +13568,10 @@ mod tests {
             Some(EmfPlusObjectClamp::BitmapClamp)
         );
 
-        let path_type = EmfPlusPathPointTypeRle {
-            control: 0x82,
-            point_type: path_point_type(0x83),
-        };
+        let path_type = EmfPlusPathPointTypeRle::new(true, 2, path_point_type(0x83)).unwrap();
         assert!(path_type.bezier());
+        assert!(path_type.marker_bit_set());
+        assert_eq!(path_type.control, 0xC2);
         assert_eq!(path_type.run_count(), 2);
         assert_eq!(
             path_type.path_point_type(),
@@ -11221,6 +13582,8 @@ mod tests {
                 .path_point_flags()
                 .contains(EmfPlusPathPointTypeFlags::CLOSE_SUBPATH)
         );
+        assert!(EmfPlusPathPointTypeRle::new(false, 0, path_point_type(0x00)).is_err());
+        assert!(EmfPlusPathPointTypeRle::new(false, 64, path_point_type(0x00)).is_err());
 
         let string_format = EmfPlusStringFormatObject {
             version: test_graphics_version(),
@@ -11280,11 +13643,44 @@ mod tests {
             0x0009
         );
         assert_eq!(string_format.language_identifier().sub_language_id(), 0x01);
+        assert_eq!(string_format.language_identifier().language_id(), 0x0409);
+        assert_eq!(string_format.language_identifier().high_word(), 0);
+        assert!(string_format.language_identifier().is_word_sized());
+        assert!(
+            !string_format
+                .language_identifier()
+                .is_vendor_primary_language_id()
+        );
+        assert!(
+            !string_format
+                .language_identifier()
+                .is_vendor_sub_language_id()
+        );
+        let language_identifier = EmfPlusLanguageIdentifier::from_parts(0x0009, 0x01).unwrap();
+        assert_eq!(language_identifier.raw, 0x0409);
+        assert_eq!(language_identifier.primary_language_id(), 0x0009);
+        assert_eq!(language_identifier.sub_language_id(), 0x01);
+        let vendor_language_identifier =
+            EmfPlusLanguageIdentifier::from_parts(0x0200, 0x20).unwrap();
+        assert_eq!(vendor_language_identifier.raw, 0x8200);
+        assert!(vendor_language_identifier.is_word_sized());
+        assert!(vendor_language_identifier.is_vendor_primary_language_id());
+        assert!(vendor_language_identifier.is_vendor_sub_language_id());
+        assert!(EmfPlusLanguageIdentifier::from_parts(0x0400, 0x01).is_err());
+        assert!(EmfPlusLanguageIdentifier::from_parts(0x0009, 0x40).is_err());
         assert_eq!(
             string_format
                 .digit_language_identifier()
                 .primary_language_id(),
             0x0009
+        );
+        assert_eq!(string_format.tab_stops(), &[4.0]);
+        assert_eq!(
+            string_format.char_ranges(),
+            &[EmfPlusCharacterRange {
+                first: 1,
+                length: 3,
+            }]
         );
         assert_eq!(string_format.string_format_data().tab_stops, [4.0]);
         assert_eq!(
@@ -11307,6 +13703,80 @@ mod tests {
                 .to_bytes()
                 .unwrap();
         invalid_string_format_bytes[4..8].copy_from_slice(&0x0000_0080_u32.to_le_bytes());
+        assert!(
+            EmfPlusObjectRecordData {
+                object_id: 1,
+                object_type_raw: EmfPlusObjectType::StringFormat.raw() as u8,
+                continues: false,
+                total_object_size: None,
+                object_data: invalid_string_format_bytes,
+            }
+            .parse_object_data()
+            .is_err()
+        );
+
+        let mut invalid_string_format = string_format.clone();
+        invalid_string_format.language = 0x0001_0409;
+        assert!(
+            EmfPlusObjectData::StringFormat(invalid_string_format)
+                .to_bytes()
+                .is_err()
+        );
+
+        let mut invalid_string_format = string_format.clone();
+        invalid_string_format.digit_language = 0x0001_0409;
+        assert!(
+            EmfPlusObjectData::StringFormat(invalid_string_format)
+                .to_bytes()
+                .is_err()
+        );
+
+        let mut invalid_string_format_bytes =
+            EmfPlusObjectData::StringFormat(string_format.clone())
+                .to_bytes()
+                .unwrap();
+        invalid_string_format_bytes[8..12].copy_from_slice(&0x0001_0409_u32.to_le_bytes());
+        assert!(
+            EmfPlusObjectRecordData {
+                object_id: 1,
+                object_type_raw: EmfPlusObjectType::StringFormat.raw() as u8,
+                continues: false,
+                total_object_size: None,
+                object_data: invalid_string_format_bytes,
+            }
+            .parse_object_data()
+            .is_err()
+        );
+
+        let mut invalid_string_format_bytes =
+            EmfPlusObjectData::StringFormat(string_format.clone())
+                .to_bytes()
+                .unwrap();
+        invalid_string_format_bytes[24..28].copy_from_slice(&0x0001_0409_u32.to_le_bytes());
+        assert!(
+            EmfPlusObjectRecordData {
+                object_id: 1,
+                object_type_raw: EmfPlusObjectType::StringFormat.raw() as u8,
+                continues: false,
+                total_object_size: None,
+                object_data: invalid_string_format_bytes,
+            }
+            .parse_object_data()
+            .is_err()
+        );
+
+        let mut invalid_string_format = string_format.clone();
+        invalid_string_format.trailing_data = vec![0xAA];
+        assert!(
+            EmfPlusObjectData::StringFormat(invalid_string_format)
+                .to_bytes()
+                .is_err()
+        );
+        let mut invalid_string_format_bytes =
+            EmfPlusObjectData::StringFormat(string_format.clone())
+                .to_bytes()
+                .unwrap();
+        invalid_string_format_bytes.push(0xAA);
         assert!(
             EmfPlusObjectRecordData {
                 object_id: 1,
@@ -11465,6 +13935,30 @@ mod tests {
             },
         };
         assert!(invalid_pixel_image.parse_image_data().is_err());
+        let too_small_stride_bitmap = EmfPlusImageData::Bitmap(EmfPlusBitmapObject {
+            width: 2,
+            height: 2,
+            stride: 4,
+            pixel_format: EmfPlusPixelFormat::Format32bppArgb.raw(),
+            bitmap_data_type: EmfPlusBitmapDataType::Pixel.raw(),
+            bitmap_data: vec![0xAA; 8],
+        });
+        assert!(too_small_stride_bitmap.to_bytes().is_err());
+        let too_small_stride_image = EmfPlusImageObject {
+            version: test_graphics_version(),
+            image_type: EmfPlusImageDataType::Bitmap.raw(),
+            image_data: {
+                let mut data = Vec::new();
+                data.extend_from_slice(&2_i32.to_le_bytes());
+                data.extend_from_slice(&2_i32.to_le_bytes());
+                data.extend_from_slice(&4_i32.to_le_bytes());
+                data.extend_from_slice(&EmfPlusPixelFormat::Format32bppArgb.raw().to_le_bytes());
+                data.extend_from_slice(&EmfPlusBitmapDataType::Pixel.raw().to_le_bytes());
+                data.extend_from_slice(&[0xAA; 8]);
+                data
+            },
+        };
+        assert!(too_small_stride_image.parse_image_data().is_err());
         assert!(
             EmfPlusImageData::Bitmap(EmfPlusBitmapObject {
                 width: 2,
@@ -11605,7 +14099,7 @@ mod tests {
                         blue: 0x33,
                         green: 0x22,
                         red: 0x11,
-                        alpha: 0xFF,
+                        alpha: 0x80,
                     },
                 ],
                 trailing_data: Vec::new(),
@@ -11662,7 +14156,7 @@ mod tests {
         let metafile = EmfPlusImageData::Metafile(EmfPlusMetafileObject {
             metafile_type: EmfPlusMetafileDataType::EmfPlusDual.raw(),
             metafile_data: vec![1, 2, 3, 4],
-            trailing_data: vec![0xEE, 0xFF],
+            trailing_data: Vec::new(),
         });
         let image = EmfPlusImageObject {
             version: test_graphics_version(),
@@ -11688,6 +14182,15 @@ mod tests {
             .to_bytes()
             .is_err()
         );
+        assert!(
+            EmfPlusImageData::Metafile(EmfPlusMetafileObject {
+                metafile_type: EmfPlusMetafileDataType::EmfPlusDual.raw(),
+                metafile_data: Vec::new(),
+                trailing_data: vec![0xEE],
+            })
+            .to_bytes()
+            .is_err()
+        );
         let invalid_metafile_image = EmfPlusImageObject {
             version: test_graphics_version(),
             image_type: EmfPlusImageDataType::Metafile.raw(),
@@ -11695,6 +14198,16 @@ mod tests {
                 let mut data = Vec::new();
                 data.extend_from_slice(&0xFFFF_FFFF_u32.to_le_bytes());
                 data.extend_from_slice(&0_u32.to_le_bytes());
+                data
+            },
+        };
+        assert!(invalid_metafile_image.parse_image_data().is_err());
+        let invalid_metafile_image = EmfPlusImageObject {
+            version: test_graphics_version(),
+            image_type: EmfPlusImageDataType::Metafile.raw(),
+            image_data: {
+                let mut data = metafile.to_bytes().unwrap();
+                data.push(0xEE);
                 data
             },
         };
@@ -11922,6 +14435,18 @@ mod tests {
         let mut bytes = Vec::new();
         let mut writer = Writer::new(std::io::Cursor::new(&mut bytes));
         assert!(stray_optional_pen_data.write_to(&mut writer).is_err());
+
+        let trailing_pen_data = EmfPlusPenData {
+            pen_data_flags: 0,
+            pen_unit: EmfPlusUnitType::Pixel.raw(),
+            pen_width: 1.0,
+            optional_data: EmfPlusPenOptionalData::default(),
+            trailing_data: vec![0xAA],
+        };
+        let mut bytes = Vec::new();
+        let mut writer = Writer::new(std::io::Cursor::new(&mut bytes));
+        assert!(trailing_pen_data.write_to(&mut writer).is_err());
+
         let invalid_pen_flags = EmfPlusPenObject {
             version: test_graphics_version(),
             pen_type: 0,
@@ -11934,6 +14459,20 @@ mod tests {
             },
         };
         assert!(invalid_pen_flags.parse_pen_payload().is_err());
+
+        let truncated_brush_pen = EmfPlusPenObject {
+            version: test_graphics_version(),
+            pen_type: 0,
+            pen_data_and_brush_object: {
+                let mut data = Vec::new();
+                data.extend_from_slice(&0_u32.to_le_bytes());
+                data.extend_from_slice(&EmfPlusUnitType::Pixel.raw().to_le_bytes());
+                data.extend_from_slice(&1.0_f32.to_le_bytes());
+                data.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+                data
+            },
+        };
+        assert!(truncated_brush_pen.parse_pen_payload().is_err());
 
         let invalid_line_style_pen = EmfPlusPenObject {
             version: test_graphics_version(),
@@ -12010,6 +14549,34 @@ mod tests {
         let mut writer = Writer::new(std::io::Cursor::new(&mut rewritten_node));
         parsed_nodes[0].write_to(&mut writer).unwrap();
         assert_eq!(rewritten_node, node_bytes);
+        let invalid_region_node = EmfPlusRegionNode {
+            node_type: EmfPlusRegionNodeDataType::Empty.raw(),
+            data: EmfPlusRegionNodeData::Rect(RectF {
+                x: 1.0,
+                y: 2.0,
+                width: 3.0,
+                height: 4.0,
+            }),
+        };
+        let mut writer = Writer::new(std::io::Cursor::new(Vec::new()));
+        assert!(invalid_region_node.write_to(&mut writer).is_err());
+        let invalid_region_node = EmfPlusRegionNode {
+            node_type: EmfPlusRegionNodeDataType::And.raw(),
+            data: EmfPlusRegionNodeData::Empty,
+        };
+        let mut writer = Writer::new(std::io::Cursor::new(Vec::new()));
+        assert!(invalid_region_node.write_to(&mut writer).is_err());
+        let unknown_region_node = EmfPlusRegionNode {
+            node_type: 0xFFFF_FFFF,
+            data: EmfPlusRegionNodeData::Raw(vec![1, 2, 3, 4]),
+        };
+        let mut unknown_region_node_bytes = Vec::new();
+        let mut writer = Writer::new(std::io::Cursor::new(&mut unknown_region_node_bytes));
+        unknown_region_node.write_to(&mut writer).unwrap();
+        assert_eq!(
+            unknown_region_node_bytes,
+            [0xFFFF_FFFF_u32.to_le_bytes().as_slice(), &[1, 2, 3, 4]].concat()
+        );
 
         let path_node = EmfPlusRegionNode {
             node_type: EmfPlusRegionNodeDataType::Path.raw(),
@@ -12103,6 +14670,14 @@ mod tests {
         assert!(invalid_count_region.parse_region_nodes().is_err());
         let mut writer = Writer::new(std::io::Cursor::new(Vec::new()));
         assert!(invalid_count_region.write_to(&mut writer).is_err());
+        let impossible_count_region = EmfPlusRegionObject {
+            version: test_graphics_version(),
+            region_node_count: 1_000,
+            region_nodes: node_bytes.clone(),
+        };
+        assert!(impossible_count_region.parse_region_nodes().is_err());
+        let mut writer = Writer::new(std::io::Cursor::new(Vec::new()));
+        assert!(impossible_count_region.write_to(&mut writer).is_err());
         assert!(
             EmfPlusObjectRecordData {
                 object_id: 1,
@@ -12153,7 +14728,7 @@ mod tests {
                 }),
                 trailing_data: Vec::new(),
             }),
-            trailing_data: vec![0xAA, 0xBB],
+            trailing_data: Vec::new(),
         };
         let raw_line_path = EmfPlusLinePathObject {
             path_data: EmfPlusRegionNodePathData::Raw(vec![5, 6, 7, 8]),
@@ -12168,6 +14743,23 @@ mod tests {
         assert_eq!(
             raw_line_path_bytes,
             [4_i32.to_le_bytes().as_slice(), &[5, 6, 7, 8]].concat()
+        );
+        let mut invalid_optional_data = line_cap_optional_data.clone();
+        invalid_optional_data.trailing_data = vec![0xAA];
+        assert!(invalid_optional_data.to_bytes().is_err());
+        let mut invalid_fill_path = line_cap_optional_data.fill_path.clone().unwrap();
+        invalid_fill_path.trailing_data = vec![0xAA];
+        assert!(
+            invalid_fill_path
+                .write_to(&mut Writer::new(std::io::Cursor::new(Vec::new())))
+                .is_err()
+        );
+        let mut invalid_line_path = line_cap_optional_data.line_path.clone().unwrap();
+        invalid_line_path.trailing_data = vec![0xAA];
+        assert!(
+            invalid_line_path
+                .write_to(&mut Writer::new(std::io::Cursor::new(Vec::new())))
+                .is_err()
         );
         let default_cap = EmfPlusCustomLineCapData::Default(EmfPlusCustomLineCapDefaultData {
             custom_line_cap_data_flags: (EmfPlusCustomLineCapDataFlags::FILL_PATH
@@ -12192,6 +14784,52 @@ mod tests {
         let parsed_cap = cap.parse_cap_data().unwrap();
         assert_eq!(parsed_cap, default_cap);
         assert_eq!(parsed_cap.to_bytes().unwrap(), cap.custom_line_cap_data);
+        let custom_start_cap = EmfPlusCustomStartCapData::from_typed_cap(&cap).unwrap();
+        assert_eq!(custom_start_cap.custom_start_cap, cap.to_bytes().unwrap());
+        assert_eq!(custom_start_cap.parse_custom_start_cap().unwrap(), cap);
+        let custom_end_cap = EmfPlusCustomEndCapData::from_typed_cap(&cap).unwrap();
+        assert_eq!(custom_end_cap.custom_end_cap, cap.to_bytes().unwrap());
+        assert_eq!(custom_end_cap.parse_custom_end_cap().unwrap(), cap);
+        let mut mutable_custom_start_cap = EmfPlusCustomStartCapData {
+            custom_start_cap: Vec::new(),
+        };
+        mutable_custom_start_cap.set_typed_cap(&cap).unwrap();
+        assert_eq!(mutable_custom_start_cap, custom_start_cap);
+        let mut mutable_custom_end_cap = EmfPlusCustomEndCapData {
+            custom_end_cap: Vec::new(),
+        };
+        mutable_custom_end_cap.set_typed_cap(&cap).unwrap();
+        assert_eq!(mutable_custom_end_cap, custom_end_cap);
+        let mut truncated_custom_start_cap = custom_start_cap.clone();
+        truncated_custom_start_cap.custom_start_cap.truncate(8);
+        assert!(truncated_custom_start_cap.parse_custom_start_cap().is_err());
+        let mut truncated_custom_end_cap = custom_end_cap.clone();
+        truncated_custom_end_cap.custom_end_cap.truncate(8);
+        assert!(truncated_custom_end_cap.parse_custom_end_cap().is_err());
+        let invalid_start_cap_pen_data = EmfPlusPenData {
+            pen_data_flags: EmfPlusPenDataFlags::CUSTOM_START_CAP.bits(),
+            pen_unit: EmfPlusUnitType::Pixel.raw(),
+            pen_width: 1.0,
+            optional_data: EmfPlusPenOptionalData {
+                custom_start_cap_data: Some(truncated_custom_start_cap),
+                ..Default::default()
+            },
+            trailing_data: Vec::new(),
+        };
+        let mut writer = Writer::new(std::io::Cursor::new(Vec::new()));
+        assert!(invalid_start_cap_pen_data.write_to(&mut writer).is_err());
+        let invalid_end_cap_pen_data = EmfPlusPenData {
+            pen_data_flags: EmfPlusPenDataFlags::CUSTOM_END_CAP.bits(),
+            pen_unit: EmfPlusUnitType::Pixel.raw(),
+            pen_width: 1.0,
+            optional_data: EmfPlusPenOptionalData {
+                custom_end_cap_data: Some(truncated_custom_end_cap),
+                ..Default::default()
+            },
+            trailing_data: Vec::new(),
+        };
+        let mut writer = Writer::new(std::io::Cursor::new(Vec::new()));
+        assert!(invalid_end_cap_pen_data.write_to(&mut writer).is_err());
         let EmfPlusCustomLineCapData::Default(parsed_default_cap) = &parsed_cap else {
             panic!("expected default custom line cap");
         };
@@ -12201,6 +14839,24 @@ mod tests {
             parsed_optional_data.to_bytes().unwrap(),
             parsed_default_cap.optional_data
         );
+        let invalid_optional_cap =
+            EmfPlusCustomLineCapData::Default(EmfPlusCustomLineCapDefaultData {
+                optional_data: {
+                    let mut data = parsed_default_cap.optional_data.clone();
+                    data.push(0xAA);
+                    data
+                },
+                ..parsed_default_cap.clone()
+            });
+        assert!(invalid_optional_cap.to_bytes().is_err());
+        let mut invalid_optional_cap_data = default_cap.to_bytes().unwrap();
+        invalid_optional_cap_data.push(0xAA);
+        let invalid_optional_cap_object = EmfPlusCustomLineCapObject {
+            version: test_graphics_version(),
+            cap_type: EmfPlusCustomLineCapDataType::Default.raw(),
+            custom_line_cap_data: invalid_optional_cap_data,
+        };
+        assert!(invalid_optional_cap_object.parse_cap_data().is_err());
         assert_eq!(
             parsed_default_cap.base_cap_kind(),
             Some(EmfPlusLineCapType::Flat)
@@ -12236,6 +14892,55 @@ mod tests {
             },
         };
         assert!(invalid_cap_flags_object.parse_cap_data().is_err());
+        assert!(invalid_cap_flags_object.to_bytes().is_err());
+
+        let missing_optional_cap =
+            EmfPlusCustomLineCapData::Default(EmfPlusCustomLineCapDefaultData {
+                custom_line_cap_data_flags: EmfPlusCustomLineCapDataFlags::FILL_PATH.bits(),
+                base_cap: EmfPlusLineCapType::Flat.raw() as u32,
+                base_inset: 0.0,
+                stroke_start_cap: EmfPlusLineCapType::Flat.raw() as u32,
+                stroke_end_cap: EmfPlusLineCapType::Flat.raw() as u32,
+                stroke_join: EmfPlusLineJoinType::Miter.raw() as u32,
+                stroke_miter_limit: 1.0,
+                width_scale: 1.0,
+                fill_hot_spot: PointF { x: 0.0, y: 0.0 },
+                stroke_hot_spot: PointF { x: 0.0, y: 0.0 },
+                optional_data: Vec::new(),
+            });
+        assert!(missing_optional_cap.to_bytes().is_err());
+        let missing_optional_cap_object = EmfPlusCustomLineCapObject {
+            version: test_graphics_version(),
+            cap_type: EmfPlusCustomLineCapDataType::Default.raw(),
+            custom_line_cap_data: [
+                EmfPlusCustomLineCapDataFlags::FILL_PATH
+                    .bits()
+                    .to_le_bytes()
+                    .as_slice(),
+                (EmfPlusLineCapType::Flat.raw() as u32)
+                    .to_le_bytes()
+                    .as_slice(),
+                0.0_f32.to_le_bytes().as_slice(),
+                (EmfPlusLineCapType::Flat.raw() as u32)
+                    .to_le_bytes()
+                    .as_slice(),
+                (EmfPlusLineCapType::Flat.raw() as u32)
+                    .to_le_bytes()
+                    .as_slice(),
+                (EmfPlusLineJoinType::Miter.raw() as u32)
+                    .to_le_bytes()
+                    .as_slice(),
+                1.0_f32.to_le_bytes().as_slice(),
+                1.0_f32.to_le_bytes().as_slice(),
+                0.0_f32.to_le_bytes().as_slice(),
+                0.0_f32.to_le_bytes().as_slice(),
+                0.0_f32.to_le_bytes().as_slice(),
+                0.0_f32.to_le_bytes().as_slice(),
+            ]
+            .concat(),
+        };
+        assert!(missing_optional_cap_object.parse_cap_data().is_err());
+        assert!(missing_optional_cap_object.to_bytes().is_err());
 
         let invalid_default_cap =
             EmfPlusCustomLineCapData::Default(EmfPlusCustomLineCapDefaultData {
@@ -12308,6 +15013,30 @@ mod tests {
             custom_line_cap_data: invalid_arrow_bytes,
         };
         assert!(invalid_arrow_cap.parse_cap_data().is_err());
+        assert!(invalid_arrow_cap.to_bytes().is_err());
+        let invalid_arrow_cap = EmfPlusCustomLineCapData::Arrow(EmfPlusCustomLineCapArrowData {
+            width: 3.0,
+            height: 4.0,
+            middle_inset: 1.0,
+            fill_state: 1,
+            line_start_cap: EmfPlusLineCapType::Flat.raw() as u32,
+            line_end_cap: EmfPlusLineCapType::Triangle.raw() as u32,
+            line_join: EmfPlusLineJoinType::Round.raw() as u32,
+            line_miter_limit: 2.0,
+            width_scale: 1.25,
+            fill_hot_spot: PointF { x: 0.0, y: 0.0 },
+            line_hot_spot: PointF { x: 0.0, y: 0.0 },
+            trailing_data: vec![0xAA],
+        });
+        assert!(invalid_arrow_cap.to_bytes().is_err());
+        let mut invalid_arrow_bytes = arrow_cap.to_bytes().unwrap();
+        invalid_arrow_bytes.push(0xAA);
+        let invalid_arrow_cap_object = EmfPlusCustomLineCapObject {
+            version: test_graphics_version(),
+            cap_type: EmfPlusCustomLineCapDataType::AdjustableArrow.raw(),
+            custom_line_cap_data: invalid_arrow_bytes,
+        };
+        assert!(invalid_arrow_cap_object.parse_cap_data().is_err());
     }
 
     #[test]
@@ -12330,7 +15059,7 @@ mod tests {
                     alpha: 8,
                 },
             ],
-            trailing_data: vec![0xAA, 0xBB],
+            trailing_data: Vec::new(),
         };
         let parsed_palette = EmfPlusPalette::read_from_bytes(&palette.to_bytes().unwrap()).unwrap();
         assert_eq!(parsed_palette, palette);
@@ -12342,9 +15071,41 @@ mod tests {
         let mut invalid_palette = palette.clone();
         invalid_palette.palette_style_flags = 0x8000_0000;
         assert!(invalid_palette.to_bytes().is_err());
+        let mut invalid_palette = palette.clone();
+        invalid_palette.trailing_data = vec![0xAA];
+        assert!(invalid_palette.to_bytes().is_err());
+        let mut invalid_palette_bytes = palette.to_bytes().unwrap();
+        invalid_palette_bytes.push(0xAA);
+        assert!(EmfPlusPalette::read_from_bytes(&invalid_palette_bytes).is_err());
         let mut invalid_palette_bytes = palette.to_bytes().unwrap();
         invalid_palette_bytes[0..4].copy_from_slice(&0x8000_0000_u32.to_le_bytes());
         assert!(EmfPlusPalette::read_from_bytes(&invalid_palette_bytes).is_err());
+        let grayscale_palette = EmfPlusPalette {
+            palette_style_flags: EmfPlusPaletteStyleFlags::GRAYSCALE.bits(),
+            entries: vec![EmfPlusArgb {
+                blue: 9,
+                green: 9,
+                red: 9,
+                alpha: 0xFF,
+            }],
+            trailing_data: Vec::new(),
+        };
+        assert!(grayscale_palette.to_bytes().is_ok());
+        let mut invalid_grayscale_palette = grayscale_palette.clone();
+        invalid_grayscale_palette.entries[0].red = 10;
+        assert!(invalid_grayscale_palette.to_bytes().is_err());
+        let mut invalid_grayscale_bytes = grayscale_palette.to_bytes().unwrap();
+        invalid_grayscale_bytes[8] = 8;
+        assert!(EmfPlusPalette::read_from_bytes(&invalid_grayscale_bytes).is_err());
+        let mut invalid_alpha_palette = palette.clone();
+        for entry in &mut invalid_alpha_palette.entries {
+            entry.alpha = 0xFF;
+        }
+        assert!(invalid_alpha_palette.to_bytes().is_err());
+        let mut invalid_alpha_bytes = palette.to_bytes().unwrap();
+        invalid_alpha_bytes[11] = 0xFF;
+        invalid_alpha_bytes[15] = 0xFF;
+        assert!(EmfPlusPalette::read_from_bytes(&invalid_alpha_bytes).is_err());
 
         let linear_optional = EmfPlusLinearGradientBrushOptionalData {
             transform_matrix: Some(XForm {
@@ -12373,7 +15134,7 @@ mod tests {
                 ],
                 trailing_data: Vec::new(),
             })),
-            trailing_data: vec![0xCC],
+            trailing_data: Vec::new(),
         };
         let linear = EmfPlusLinearGradientBrushData {
             brush_data_flags: (EmfPlusBrushDataFlags::TRANSFORM
@@ -12408,6 +15169,94 @@ mod tests {
             parsed_linear_optional.to_bytes().unwrap(),
             linear.optional_data
         );
+        let invalid_blend_colors_trailing_data = EmfPlusBlendColors {
+            positions: vec![0.0, 1.0],
+            colors: vec![
+                EmfPlusArgb {
+                    blue: 10,
+                    green: 20,
+                    red: 30,
+                    alpha: 255,
+                },
+                EmfPlusArgb {
+                    blue: 40,
+                    green: 50,
+                    red: 60,
+                    alpha: 255,
+                },
+            ],
+            trailing_data: vec![0xAA],
+        };
+        let mut writer = Writer::new(std::io::Cursor::new(Vec::new()));
+        assert!(
+            invalid_blend_colors_trailing_data
+                .write_to(&mut writer)
+                .is_err()
+        );
+        let vertical_factors = EmfPlusBlendFactors {
+            positions: vec![0.0, 1.0],
+            factors: vec![0.1, 0.9],
+            trailing_data: Vec::new(),
+        };
+        let horizontal_factors = EmfPlusBlendFactors {
+            positions: vec![0.0, 1.0],
+            factors: vec![0.2, 0.8],
+            trailing_data: Vec::new(),
+        };
+        let linear_hv_optional = EmfPlusLinearGradientBrushOptionalData {
+            transform_matrix: None,
+            blend_pattern: Some(EmfPlusBlendPattern::FactorsHV {
+                horizontal: horizontal_factors.clone(),
+                vertical: vertical_factors.clone(),
+            }),
+            trailing_data: Vec::new(),
+        };
+        let mut expected_hv_bytes = Vec::new();
+        {
+            let mut writer = Writer::new(std::io::Cursor::new(&mut expected_hv_bytes));
+            vertical_factors.write_to(&mut writer).unwrap();
+            horizontal_factors.write_to(&mut writer).unwrap();
+        }
+        assert_eq!(linear_hv_optional.to_bytes().unwrap(), expected_hv_bytes);
+        let invalid_blend_factors_trailing_data = EmfPlusBlendFactors {
+            positions: vec![0.0, 1.0],
+            factors: vec![0.25, 0.75],
+            trailing_data: vec![0xAA],
+        };
+        let mut writer = Writer::new(std::io::Cursor::new(Vec::new()));
+        assert!(
+            invalid_blend_factors_trailing_data
+                .write_to(&mut writer)
+                .is_err()
+        );
+        let linear_hv = EmfPlusLinearGradientBrushData {
+            brush_data_flags: (EmfPlusBrushDataFlags::BLEND_FACTORS_H
+                | EmfPlusBrushDataFlags::BLEND_FACTORS_V)
+                .bits(),
+            wrap_mode: EmfPlusWrapMode::Tile.raw() as i32,
+            rect: RectF {
+                x: 0.0,
+                y: 0.0,
+                width: 10.0,
+                height: 20.0,
+            },
+            start_color: EmfPlusArgb {
+                blue: 0,
+                green: 0,
+                red: 0,
+                alpha: 255,
+            },
+            end_color: EmfPlusArgb {
+                blue: 255,
+                green: 255,
+                red: 255,
+                alpha: 255,
+            },
+            reserved1: 0,
+            reserved2: 0,
+            optional_data: expected_hv_bytes,
+        };
+        assert_eq!(linear_hv.parse_optional_data().unwrap(), linear_hv_optional);
 
         let path_tail = EmfPlusPathGradientBrushTailData {
             boundary_data: Some(EmfPlusBoundaryData::Points(EmfPlusBoundaryPointData {
@@ -12428,7 +15277,7 @@ mod tests {
                     trailing_data: Vec::new(),
                 }),
             },
-            trailing_data: vec![0xDD],
+            trailing_data: Vec::new(),
         };
         let path_gradient = EmfPlusPathGradientBrushData {
             brush_data_flags: (EmfPlusBrushDataFlags::BLEND_FACTORS_H
@@ -12450,6 +15299,45 @@ mod tests {
         assert_eq!(
             parsed_path_tail.to_bytes().unwrap(),
             path_gradient.boundary_and_optional_data
+        );
+        let mut invalid_path_tail_trailing_data = path_tail.clone();
+        invalid_path_tail_trailing_data.trailing_data.push(0xAA);
+        assert!(invalid_path_tail_trailing_data.to_bytes().is_err());
+        let mut invalid_boundary_point_tail = path_tail.clone();
+        let Some(EmfPlusBoundaryData::Points(points)) =
+            &mut invalid_boundary_point_tail.boundary_data
+        else {
+            panic!("expected boundary points");
+        };
+        points.trailing_data.push(0xAA);
+        assert!(invalid_boundary_point_tail.to_bytes().is_err());
+
+        let mut invalid_focus_tail_data = path_tail.clone();
+        invalid_focus_tail_data
+            .optional_data
+            .focus_scale_data
+            .as_mut()
+            .unwrap()
+            .trailing_data
+            .push(0xAA);
+        assert!(invalid_focus_tail_data.to_bytes().is_err());
+
+        let mut linear_with_trailing_optional_data = linear.clone();
+        linear_with_trailing_optional_data.optional_data.push(0xCC);
+        assert!(
+            EmfPlusBrushData::LinearGradient(linear_with_trailing_optional_data)
+                .to_bytes()
+                .is_err()
+        );
+
+        let mut path_gradient_with_trailing_optional_data = path_gradient.clone();
+        path_gradient_with_trailing_optional_data
+            .boundary_and_optional_data
+            .push(0xDD);
+        assert!(
+            EmfPlusBrushData::PathGradient(path_gradient_with_trailing_optional_data)
+                .to_bytes()
+                .is_err()
         );
 
         let invalid_linear_optional = EmfPlusLinearGradientBrushOptionalData {
@@ -12534,5 +15422,12 @@ mod tests {
             path_boundary_gradient.parse_tail_data().unwrap(),
             boundary_path_tail
         );
+        let mut invalid_boundary_path_tail = boundary_path_tail.clone();
+        let Some(EmfPlusBoundaryData::Path(path)) = &mut invalid_boundary_path_tail.boundary_data
+        else {
+            panic!("expected boundary path");
+        };
+        path.trailing_data.push(0xAA);
+        assert!(invalid_boundary_path_tail.to_bytes().is_err());
     }
 }
