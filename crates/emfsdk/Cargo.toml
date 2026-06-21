@@ -16,9 +16,11 @@ readme.workspace = true
 bitflags = { workspace = true }
 emfsdk-derive = { workspace = true }
 encoding_rs = { workspace = true }
+fontdb = { workspace = true, optional = true }
 image = { workspace = true, optional = true }
 thiserror = { workspace = true }
+ttf-parser = { workspace = true, optional = true }
 
 [features]
 default = []
-render = ["dep:image"]
+render = ["dep:fontdb", "dep:image", "dep:ttf-parser"]
