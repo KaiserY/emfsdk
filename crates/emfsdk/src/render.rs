@@ -11,11 +11,12 @@ use crate::emfplus::{
     EmfPlusBitmapPayload, EmfPlusBrushData, EmfPlusBrushRef, EmfPlusDrawArcData,
     EmfPlusDrawImageData, EmfPlusDrawImagePointsData, EmfPlusDrawPointsData,
     EmfPlusDrawRectShapeData, EmfPlusDrawStringData, EmfPlusFillPieData, EmfPlusFillRectShapeData,
-    EmfPlusFontObject, EmfPlusImageData, EmfPlusImageObject, EmfPlusObjectData,
-    EmfPlusObjectRecordData, EmfPlusPathObject, EmfPlusPathPointType, EmfPlusPathPointTypeFlags,
-    EmfPlusPathPointTypeValue, EmfPlusPathPointTypes, EmfPlusPenObject, EmfPlusPointData,
-    EmfPlusRecord, EmfPlusRecordData, EmfPlusRotateWorldTransformData,
-    EmfPlusScaleWorldTransformData, EmfPlusTranslateWorldTransformData,
+    EmfPlusFontObject, EmfPlusImageData, EmfPlusImageObject, EmfPlusObjectAssembler,
+    EmfPlusObjectData, EmfPlusObjectRecordData, EmfPlusPathObject, EmfPlusPathPointType,
+    EmfPlusPathPointTypeFlags, EmfPlusPathPointTypeValue, EmfPlusPathPointTypes, EmfPlusPenObject,
+    EmfPlusPointData, EmfPlusRecord, EmfPlusRecordData, EmfPlusRecordType,
+    EmfPlusRotateWorldTransformData, EmfPlusScaleWorldTransformData,
+    EmfPlusTranslateWorldTransformData,
 };
 use crate::wmf::{
     WmfBrushStyle, WmfEscapeData, WmfMetafile, WmfPenLineStyle, WmfRecordData,
@@ -607,7 +608,7 @@ struct EmfVectorState {
     clip_mask: Option<Vec<bool>>,
     saved_states: Vec<EmfVectorSnapshot>,
     emf_plus_objects: Vec<Option<EmfPlusRenderObject>>,
-    emf_plus_multipart: Option<EmfPlusMultipartObject>,
+    emf_plus_object_assembler: EmfPlusObjectAssembler,
     font_cache: RenderFontCache,
     rgb: Vec<u8>,
 }
@@ -719,14 +720,6 @@ impl EmfPlusRenderBrush {
             }
         }
     }
-}
-
-#[derive(Clone, Debug)]
-struct EmfPlusMultipartObject {
-    object_id: u8,
-    object_type_raw: u8,
-    total_size: usize,
-    data: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -910,7 +903,7 @@ impl EmfVectorState {
             clip_mask: None,
             saved_states: Vec::new(),
             emf_plus_objects: Vec::new(),
-            emf_plus_multipart: None,
+            emf_plus_object_assembler: EmfPlusObjectAssembler::default(),
             font_cache: RenderFontCache::load(),
             rgb: vec![255; width * height * RGB_BYTES_PER_PIXEL],
         })
@@ -2103,7 +2096,7 @@ impl WmfRenderState {
                 clip_mask: None,
                 saved_states: Vec::new(),
                 emf_plus_objects: Vec::new(),
-                emf_plus_multipart: None,
+                emf_plus_object_assembler: EmfPlusObjectAssembler::default(),
                 font_cache: RenderFontCache::load(),
                 rgb: vec![255; width * height * RGB_BYTES_PER_PIXEL],
             },
@@ -2764,10 +2757,14 @@ fn process_emf_plus_comment(
         }
         let record_bytes = &data[cursor..cursor + size];
         let mut reader = Reader::new(std::io::Cursor::new(record_bytes));
-        if let Ok(record) = EmfPlusRecord::read_from(&mut reader, record_bytes.len() as u64)
-            && let Ok(parsed) = record.parse_data()
-        {
-            process_emf_plus_record(parsed, state)?;
+        if let Ok(record) = EmfPlusRecord::read_from(&mut reader, record_bytes.len() as u64) {
+            if record.record_kind() == Some(EmfPlusRecordType::Object) {
+                if let Ok(fragment) = record.object_fragment() {
+                    process_emf_plus_object(fragment, state)?;
+                }
+            } else if let Ok(parsed) = record.parse_data() {
+                process_emf_plus_record(parsed, state)?;
+            }
         }
         cursor += size;
     }
@@ -2779,7 +2776,7 @@ fn process_emf_plus_record(
     state: &mut EmfVectorState,
 ) -> Result<(), String> {
     match record {
-        EmfPlusRecordData::Object(value) => process_emf_plus_object(value, state),
+        EmfPlusRecordData::Object(value) => process_emf_plus_object(value, state)?,
         EmfPlusRecordData::Clear(value) => {
             let color = emf_plus_argb_to_color(value.color);
             for y in 0..state.height {
@@ -2997,54 +2994,18 @@ fn process_emf_plus_record(
     Ok(())
 }
 
-fn process_emf_plus_object(value: EmfPlusObjectRecordData, state: &mut EmfVectorState) {
-    if value.continues || state.emf_plus_multipart.is_some() {
-        process_emf_plus_multipart_object(value, state);
-        return;
+fn process_emf_plus_object(
+    value: EmfPlusObjectRecordData,
+    state: &mut EmfVectorState,
+) -> Result<(), String> {
+    match state.emf_plus_object_assembler.push(value) {
+        Ok(Some(complete)) => process_complete_emf_plus_object(complete, state),
+        Ok(None) => {}
+        Err(_) => {
+            state.emf_plus_object_assembler = EmfPlusObjectAssembler::default();
+        }
     }
-    process_complete_emf_plus_object(value, state);
-}
-
-fn process_emf_plus_multipart_object(value: EmfPlusObjectRecordData, state: &mut EmfVectorState) {
-    if value.continues && value.total_object_size.is_some() {
-        state.emf_plus_multipart = Some(EmfPlusMultipartObject {
-            object_id: value.object_id,
-            object_type_raw: value.object_type_raw,
-            total_size: value.total_object_size.unwrap_or(0) as usize,
-            data: value.object_data,
-        });
-        return;
-    }
-
-    let Some(mut multipart) = state.emf_plus_multipart.take() else {
-        process_complete_emf_plus_object(value, state);
-        return;
-    };
-    if multipart.object_id != value.object_id || multipart.object_type_raw != value.object_type_raw
-    {
-        state.emf_plus_multipart = Some(multipart);
-        return;
-    }
-
-    multipart.data.extend_from_slice(&value.object_data);
-    if value.continues && multipart.data.len() < multipart.total_size {
-        state.emf_plus_multipart = Some(multipart);
-        return;
-    }
-
-    if multipart.total_size != 0 && multipart.data.len() > multipart.total_size {
-        multipart.data.truncate(multipart.total_size);
-    }
-    process_complete_emf_plus_object(
-        EmfPlusObjectRecordData {
-            object_id: multipart.object_id,
-            object_type_raw: multipart.object_type_raw,
-            continues: false,
-            total_object_size: None,
-            object_data: multipart.data,
-        },
-        state,
-    );
+    Ok(())
 }
 
 fn process_complete_emf_plus_object(value: EmfPlusObjectRecordData, state: &mut EmfVectorState) {
@@ -4716,9 +4677,12 @@ mod tests {
             raster_operation: 0x00CC_0020,
             dest_size: SizeL { cx: 2, cy: 2 },
             bitmap: EmrBitmapBuffer {
+                undefined_space_before_bitmap_info: Vec::new(),
                 bitmap_info,
+                undefined_space_before_bitmap_bits: Vec::new(),
                 bitmap_bits,
             },
+            padding: Vec::new(),
         })
         .to_record()
         .unwrap()

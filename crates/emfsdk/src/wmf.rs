@@ -1247,6 +1247,10 @@ impl WmfRecord {
         WmfRecordData::from_record(self)
     }
 
+    pub fn rebuild_typed(&self) -> Result<Self> {
+        self.parse_data()?.to_record_with_function(self.function)
+    }
+
     pub fn read_from<R: std::io::Read + std::io::Seek>(
         reader: &mut Reader<R>,
         file_len: u64,
@@ -1794,6 +1798,21 @@ impl<'a> WmfRecordData<'a> {
                 (*record).clone()
             }
         })
+    }
+
+    pub fn to_record_with_function(&self, function: u16) -> Result<WmfRecord> {
+        let mut record = self.to_record()?;
+        record.function = function;
+        {
+            let reparsed = record.parse_data()?;
+            if reparsed != *self {
+                return Err(Error::invalid(
+                    0,
+                    "WMF RecordFunction does not identify the supplied typed record data",
+                ));
+            }
+        }
+        Ok(record)
     }
 }
 
@@ -3577,6 +3596,165 @@ pub enum WmfEscapeData<'a> {
     },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WmfEnhancedMetafile {
+    pub version: u32,
+    pub checksum: u16,
+    pub data: Vec<u8>,
+}
+
+impl WmfEnhancedMetafile {
+    pub fn computed_checksum(&self) -> Result<u16> {
+        compute_enhanced_metafile_checksum(&self.data)
+    }
+
+    pub fn parse_emf(&self) -> Result<crate::emf::EmfMetafile> {
+        crate::emf::EmfMetafile::from_bytes(&self.data)
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct WmfEnhancedMetafileAssembler {
+    state: Option<WmfEnhancedMetafileAssembly>,
+}
+
+#[derive(Clone, Debug)]
+struct WmfEnhancedMetafileAssembly {
+    version: u32,
+    checksum: u16,
+    record_count: u32,
+    records_seen: u32,
+    total_size: u32,
+    data: Vec<u8>,
+}
+
+impl WmfEnhancedMetafileAssembler {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn push(&mut self, record: &WmfEscapeRecord) -> Result<Option<WmfEnhancedMetafile>> {
+        let WmfEscapeData::EnhancedMetafile {
+            version,
+            checksum,
+            comment_record_count,
+            current_record_size,
+            remaining_bytes,
+            enhanced_metafile_data_size,
+            enhanced_metafile_data,
+            ..
+        } = record.typed_data()?
+        else {
+            return Err(Error::invalid(
+                0,
+                "WMF enhanced-metafile assembler requires META_ESCAPE_ENHANCED_METAFILE",
+            ));
+        };
+
+        let state = self
+            .state
+            .get_or_insert_with(|| WmfEnhancedMetafileAssembly {
+                version,
+                checksum,
+                record_count: comment_record_count,
+                records_seen: 0,
+                total_size: enhanced_metafile_data_size,
+                data: Vec::with_capacity(enhanced_metafile_data_size as usize),
+            });
+        if state.version != version
+            || state.checksum != checksum
+            || state.record_count != comment_record_count
+            || state.total_size != enhanced_metafile_data_size
+        {
+            return Err(Error::invalid(
+                0,
+                "META_ESCAPE_ENHANCED_METAFILE sequence metadata changed between chunks",
+            ));
+        }
+        if state.records_seen >= state.record_count {
+            return Err(Error::invalid(
+                0,
+                "META_ESCAPE_ENHANCED_METAFILE has more chunks than CommentRecordCount",
+            ));
+        }
+        if current_record_size as usize != enhanced_metafile_data.len() {
+            return Err(Error::invalid(
+                0,
+                "META_ESCAPE_ENHANCED_METAFILE CurrentRecordSize does not match chunk data",
+            ));
+        }
+        let accumulated = state
+            .data
+            .len()
+            .checked_add(enhanced_metafile_data.len())
+            .ok_or_else(|| Error::invalid(0, "embedded EMF size overflows"))?;
+        let expected_remaining = (state.total_size as usize)
+            .checked_sub(accumulated)
+            .ok_or_else(|| Error::invalid(0, "embedded EMF chunks exceed total size"))?;
+        if remaining_bytes as usize != expected_remaining {
+            return Err(Error::invalid(
+                0,
+                "META_ESCAPE_ENHANCED_METAFILE RemainingBytes is inconsistent",
+            ));
+        }
+        state.data.extend_from_slice(enhanced_metafile_data);
+        state.records_seen += 1;
+
+        if state.records_seen == state.record_count {
+            if remaining_bytes != 0 || state.data.len() != state.total_size as usize {
+                return Err(Error::invalid(
+                    0,
+                    "META_ESCAPE_ENHANCED_METAFILE final chunk does not complete the stream",
+                ));
+            }
+            let state = self.state.take().expect("assembly state was initialized");
+            let value = WmfEnhancedMetafile {
+                version: state.version,
+                checksum: state.checksum,
+                data: state.data,
+            };
+            if value.checksum != value.computed_checksum()? {
+                return Err(Error::invalid(
+                    0,
+                    "META_ESCAPE_ENHANCED_METAFILE Checksum is invalid",
+                ));
+            }
+            Ok(Some(value))
+        } else if remaining_bytes == 0 {
+            Err(Error::invalid(
+                0,
+                "META_ESCAPE_ENHANCED_METAFILE ended before CommentRecordCount chunks",
+            ))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn finish(&self) -> Result<()> {
+        if self.state.is_none() {
+            Ok(())
+        } else {
+            Err(Error::invalid(
+                0,
+                "META_ESCAPE_ENHANCED_METAFILE sequence is incomplete",
+            ))
+        }
+    }
+}
+
+pub fn compute_enhanced_metafile_checksum(data: &[u8]) -> Result<u16> {
+    if !data.len().is_multiple_of(2) {
+        return Err(Error::invalid(
+            0,
+            "embedded EMF stream must contain complete WORDs",
+        ));
+    }
+    let xor = data.chunks_exact(2).fold(0u16, |value, word| {
+        value ^ u16::from_le_bytes([word[0], word[1]])
+    });
+    Ok(!xor)
+}
+
 impl WmfEscapeData<'_> {
     pub const fn escape_kind(&self) -> WmfMetafileEscape {
         match self {
@@ -4730,12 +4908,6 @@ fn validate_wmf_font_object(value: &WmfFontObject) -> Result<()> {
     if value.strike_out > 1 {
         return Err(Error::invalid(0, "WMF Font StrikeOut must be a Boolean"));
     }
-    if value.char_set_kind().is_none() {
-        return Err(Error::invalid(
-            0,
-            "WMF Font CharSet is not a valid CharacterSet",
-        ));
-    }
     if value.out_precision_kind().is_none() {
         return Err(Error::invalid(
             0,
@@ -5738,6 +5910,17 @@ mod tests {
             panic!("expected normalized META_SETBKMODE");
         };
         assert_eq!(value.mix_mode_kind(), Some(WmfMixMode::Opaque));
+        assert_eq!(
+            high_byte_variant.rebuild_typed().unwrap(),
+            high_byte_variant
+        );
+        assert!(
+            high_byte_variant
+                .parse_data()
+                .unwrap()
+                .to_record_with_function(WmfRecordFunction::SetMapMode.raw())
+                .is_err()
+        );
         let accepted_high_byte_variant = WmfRecord::new(0x9922, Vec::new());
         assert_eq!(
             accepted_high_byte_variant.normalized_function_kind(),
@@ -6755,6 +6938,56 @@ mod tests {
         );
         assert_eq!(parsed, enhanced);
 
+        let embedded = [1, 0, 2, 0, 3, 0];
+        let checksum = compute_enhanced_metafile_checksum(&embedded).unwrap();
+        let first_chunk = WmfEscapeRecord::from_typed_data(
+            WmfEscapeData::EnhancedMetafile {
+                comment_identifier: WMF_EMF_COMMENT_IDENTIFIER,
+                comment_type: WMF_EMF_COMMENT_TYPE,
+                version: WMF_EMF_INTEROP_VERSION,
+                checksum,
+                flags: 0,
+                comment_record_count: 2,
+                current_record_size: 2,
+                remaining_bytes: 4,
+                enhanced_metafile_data_size: 6,
+                enhanced_metafile_data: &embedded[..2],
+            },
+            Vec::new(),
+        )
+        .unwrap();
+        let second_chunk = WmfEscapeRecord::from_typed_data(
+            WmfEscapeData::EnhancedMetafile {
+                comment_identifier: WMF_EMF_COMMENT_IDENTIFIER,
+                comment_type: WMF_EMF_COMMENT_TYPE,
+                version: WMF_EMF_INTEROP_VERSION,
+                checksum,
+                flags: 0,
+                comment_record_count: 2,
+                current_record_size: 4,
+                remaining_bytes: 0,
+                enhanced_metafile_data_size: 6,
+                enhanced_metafile_data: &embedded[2..],
+            },
+            Vec::new(),
+        )
+        .unwrap();
+        let mut assembler = WmfEnhancedMetafileAssembler::new();
+        assert_eq!(assembler.push(&first_chunk).unwrap(), None);
+        assert!(assembler.finish().is_err());
+        let assembled = assembler.push(&second_chunk).unwrap().unwrap();
+        assert_eq!(assembled.data, embedded);
+        assert_eq!(assembled.computed_checksum().unwrap(), checksum);
+        assert!(assembler.finish().is_ok());
+
+        let mut invalid_checksum = first_chunk.clone();
+        invalid_checksum.escape_data[12..14].copy_from_slice(&0_u16.to_le_bytes());
+        let mut assembler = WmfEnhancedMetafileAssembler::new();
+        assembler.push(&invalid_checksum).unwrap();
+        let mut invalid_checksum = second_chunk.clone();
+        invalid_checksum.escape_data[12..14].copy_from_slice(&0_u16.to_le_bytes());
+        assert!(assembler.push(&invalid_checksum).is_err());
+
         let enhanced_non_wmfc = WmfRecord::new(
             WmfRecordFunction::Escape.raw(),
             [
@@ -7504,6 +7737,20 @@ mod tests {
         assert_eq!(pitch_and_family.family_kind(), Some(WmfFamilyFont::Swiss));
         assert_eq!(pitch_and_family.reserved_bits(), 0);
         assert_eq!(parsed.to_record().unwrap(), create_font);
+        let mut vendor_char_set = create_font.clone();
+        vendor_char_set.data[13] = 0xFE;
+        let WmfRecordData::CreateFontIndirect(vendor_font) = vendor_char_set.parse_data().unwrap()
+        else {
+            panic!("expected META_CREATEFONTINDIRECT");
+        };
+        assert_eq!(vendor_font.char_set, 0xFE);
+        assert_eq!(vendor_font.char_set_kind(), None);
+        assert_eq!(
+            WmfRecordData::CreateFontIndirect(vendor_font)
+                .to_record()
+                .unwrap(),
+            vendor_char_set
+        );
         let mut invalid_weight = create_font.clone();
         invalid_weight.data[8..10].copy_from_slice(&1001_i16.to_le_bytes());
         assert!(invalid_weight.parse_data().is_err());

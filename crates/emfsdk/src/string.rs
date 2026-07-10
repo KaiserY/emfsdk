@@ -8,6 +8,7 @@ use crate::common::{Error, Reader, Result};
 pub enum SdkEncoding {
     Utf8,
     Utf16Le,
+    UnicodeLowByte,
     Windows1252,
     CodePage(u16),
     WmfCharset(u8),
@@ -18,6 +19,7 @@ impl SdkEncoding {
         match self {
             Self::Utf8 => "utf-8".to_string(),
             Self::Utf16Le => "utf-16le".to_string(),
+            Self::UnicodeLowByte => "unicode-low-byte".to_string(),
             Self::Windows1252 => "windows-1252".to_string(),
             Self::CodePage(code_page) => format!("cp{code_page}"),
             Self::WmfCharset(charset) => format!("wmf-charset-{charset}"),
@@ -28,6 +30,10 @@ impl SdkEncoding {
         match self {
             Self::Utf8 => Ok(UTF_8),
             Self::Utf16Le => Ok(UTF_16LE),
+            Self::UnicodeLowByte => Err(Error::encoding(
+                self.label(),
+                "Unicode low-byte strings use the SDK's direct byte mapping",
+            )),
             Self::Windows1252 => Ok(WINDOWS_1252),
             Self::CodePage(code_page) => code_page_encoding(code_page).ok_or_else(|| {
                 Error::encoding(
@@ -53,6 +59,9 @@ impl SdkEncoding {
     }
 
     pub fn decode(self, bytes: &[u8]) -> Result<String> {
+        if self == Self::UnicodeLowByte {
+            return Ok(bytes.iter().map(|value| char::from(*value)).collect());
+        }
         let (text, _, had_errors) = self.encoding_rs()?.decode(bytes);
         if had_errors {
             return Err(Error::encoding(
@@ -64,6 +73,16 @@ impl SdkEncoding {
     }
 
     pub fn encode(self, value: &str) -> Result<Vec<u8>> {
+        if self == Self::UnicodeLowByte {
+            return value
+                .chars()
+                .map(|character| {
+                    u8::try_from(u32::from(character)).map_err(|_| {
+                        Error::encoding(self.label(), "string contains a character above U+00FF")
+                    })
+                })
+                .collect();
+        }
         let (bytes, _, had_errors) = self.encoding_rs()?.encode(value);
         if had_errors {
             return Err(Error::encoding(
@@ -221,5 +240,18 @@ mod tests {
         let mut value = SdkString::raw(b"abc".to_vec(), SdkEncoding::Utf8);
         value.to_mut_string().unwrap().push('d');
         assert_eq!(value.encoded_bytes().unwrap().as_ref(), b"abcd");
+    }
+
+    #[test]
+    fn unicode_low_byte_does_not_apply_windows_1252_remapping() {
+        assert_eq!(
+            SdkEncoding::UnicodeLowByte.decode(&[0x80]).unwrap(),
+            "\u{80}"
+        );
+        assert_eq!(
+            SdkEncoding::UnicodeLowByte.encode("\u{80}\u{ff}").unwrap(),
+            [0x80, 0xFF]
+        );
+        assert!(SdkEncoding::UnicodeLowByte.encode("\u{100}").is_err());
     }
 }

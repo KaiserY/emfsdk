@@ -1097,6 +1097,117 @@ pub struct EmfPlusObjectRecordData {
     pub object_data: Vec<u8>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EmfPlusObjectAssembler {
+    pending: Option<EmfPlusPendingObject>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct EmfPlusPendingObject {
+    object_id: u8,
+    object_type_raw: u8,
+    total_object_size: usize,
+    object_data: Vec<u8>,
+}
+
+impl EmfPlusObjectAssembler {
+    pub fn push(
+        &mut self,
+        fragment: EmfPlusObjectRecordData,
+    ) -> Result<Option<EmfPlusObjectRecordData>> {
+        validate_emf_plus_object_fragment(&fragment)?;
+
+        if self.pending.is_none() {
+            if !fragment.continues {
+                fragment.parse_object_data()?;
+                return Ok(Some(fragment));
+            }
+            let total_object_size = fragment.total_object_size.ok_or_else(|| {
+                Error::invalid(
+                    0,
+                    "EmfPlusObject continued fragment is missing TotalObjectSize",
+                )
+            })? as usize;
+            if fragment.object_data.len() >= total_object_size {
+                return Err(Error::invalid(
+                    0,
+                    "EmfPlusObject continuation reaches TotalObjectSize before its final fragment",
+                ));
+            }
+            self.pending = Some(EmfPlusPendingObject {
+                object_id: fragment.object_id,
+                object_type_raw: fragment.object_type_raw,
+                total_object_size,
+                object_data: fragment.object_data,
+            });
+            return Ok(None);
+        }
+
+        let pending = self.pending.as_mut().expect("pending object checked above");
+        if fragment.object_id != pending.object_id
+            || fragment.object_type_raw != pending.object_type_raw
+        {
+            return Err(Error::invalid(
+                0,
+                "EmfPlusObject continuation ObjectID or ObjectType changed",
+            ));
+        }
+        if fragment.continues
+            && fragment.total_object_size.map(|value| value as usize)
+                != Some(pending.total_object_size)
+        {
+            return Err(Error::invalid(
+                0,
+                "EmfPlusObject continuation TotalObjectSize changed",
+            ));
+        }
+        pending.object_data.extend_from_slice(&fragment.object_data);
+        if pending.object_data.len() > pending.total_object_size {
+            return Err(Error::invalid(
+                0,
+                "EmfPlusObject continuation exceeds TotalObjectSize",
+            ));
+        }
+        if fragment.continues {
+            if pending.object_data.len() == pending.total_object_size {
+                return Err(Error::invalid(
+                    0,
+                    "EmfPlusObject continuation reaches TotalObjectSize before its final fragment",
+                ));
+            }
+            return Ok(None);
+        }
+        if pending.object_data.len() != pending.total_object_size {
+            return Err(Error::invalid(
+                0,
+                "EmfPlusObject final fragment does not reach TotalObjectSize",
+            ));
+        }
+
+        let pending = self.pending.take().expect("pending object checked above");
+        let complete = EmfPlusObjectRecordData {
+            object_id: pending.object_id,
+            object_type_raw: pending.object_type_raw,
+            continues: false,
+            total_object_size: None,
+            object_data: pending.object_data,
+        };
+        complete.parse_object_data()?;
+        Ok(Some(complete))
+    }
+
+    pub fn finish(&self) -> Result<()> {
+        if self.pending.is_some() {
+            Err(Error::invalid(
+                0,
+                "EmfPlusObject continuation is missing its final fragment",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
 impl EmfPlusObjectRecordData {
     pub fn object_type(&self) -> Option<EmfPlusObjectType> {
         EmfPlusObjectType::from_raw(u16::from(self.object_type_raw))
@@ -4101,8 +4212,56 @@ impl EmfPlusSetTsGraphicsData {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EmfPlusSetTsClipRects {
     Rects(Vec<EmfPlusRectS>),
-    Compressed(Vec<[u8; 4]>),
-    Raw(Vec<u8>),
+    Compressed(Vec<EmfPlusSetTsClipCompressedRect>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EmfPlusSetTsClipCompressedRect {
+    pub left_delta: i8,
+    pub top_delta: i8,
+    pub right_delta: i8,
+    pub bottom_delta: i8,
+}
+
+impl EmfPlusSetTsClipCompressedRect {
+    fn read_from_bytes(bytes: [u8; 4]) -> Result<Self> {
+        let mut values = [0_i8; 4];
+        for (index, byte) in bytes.into_iter().enumerate() {
+            if byte & 0x80 == 0 {
+                return Err(Error::invalid(
+                    0,
+                    "EmfPlusSetTSClip compressed coordinate high bit must be set",
+                ));
+            }
+            values[index] = ((byte << 1) as i8) >> 1;
+        }
+        Ok(Self {
+            left_delta: values[0],
+            top_delta: values[1],
+            right_delta: values[2],
+            bottom_delta: values[3],
+        })
+    }
+
+    fn to_bytes(self) -> Result<[u8; 4]> {
+        let values = [
+            self.left_delta,
+            self.top_delta,
+            self.right_delta,
+            self.bottom_delta,
+        ];
+        let mut bytes = [0_u8; 4];
+        for (index, value) in values.into_iter().enumerate() {
+            if !(-64..=63).contains(&value) {
+                return Err(Error::invalid(
+                    0,
+                    "EmfPlusSetTSClip compressed coordinate is outside -64..=63",
+                ));
+            }
+            bytes[index] = 0x80 | ((value as u8) & 0x7F);
+        }
+        Ok(bytes)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -4130,9 +4289,10 @@ impl EmfPlusSetTsClipData {
         if compressed {
             let mut rects = Vec::with_capacity(usize::from(rect_count));
             for chunk in data.chunks_exact(4) {
-                rects.push(chunk.try_into().map_err(|_| {
+                let bytes = chunk.try_into().map_err(|_| {
                     Error::invalid(0, "EmfPlusSetTSClip compressed rect is malformed")
-                })?);
+                })?;
+                rects.push(EmfPlusSetTsClipCompressedRect::read_from_bytes(bytes)?);
             }
             Ok(Self {
                 compressed,
@@ -4167,11 +4327,10 @@ impl EmfPlusSetTsClipData {
             }
             EmfPlusSetTsClipRects::Compressed(rects) => {
                 for rect in rects {
-                    writer.write_all(rect)?;
+                    writer.write_all(&rect.to_bytes()?)?;
                 }
                 Ok(())
             }
-            EmfPlusSetTsClipRects::Raw(data) => writer.write_all(data),
         }
     }
 
@@ -4179,7 +4338,6 @@ impl EmfPlusSetTsClipData {
         match &self.rects {
             EmfPlusSetTsClipRects::Rects(rects) => rects.len() as u64 * 8,
             EmfPlusSetTsClipRects::Compressed(rects) => rects.len() as u64 * 4,
-            EmfPlusSetTsClipRects::Raw(data) => data.len() as u64,
         }
     }
 
@@ -4518,7 +4676,76 @@ impl EmfPlusRecord {
         EmfPlusRecordType::from_raw(self.record_type)
     }
 
+    pub fn object_fragment(&self) -> Result<EmfPlusObjectRecordData> {
+        if self.record_kind() != Some(EmfPlusRecordType::Object) {
+            return Err(Error::invalid(0, "EMF+ record is not an EmfPlusObject"));
+        }
+        let flags = self.flags();
+        let fragment = EmfPlusObjectRecordData {
+            object_id: flags.object_id(),
+            object_type_raw: flags.object_type_raw(),
+            continues: flags.object_continues(),
+            total_object_size: self.total_object_size,
+            object_data: self.data.clone(),
+        };
+        validate_emf_plus_object_fragment(&fragment)?;
+        Ok(fragment)
+    }
+
+    pub fn from_continued_object(
+        object_id: u8,
+        data: &EmfPlusObjectData,
+        max_data_size: usize,
+    ) -> Result<Vec<Self>> {
+        validate_object_id_u8(object_id, "EmfPlusObject ObjectID")?;
+        if max_data_size == 0 || !max_data_size.is_multiple_of(4) {
+            return Err(Error::invalid(
+                0,
+                "EmfPlusObject continuation data size must be a nonzero multiple of 4",
+            ));
+        }
+        let object_type_raw = data.object_type_raw();
+        if !matches!(
+            EmfPlusObjectType::from_raw(u16::from(object_type_raw)),
+            Some(value) if value != EmfPlusObjectType::Invalid
+        ) {
+            return Err(Error::invalid(0, "EmfPlusObject ObjectType is invalid"));
+        }
+        let object_data = data.to_bytes()?;
+        if !object_data.len().is_multiple_of(4) {
+            return Err(Error::invalid(
+                0,
+                "EmfPlusObject ObjectData must be 32-bit aligned",
+            ));
+        }
+        let total_object_size = len_to_u32(object_data.len(), "EMF+ total object size")?;
+        let chunk_count = object_data.len().div_ceil(max_data_size);
+        let mut records = Vec::with_capacity(chunk_count.max(1));
+        for (index, chunk) in object_data.chunks(max_data_size).enumerate() {
+            let continues = index + 1 < chunk_count;
+            records.push(Self {
+                record_type: EmfPlusRecordType::Object.raw(),
+                flags: u16::from(object_id)
+                    | (u16::from(object_type_raw) << 8)
+                    | if continues { 0x8000 } else { 0 },
+                total_object_size: continues.then_some(total_object_size),
+                data: chunk.to_vec(),
+                padding: Vec::new(),
+            });
+        }
+        if records.is_empty() {
+            return Err(Error::invalid(0, "EmfPlusObject ObjectData is empty"));
+        }
+        Ok(records)
+    }
+
     pub fn parse_data(&self) -> Result<EmfPlusRecordData<'_>> {
+        if !self.data.len().is_multiple_of(4) || !self.padding.is_empty() {
+            return Err(Error::invalid(
+                0,
+                "EMF+ typed record requires 32-bit-aligned DataSize with no outer padding",
+            ));
+        }
         validate_emf_plus_fixed_payload_shape(
             self.record_kind(),
             self.data.len(),
@@ -4555,13 +4782,7 @@ impl EmfPlusRecord {
                     data: self.data.clone(),
                 })
             }
-            Some(EmfPlusRecordType::Object) => EmfPlusRecordData::Object(EmfPlusObjectRecordData {
-                object_id: flags.object_id(),
-                object_type_raw: flags.object_type_raw(),
-                continues: flags.object_continues(),
-                total_object_size: self.total_object_size,
-                object_data: self.data.clone(),
-            }),
+            Some(EmfPlusRecordType::Object) => EmfPlusRecordData::Object(self.object_fragment()?),
             Some(EmfPlusRecordType::Clear) => {
                 EmfPlusRecordData::Clear(read_exact_object(&self.data, "EmfPlusClear")?)
             }
@@ -5318,6 +5539,13 @@ impl EmfPlusRecord {
                     return Ok((*record).clone());
                 }
             }
+        }
+
+        if !record_data.len().is_multiple_of(4) {
+            return Err(Error::invalid(
+                0,
+                "EMF+ typed record DataSize must be 32-bit aligned",
+            ));
         }
 
         Ok(Self {
@@ -8236,7 +8464,6 @@ fn validate_string_format_object(value: &EmfPlusStringFormatObject) -> Result<()
         EmfPlusStringFormatFlags::all().bits(),
         "EmfPlusStringFormat StringFormatFlags",
     )?;
-    validate_language_identifier(value.language_identifier(), "EmfPlusStringFormat Language")?;
     if value.string_alignment_kind().is_none() {
         return Err(Error::invalid(
             0,
@@ -8255,10 +8482,6 @@ fn validate_string_format_object(value: &EmfPlusStringFormatObject) -> Result<()
             "EmfPlusStringFormat DigitSubstitution is invalid",
         ));
     }
-    validate_language_identifier(
-        value.digit_language_identifier(),
-        "EmfPlusStringFormat DigitLanguage",
-    )?;
     if value.hotkey_prefix_kind().is_none() {
         return Err(Error::invalid(
             0,
@@ -8269,17 +8492,6 @@ fn validate_string_format_object(value: &EmfPlusStringFormatObject) -> Result<()
         return Err(Error::invalid(0, "EmfPlusStringFormat Trimming is invalid"));
     }
     validate_empty_trailing_data(&value.trailing_data, "EmfPlusStringFormat")
-}
-
-fn validate_language_identifier(value: EmfPlusLanguageIdentifier, name: &str) -> Result<()> {
-    if value.is_word_sized() {
-        Ok(())
-    } else {
-        Err(Error::invalid(
-            0,
-            format!("{name} high 16 bits must be zero"),
-        ))
-    }
 }
 
 fn validate_unknown_object_data_type(object_type_raw: u8) -> Result<()> {
@@ -8605,6 +8817,31 @@ fn ensure_no_unparsed_optional_data(trailing_data: &[u8], name: &str) -> Result<
     }
 }
 
+fn validate_emf_plus_object_fragment(value: &EmfPlusObjectRecordData) -> Result<()> {
+    validate_object_id_u8(value.object_id, "EmfPlusObject ObjectID")?;
+    match value.object_type() {
+        Some(EmfPlusObjectType::Invalid) | None => {
+            return Err(Error::invalid(0, "EmfPlusObject ObjectType is invalid"));
+        }
+        Some(_) => {}
+    }
+    if value.continues != value.total_object_size.is_some() {
+        return Err(Error::invalid(
+            0,
+            "EmfPlusObject continued flag requires TotalObjectSize",
+        ));
+    }
+    if let Some(total_object_size) = value.total_object_size
+        && u64::from(total_object_size) < value.object_data.len() as u64
+    {
+        return Err(Error::invalid(
+            0,
+            "EmfPlusObject TotalObjectSize is smaller than ObjectData",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_emf_plus_record_data(
     value: &EmfPlusRecordData<'_>,
     flags: EmfPlusRecordFlags,
@@ -8612,27 +8849,7 @@ fn validate_emf_plus_record_data(
     match value {
         EmfPlusRecordData::Header(value) => validate_header_data(value, flags)?,
         EmfPlusRecordData::Object(value) => {
-            validate_object_id_u8(value.object_id, "EmfPlusObject ObjectID")?;
-            if value.continues != value.total_object_size.is_some() {
-                return Err(Error::invalid(
-                    0,
-                    "EmfPlusObject continued flag requires TotalObjectSize",
-                ));
-            }
-            if let Some(total_object_size) = value.total_object_size
-                && u64::from(total_object_size) < value.object_data.len() as u64
-            {
-                return Err(Error::invalid(
-                    0,
-                    "EmfPlusObject TotalObjectSize is smaller than ObjectData",
-                ));
-            }
-            match value.object_type() {
-                Some(EmfPlusObjectType::Invalid) | None => {
-                    return Err(Error::invalid(0, "EmfPlusObject ObjectType is invalid"));
-                }
-                Some(_) => {}
-            }
+            validate_emf_plus_object_fragment(value)?;
             if !value.continues {
                 value.parse_object_data()?;
             }
@@ -8982,12 +9199,9 @@ fn validate_set_ts_clip(value: &EmfPlusSetTsClipData) -> Result<()> {
                     "EmfPlusSetTSClip RectCount does not match compressed rects length",
                 ));
             }
-        }
-        EmfPlusSetTsClipRects::Raw(_) => {
-            return Err(Error::invalid(
-                0,
-                "EmfPlusSetTSClip Raw data must use typed rect data",
-            ));
+            for rect in rects {
+                rect.to_bytes()?;
+            }
         }
     }
     Ok(())
@@ -9084,8 +9298,12 @@ fn validate_color_lookup_table_effect(value: &EmfPlusColorLookupTableEffect) -> 
 }
 
 fn validate_color_matrix_effect(value: &EmfPlusColorMatrixEffect) -> Result<()> {
-    for row in 0..4 {
-        if value.matrix[4][row] != 0.0 {
+    // The wire layout groups Matrix_N_0 through Matrix_N_4, so the outer
+    // index is the second index in the names used by MS-EMFPLUS. The required
+    // zeroes are Matrix_4_0 through Matrix_4_3, not the translation entries
+    // Matrix_0_4 through Matrix_3_4.
+    for column in 0..4 {
+        if value.matrix[column][4] != 0.0 {
             return Err(Error::invalid(
                 0,
                 "ColorMatrixEffect Matrix_4_0 through Matrix_4_3 must be 0.0",
@@ -9355,11 +9573,20 @@ mod tests {
         let records = read_records(&bytes).unwrap();
         assert_eq!(records[0].data, [0xAA, 0xBB]);
         assert_eq!(records[0].padding, [0xCC, 0xDD]);
+        assert!(records[0].parse_data().is_err());
 
         let mut writer = Writer::new(std::io::Cursor::new(Vec::new()));
         records[0].write_to(&mut writer).unwrap();
         assert_eq!(writer.into_inner().into_inner(), bytes);
         assert_eq!(records[0].record_kind(), Some(EmfPlusRecordType::Comment));
+
+        assert!(
+            EmfPlusRecord::from_data(
+                &EmfPlusRecordData::Comment(vec![0xAA, 0xBB]),
+                EmfPlusRecordFlags::empty(),
+            )
+            .is_err()
+        );
 
         let excessive_padding = [
             0x03, 0x40, // Type: Comment
@@ -9580,14 +9807,14 @@ mod tests {
             record_type: 0x7FFF,
             flags: 0,
             total_object_size: None,
-            data: vec![1, 2, 3],
+            data: vec![1, 2, 3, 4],
             padding: Vec::new(),
         };
         let EmfPlusRecordData::Unknown(parsed) = unknown.parse_data().unwrap() else {
             panic!("expected unknown EMF+ record");
         };
         assert_eq!(parsed.record_type, 0x7FFF);
-        assert_eq!(parsed.data, vec![1, 2, 3]);
+        assert_eq!(parsed.data, vec![1, 2, 3, 4]);
     }
 
     #[test]
@@ -11697,7 +11924,12 @@ mod tests {
             EmfPlusRecordData::SetTsClip(EmfPlusSetTsClipData {
                 compressed: true,
                 rect_count: 1,
-                rects: EmfPlusSetTsClipRects::Compressed(vec![[0x10, 0x20, 0x30, 0x40]]),
+                rects: EmfPlusSetTsClipRects::Compressed(vec![EmfPlusSetTsClipCompressedRect {
+                    left_delta: 1,
+                    top_delta: -2,
+                    right_delta: 3,
+                    bottom_delta: 4,
+                }]),
             }),
         ];
         for value in raw_values {
@@ -11743,21 +11975,28 @@ mod tests {
                 &EmfPlusRecordData::SetTsClip(EmfPlusSetTsClipData {
                     compressed: false,
                     rect_count: 1,
-                    rects: EmfPlusSetTsClipRects::Compressed(vec![[0x10, 0x20, 0x30, 0x40]]),
+                    rects: EmfPlusSetTsClipRects::Compressed(vec![
+                        EmfPlusSetTsClipCompressedRect {
+                            left_delta: 1,
+                            top_delta: 2,
+                            right_delta: 3,
+                            bottom_delta: 4,
+                        },
+                    ]),
                 }),
                 EmfPlusRecordFlags::empty(),
             )
             .is_err()
         );
         assert!(
-            EmfPlusRecord::from_data(
-                &EmfPlusRecordData::SetTsClip(EmfPlusSetTsClipData {
-                    compressed: false,
-                    rect_count: 1,
-                    rects: EmfPlusSetTsClipRects::Raw(vec![1, 2, 3, 4]),
-                }),
-                EmfPlusRecordFlags::empty(),
-            )
+            EmfPlusRecord {
+                record_type: EmfPlusRecordType::SetTsClip.raw(),
+                flags: 0x8001,
+                total_object_size: None,
+                data: vec![1, 2, 3, 4],
+                padding: Vec::new(),
+            }
+            .parse_data()
             .is_err()
         );
         let empty_ts_clip = EmfPlusRecordData::SetTsClip(EmfPlusSetTsClipData {
@@ -11774,7 +12013,7 @@ mod tests {
                 &EmfPlusRecordData::SetTsClip(EmfPlusSetTsClipData {
                     compressed: false,
                     rect_count: 0x8000,
-                    rects: EmfPlusSetTsClipRects::Raw(Vec::new()),
+                    rects: EmfPlusSetTsClipRects::Rects(Vec::new()),
                 }),
                 EmfPlusRecordFlags::empty(),
             )
@@ -11809,6 +12048,56 @@ mod tests {
                 1, 2, 3, 4, // ObjectData
             ]
         );
+
+        let brush_data = EmfPlusBrushData::Solid(EmfPlusSolidBrushData {
+            solid_color: EmfPlusArgb {
+                blue: 1,
+                green: 2,
+                red: 3,
+                alpha: 0xFF,
+            },
+            trailing_data: Vec::new(),
+        });
+        let complete_object_data = EmfPlusObjectData::Brush(EmfPlusBrushObject {
+            version: test_graphics_version(),
+            brush_type: EmfPlusBrushType::SolidColor.raw(),
+            brush_data: brush_data.to_bytes().unwrap(),
+        });
+        let complete_bytes = complete_object_data.to_bytes().unwrap();
+        let total_size = complete_bytes.len() as u32;
+        let continued_records =
+            EmfPlusRecord::from_continued_object(6, &complete_object_data, 4).unwrap();
+        assert_eq!(continued_records.len(), 3);
+        assert!(continued_records[0].flags().object_continues());
+        assert!(continued_records[1].flags().object_continues());
+        assert!(!continued_records[2].flags().object_continues());
+        assert_eq!(continued_records[0].total_object_size, Some(total_size));
+        assert_eq!(continued_records[1].total_object_size, Some(total_size));
+        assert_eq!(continued_records[2].total_object_size, None);
+        for record in &continued_records {
+            let mut writer = Writer::new(std::io::Cursor::new(Vec::new()));
+            record.write_to(&mut writer).unwrap();
+        }
+        let fragments = continued_records
+            .iter()
+            .map(EmfPlusRecord::object_fragment)
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        let mut assembler = EmfPlusObjectAssembler::default();
+        assert!(assembler.push(fragments[0].clone()).unwrap().is_none());
+        assert!(assembler.push(fragments[1].clone()).unwrap().is_none());
+        let assembled = assembler.push(fragments[2].clone()).unwrap().unwrap();
+        assert_eq!(assembled.object_data, complete_bytes);
+        assert_eq!(assembled.parse_object_data().unwrap(), complete_object_data);
+        assembler.finish().unwrap();
+
+        let mut incomplete_assembler = EmfPlusObjectAssembler::default();
+        incomplete_assembler.push(fragments[0].clone()).unwrap();
+        assert!(incomplete_assembler.finish().is_err());
+        let mut changed_total_size = fragments[1].clone();
+        changed_total_size.total_object_size = Some(total_size + 4);
+        assert!(incomplete_assembler.push(changed_total_size).is_err());
+
         let invalid_object_type = EmfPlusRecordData::Object(EmfPlusObjectRecordData {
             object_id: 1,
             object_type_raw: EmfPlusObjectType::Invalid.raw() as u8,
@@ -12296,6 +12585,7 @@ mod tests {
         color_matrix[2][2] = 1.0;
         color_matrix[3][3] = 1.0;
         color_matrix[4][4] = 1.0;
+        color_matrix[4][0] = 0.25;
         let color_matrix_effect = EmfPlusImageEffect::ColorMatrix(EmfPlusColorMatrixEffect {
             matrix: color_matrix,
             trailing_data: Vec::new(),
@@ -12311,7 +12601,7 @@ mod tests {
             color_matrix_serializable.buffer
         );
         let mut invalid_color_matrix = color_matrix;
-        invalid_color_matrix[4][2] = 0.5;
+        invalid_color_matrix[2][4] = 0.5;
         assert!(
             EmfPlusImageEffect::ColorMatrix(EmfPlusColorMatrixEffect {
                 matrix: invalid_color_matrix,
@@ -14042,10 +14332,12 @@ mod tests {
 
         let mut invalid_string_format = string_format.clone();
         invalid_string_format.language = 0x0001_0409;
+        assert_eq!(invalid_string_format.language_identifier().high_word(), 1);
+        assert!(!invalid_string_format.language_identifier().is_word_sized());
         assert!(
             EmfPlusObjectData::StringFormat(invalid_string_format)
                 .to_bytes()
-                .is_err()
+                .is_ok()
         );
 
         let mut invalid_string_format = string_format.clone();
@@ -14053,7 +14345,7 @@ mod tests {
         assert!(
             EmfPlusObjectData::StringFormat(invalid_string_format)
                 .to_bytes()
-                .is_err()
+                .is_ok()
         );
 
         let mut invalid_string_format_bytes =
@@ -14061,7 +14353,7 @@ mod tests {
                 .to_bytes()
                 .unwrap();
         invalid_string_format_bytes[8..12].copy_from_slice(&0x0001_0409_u32.to_le_bytes());
-        assert!(
+        assert!(matches!(
             EmfPlusObjectRecordData {
                 object_id: 1,
                 object_type_raw: EmfPlusObjectType::StringFormat.raw() as u8,
@@ -14069,16 +14361,16 @@ mod tests {
                 total_object_size: None,
                 object_data: invalid_string_format_bytes,
             }
-            .parse_object_data()
-            .is_err()
-        );
+            .parse_object_data(),
+            Ok(EmfPlusObjectData::StringFormat(value)) if value.language == 0x0001_0409
+        ));
 
         let mut invalid_string_format_bytes =
             EmfPlusObjectData::StringFormat(string_format.clone())
                 .to_bytes()
                 .unwrap();
         invalid_string_format_bytes[24..28].copy_from_slice(&0x0001_0409_u32.to_le_bytes());
-        assert!(
+        assert!(matches!(
             EmfPlusObjectRecordData {
                 object_id: 1,
                 object_type_raw: EmfPlusObjectType::StringFormat.raw() as u8,
@@ -14086,9 +14378,9 @@ mod tests {
                 total_object_size: None,
                 object_data: invalid_string_format_bytes,
             }
-            .parse_object_data()
-            .is_err()
-        );
+            .parse_object_data(),
+            Ok(EmfPlusObjectData::StringFormat(value)) if value.digit_language == 0x0001_0409
+        ));
 
         let mut invalid_string_format = string_format.clone();
         invalid_string_format.trailing_data = vec![0xAA];

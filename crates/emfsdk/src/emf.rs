@@ -485,6 +485,12 @@ pub enum EmrMapMode {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, SdkEnum)]
 #[sdk(repr = "u32")]
+pub enum EmrMetafileVersion {
+    Enhanced = 0x0001_0000,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, SdkEnum)]
+#[sdk(repr = "u32")]
 pub enum EmrModifyWorldTransformMode {
     Identity = 0x0000_0001,
     LeftMultiply = 0x0000_0002,
@@ -813,6 +819,7 @@ impl EmfMetafile {
         }
         validate_emf_header_handles(header.handles, &self.records)?;
         validate_emf_comment_groups(&self.records)?;
+        validate_emf_path_brackets(&self.records)?;
         Ok(())
     }
 }
@@ -1050,6 +1057,41 @@ fn validate_emf_comment_groups(records: &[EmfRecord]) -> Result<()> {
             0,
             "EMR_COMMENT_BEGINGROUP without matching ENDGROUP",
         ))
+    }
+}
+
+fn validate_emf_path_brackets(records: &[EmfRecord]) -> Result<()> {
+    let mut open = false;
+    for record in records {
+        match record.record_kind() {
+            Some(EmfRecordType::BeginPath) => {
+                if open {
+                    return Err(Error::invalid(
+                        0,
+                        "EMR_BEGINPATH encountered while path bracket construction is open",
+                    ));
+                }
+                open = true;
+            }
+            Some(EmfRecordType::EndPath | EmfRecordType::AbortPath) => {
+                if !open {
+                    return Err(Error::invalid(
+                        0,
+                        "EMR_ENDPATH or EMR_ABORTPATH encountered without EMR_BEGINPATH",
+                    ));
+                }
+                open = false;
+            }
+            _ => {}
+        }
+    }
+    if open {
+        Err(Error::invalid(
+            0,
+            "EMR_BEGINPATH is not closed by EMR_ENDPATH or EMR_ABORTPATH",
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -1980,13 +2022,16 @@ impl LogPalette {
         for _ in 0..entry_count {
             entries.push(LogPaletteEntry::read_from(reader)?);
         }
-        Ok(Self { version, entries })
+        let value = Self { version, entries };
+        validate_log_palette(&value)?;
+        Ok(value)
     }
 
     pub fn write_to<W: std::io::Write + std::io::Seek>(
         &self,
         writer: &mut Writer<W>,
     ) -> Result<()> {
+        validate_log_palette(self)?;
         writer.write_u16(self.version)?;
         writer.write_u16(
             u16::try_from(self.entries.len())
@@ -2594,6 +2639,7 @@ pub struct EmrStrokePath {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+#[sdk(validate = "validate_region_data_header")]
 pub struct RegionDataHeader {
     pub size: u32,
     pub region_type: u32,
@@ -2626,6 +2672,10 @@ impl RegionDataHeader {
         }
         Ok(())
     }
+}
+
+fn validate_region_data_header(value: &RegionDataHeader) -> Result<()> {
+    value.validate()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3103,6 +3153,24 @@ impl EmrCreatePen {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, SdkObject)]
+#[sdk(validate = "validate_log_brush_ex")]
+pub struct LogBrushEx {
+    pub brush_style: u32,
+    pub color: ColorRef,
+    pub brush_hatch: u32,
+}
+
+impl LogBrushEx {
+    pub fn brush_style_kind(&self) -> Option<WmfBrushStyle> {
+        WmfBrushStyle::from_raw(self.brush_style as u16)
+    }
+
+    pub fn brush_hatch_kind(&self) -> Option<EmrHatchStyle> {
+        EmrHatchStyle::from_raw(self.brush_hatch)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
 #[sdk(validate = "validate_emr_create_brush_indirect")]
 pub struct EmrCreateBrushIndirect {
@@ -3113,12 +3181,20 @@ pub struct EmrCreateBrushIndirect {
 }
 
 impl EmrCreateBrushIndirect {
+    pub fn log_brush_ex(&self) -> LogBrushEx {
+        LogBrushEx {
+            brush_style: self.brush_style,
+            color: self.color,
+            brush_hatch: self.brush_hatch,
+        }
+    }
+
     pub fn brush_style_kind(&self) -> Option<WmfBrushStyle> {
-        WmfBrushStyle::from_raw(self.brush_style as u16)
+        self.log_brush_ex().brush_style_kind()
     }
 
     pub fn brush_hatch_kind(&self) -> Option<EmrHatchStyle> {
-        EmrHatchStyle::from_raw(self.brush_hatch)
+        self.log_brush_ex().brush_hatch_kind()
     }
 }
 
@@ -3163,13 +3239,16 @@ impl EmrExtCreatePen {
             return Ok(None);
         }
         let data = self.reconstructed_record_data()?;
-        Ok(Some(read_bitmap_buffer(
+        let (bitmap, _) = read_bitmap_buffer(
             &data,
+            self.bitmap_buffer_data_start(),
             self.bitmap_info_offset as usize,
             self.bitmap_info_size as usize,
             self.bitmap_bits_offset as usize,
             self.bitmap_bits_size as usize,
-        )?))
+            "EMR_EXTCREATEPEN",
+        )?;
+        Ok(Some(bitmap))
     }
 
     pub fn log_pen_ex(&self) -> LogPenEx {
@@ -4102,8 +4181,7 @@ impl EmrCreateColorSpaceW {
             "EMR_CREATECOLORSPACEW profile data size",
         )?)?;
         writer.write_all(&self.data)?;
-        writer.write_all(&self.padding)?;
-        pad_writer_to_4(&mut writer)?;
+        write_emf_record_alignment_padding(&mut writer, &self.padding, "EMR_CREATECOLORSPACEW")?;
         Ok(writer.into_inner().into_inner())
     }
 }
@@ -4802,10 +4880,14 @@ fn validate_emr_create_pen(value: &EmrCreatePen) -> Result<()> {
 
 fn validate_emr_create_brush_indirect(value: &EmrCreateBrushIndirect) -> Result<()> {
     validate_emr_created_object_index(value.object_index, "EMR_CREATEBRUSHINDIRECT", "ihBrush")?;
+    validate_log_brush_ex(&value.log_brush_ex())
+}
+
+fn validate_log_brush_ex(value: &LogBrushEx) -> Result<()> {
     let Some(brush_style) = value.brush_style_kind() else {
         return Err(Error::invalid(
             0,
-            "EMR_CREATEBRUSHINDIRECT BrushStyle is not a valid BrushStyle",
+            "LogBrushEx BrushStyle is not a valid BrushStyle",
         ));
     };
     match brush_style {
@@ -4814,31 +4896,33 @@ fn validate_emr_create_brush_indirect(value: &EmrCreateBrushIndirect) -> Result<
             if value.brush_hatch_kind().is_none() {
                 return Err(Error::invalid(
                     0,
-                    "EMR_CREATEBRUSHINDIRECT BrushHatch is not a valid HatchStyle for BS_HATCHED",
+                    "LogBrushEx BrushHatch is not a valid HatchStyle for BS_HATCHED",
                 ));
             }
             Ok(())
         }
-        _ => Err(Error::invalid(
-            0,
-            "EMR_CREATEBRUSHINDIRECT BrushStyle is not supported by LogBrushEx",
-        )),
+        _ => Err(Error::invalid(0, "LogBrushEx BrushStyle is not supported")),
     }
 }
 
 fn validate_emr_create_palette(value: &EmrCreatePalette) -> Result<()> {
     validate_emr_created_object_index(value.palette_index, "EMR_CREATEPALETTE", "ihPal")?;
-    if value.log_palette.version != 0x0300 {
-        return Err(Error::invalid(
-            0,
-            "EMR_CREATEPALETTE LogPalette Version must be 0x0300",
-        ));
-    }
+    validate_log_palette(&value.log_palette)?;
     if value.log_palette.entries.is_empty() {
         return Err(Error::invalid(
             0,
             "EMR_CREATEPALETTE NumberOfEntries must be nonzero",
         ));
+    }
+    Ok(())
+}
+
+fn validate_log_palette(value: &LogPalette) -> Result<()> {
+    if value.version != 0x0300 {
+        return Err(Error::invalid(0, "LogPalette Version must be 0x0300"));
+    }
+    if value.entries.len() > u16::MAX as usize {
+        return Err(Error::invalid(0, "LogPalette entry count exceeds u16::MAX"));
     }
     Ok(())
 }
@@ -4852,6 +4936,12 @@ fn validate_emr_created_object_index(
         return Err(Error::invalid(
             0,
             format!("{record_name} {field_name} must not be zero"),
+        ));
+    }
+    if EmrStockObject::from_raw(value).is_some() {
+        return Err(Error::invalid(
+            0,
+            format!("{record_name} {field_name} must not be a stock object index"),
         ));
     }
     Ok(())
@@ -5210,7 +5300,7 @@ fn validate_emr_text(value: &EmrText, wide: bool, record_name: &str) -> Result<(
     } else {
         text_bytes.len()
     };
-    if !value.dx.is_empty() {
+    if value.dx_buffer_present {
         let expected_dx = char_count
             .checked_mul(if value.options.contains(ExtTextOutOptions::PDY) {
                 2
@@ -5222,6 +5312,19 @@ fn validate_emr_text(value: &EmrText, wide: bool, record_name: &str) -> Result<(
             return Err(Error::invalid(
                 0,
                 format!("{record_name} dx count does not match character count"),
+            ));
+        }
+    } else {
+        if !value.dx.is_empty() {
+            return Err(Error::invalid(
+                0,
+                format!("{record_name} DxBuffer values require a nonzero offDx"),
+            ));
+        }
+        if !value.undefined_space_before_dx.is_empty() {
+            return Err(Error::invalid(
+                0,
+                format!("{record_name} UndefinedSpace before Dx requires a DxBuffer"),
             ));
         }
     }
@@ -5405,6 +5508,11 @@ fn validate_emr_create_color_space_w(value: &EmrCreateColorSpaceW) -> Result<()>
             "EMR_CREATECOLORSPACEW dwFlags contains invalid bits",
         ));
     }
+    validate_emf_record_alignment_padding(
+        &value.padding,
+        12 + LogColorSpace::sdk_size(520) + value.data.len(),
+        "EMR_CREATECOLORSPACEW",
+    )?;
     Ok(())
 }
 
@@ -5425,13 +5533,9 @@ fn validate_emr_color_match_to_target_w(value: &EmrColorMatchToTargetW) -> Resul
 }
 
 fn validate_emr_comment_multi_formats(value: &EmrCommentMultiFormats) -> Result<()> {
-    if !value.padding.is_empty() {
-        return Err(Error::invalid(
-            0,
-            "EMR_COMMENT_MULTIFORMATS has undeclared trailing data",
-        ));
-    }
     let mut total_size = 0usize;
+    let format_data_start = value.format_data_start_offset()?;
+    let mut ranges = Vec::with_capacity(value.formats.len());
     for (index, format) in value.formats.iter().enumerate() {
         let Some(signature) = format.signature_kind() else {
             return Err(Error::invalid(
@@ -5452,6 +5556,11 @@ fn validate_emr_comment_multi_formats(value: &EmrCommentMultiFormats) -> Result<
             ));
         }
         let format_data = value.format_data_slice(index)?;
+        let start = (format.data_offset - format_data_start) as usize;
+        let end = start
+            .checked_add(format.size_data as usize)
+            .ok_or_else(|| Error::invalid(0, "EMR_COMMENT_MULTIFORMATS data range overflows"))?;
+        ranges.push((start, end));
         if signature == EmrFormatSignature::Eps {
             EmrEpsData::read_data(format_data)?;
         }
@@ -5465,16 +5574,21 @@ fn validate_emr_comment_multi_formats(value: &EmrCommentMultiFormats) -> Result<
             "EMR_COMMENT_MULTIFORMATS FormatData length does not match SizeData",
         ));
     }
+    ranges.sort_unstable();
+    let mut next = 0usize;
+    for (start, end) in ranges {
+        if start != next {
+            return Err(Error::invalid(
+                0,
+                "EMR_COMMENT_MULTIFORMATS data ranges overlap or leave gaps",
+            ));
+        }
+        next = end;
+    }
     Ok(())
 }
 
 fn validate_emr_comment_windows_metafile(value: &EmrCommentWindowsMetafile) -> Result<()> {
-    if !value.padding.is_empty() {
-        return Err(Error::invalid(
-            0,
-            "EMR_COMMENT_WINDOWS_METAFILE has undeclared trailing data",
-        ));
-    }
     if value.version_kind().is_none() {
         return Err(Error::invalid(
             0,
@@ -5503,12 +5617,6 @@ fn validate_emr_comment_windows_metafile(value: &EmrCommentWindowsMetafile) -> R
 }
 
 fn validate_emr_comment_begin_group(value: &EmrCommentBeginGroup) -> Result<()> {
-    if !value.padding.is_empty() {
-        return Err(Error::invalid(
-            0,
-            "EMR_COMMENT_BEGINGROUP has undeclared trailing data",
-        ));
-    }
     let description = value.description.encoded_bytes()?;
     let expected_len = (value.description_chars as usize)
         .checked_mul(2)
@@ -5541,11 +5649,21 @@ fn validate_emr_comment_emf_plus(
     validate_emr_comment_alignment_padding(alignment_padding)
 }
 
-fn validate_emr_comment_emf_spool(spool_identifier: u32, alignment_padding: &[u8]) -> Result<()> {
+fn validate_emr_comment_emf_spool(
+    spool_identifier: u32,
+    data: &[u8],
+    alignment_padding: &[u8],
+) -> Result<()> {
     if spool_identifier != EMR_COMMENT_EMFSPOOL_FONT_DEFINITION {
         return Err(Error::invalid(
             0,
             "EMR_COMMENT_EMFSPOOL identifier must be EMFSPOOL font definition",
+        ));
+    }
+    if data.is_empty() {
+        return Err(Error::invalid(
+            0,
+            "EMR_COMMENT_EMFSPOOL must contain at least one font definition record",
         ));
     }
     validate_emr_comment_alignment_padding(alignment_padding)
@@ -5556,6 +5674,27 @@ fn validate_unknown_public_comment_identifier(identifier: u32, offset: u64) -> R
         return Err(Error::invalid(
             offset,
             "EMR_COMMENT_PUBLIC Unknown comment requires an unknown identifier",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_emr_private_data(data: &[u8], alignment_padding: &[u8]) -> Result<()> {
+    if data.len() >= 4 {
+        return Err(Error::invalid(
+            0,
+            "EMR_COMMENT PrivateData without CommentIdentifier must be shorter than 4 bytes",
+        ));
+    }
+    validate_emr_comment_alignment_padding(alignment_padding)?;
+    let record_data_size = 4usize
+        .checked_add(data.len())
+        .and_then(|size| size.checked_add(alignment_padding.len()))
+        .ok_or_else(|| Error::invalid(0, "EMR_COMMENT size overflows"))?;
+    if !alignment_padding.is_empty() && !record_data_size.is_multiple_of(4) {
+        return Err(Error::invalid(
+            0,
+            "EMR_COMMENT alignment padding does not align the record",
         ));
     }
     Ok(())
@@ -5963,9 +6102,6 @@ fn validate_emr_blend_function(value: &EmrBlendFunction) -> Result<()> {
             0,
             "EMR_ALPHABLEND BlendOperation is invalid",
         ));
-    }
-    if value.blend_flags != 0 {
-        return Err(Error::invalid(0, "EMR_ALPHABLEND BlendFlags must be zero"));
     }
     if value.alpha_format_kind().is_none() {
         return Err(Error::invalid(0, "EMR_ALPHABLEND AlphaFormat is invalid"));
@@ -6406,6 +6542,9 @@ pub struct EmrText {
     pub options: ExtTextOutOptions,
     pub rectangle: Option<RectL>,
     pub text: SdkString,
+    pub undefined_space_before_string: Vec<u8>,
+    pub dx_buffer_present: bool,
+    pub undefined_space_before_dx: Vec<u8>,
     pub dx: Vec<u32>,
 }
 
@@ -6430,8 +6569,28 @@ impl EmrExtTextOut {
         let graphics_mode = reader.read_u32()?;
         let ex_scale = reader.read_f32()?;
         let ey_scale = reader.read_f32()?;
-        let (text, consumed_end) = read_emr_text(&mut reader, data, wide, "EMR_EXTTEXTOUT")?;
-        let highest_consumed = consumed_end.max(reader.position()? as usize);
+        let (mut text, buffer_ranges) = read_emr_text(&mut reader, data, wide, "EMR_EXTTEXTOUT")?;
+        let descriptor_end = reader.position()? as usize;
+        if buffer_ranges.string_start < descriptor_end {
+            return Err(Error::invalid(
+                0,
+                "EMR_EXTTEXTOUT string overlaps the fixed text descriptor",
+            ));
+        }
+        text.undefined_space_before_string =
+            data[descriptor_end..buffer_ranges.string_start].to_vec();
+        text.undefined_space_before_dx = if let Some(dx_start) = buffer_ranges.dx_start {
+            if dx_start < buffer_ranges.string_end {
+                return Err(Error::invalid(
+                    0,
+                    "EMR_EXTTEXTOUT dx buffer overlaps or precedes the string buffer",
+                ));
+            }
+            data[buffer_ranges.string_end..dx_start].to_vec()
+        } else {
+            Vec::new()
+        };
+        let highest_consumed = buffer_ranges.consumed_end().max(descriptor_end);
         let padding = data
             .get(highest_consumed..)
             .ok_or_else(|| Error::invalid(0, "EMR_EXTTEXTOUT data range is out of bounds"))?
@@ -6455,11 +6614,30 @@ impl EmrExtTextOut {
         let text_bytes = self.text.text.encoded_bytes()?;
         let has_rect = self.text.rectangle.is_some();
         let fixed_size = 16 + 4 + 4 + 4 + 8 + 4 + 4 + 4 + if has_rect { 16 } else { 0 } + 4;
-        let string_offset = 8 + fixed_size;
-        let dx_offset = if self.text.dx.is_empty() {
+        let string_offset = 8usize
+            .checked_add(fixed_size)
+            .and_then(|value| value.checked_add(self.text.undefined_space_before_string.len()))
+            .ok_or_else(|| Error::invalid(0, "EMR_EXTTEXTOUT string offset overflows"))?;
+        validate_record_relative_alignment(
+            string_offset,
+            if wide { 2 } else { 1 },
+            "EMR_EXTTEXTOUT offString",
+        )?;
+        let dx_offset = if !self.text.dx_buffer_present {
             0
+        } else if self.text.undefined_space_before_dx.is_empty() {
+            align_to_u32(
+                string_offset
+                    .checked_add(text_bytes.len())
+                    .ok_or_else(|| Error::invalid(0, "EMR_EXTTEXTOUT dx offset overflows"))?,
+            )
         } else {
-            align_to_u32(string_offset + text_bytes.len())
+            let offset = string_offset
+                .checked_add(text_bytes.len())
+                .and_then(|value| value.checked_add(self.text.undefined_space_before_dx.len()))
+                .ok_or_else(|| Error::invalid(0, "EMR_EXTTEXTOUT dx offset overflows"))?;
+            validate_record_relative_alignment(offset, 4, "EMR_EXTTEXTOUT offDx")?;
+            offset
         };
         let mut writer = Writer::new(Cursor::new(Vec::with_capacity(
             fixed_size + text_bytes.len() + self.text.dx.len() * 4 + 4,
@@ -6481,9 +6659,14 @@ impl EmrExtTextOut {
             rectangle.write_to(&mut writer)?;
         }
         writer.write_u32(usize_to_u32(dx_offset, "EMR_EXTTEXTOUT dx offset")?)?;
+        writer.write_all(&self.text.undefined_space_before_string)?;
         writer.write_all(&text_bytes)?;
         if dx_offset != 0 {
-            pad_writer_to_record_offset(&mut writer, dx_offset)?;
+            if self.text.undefined_space_before_dx.is_empty() {
+                pad_writer_to_record_offset(&mut writer, dx_offset)?;
+            } else {
+                writer.write_all(&self.text.undefined_space_before_dx)?;
+            }
             for value in &self.text.dx {
                 writer.write_u32(*value)?;
             }
@@ -6524,15 +6707,37 @@ impl EmrPolyTextOut {
             "EMR_POLYTEXTOUT text headers",
         )?;
         let mut texts = Vec::with_capacity(strings);
-        let mut highest_consumed = reader.position()? as usize;
+        let mut buffer_ranges = Vec::with_capacity(strings);
 
         for _ in 0..strings {
-            let (text, consumed_end) = read_emr_text(&mut reader, data, wide, "EMR_POLYTEXTOUT")?;
-            highest_consumed = highest_consumed.max(consumed_end);
+            let (text, ranges) = read_emr_text(&mut reader, data, wide, "EMR_POLYTEXTOUT")?;
             texts.push(text);
+            buffer_ranges.push(ranges);
         }
 
-        highest_consumed = highest_consumed.max(reader.position()? as usize);
+        let descriptor_end = reader.position()? as usize;
+        let mut highest_consumed = descriptor_end;
+        for (text, ranges) in texts.iter_mut().zip(buffer_ranges) {
+            if ranges.string_start < highest_consumed {
+                return Err(Error::invalid(
+                    0,
+                    "EMR_POLYTEXTOUT string buffers overlap or precede their descriptors",
+                ));
+            }
+            text.undefined_space_before_string =
+                data[highest_consumed..ranges.string_start].to_vec();
+            highest_consumed = ranges.string_end;
+            if let Some(dx_start) = ranges.dx_start {
+                if dx_start < highest_consumed {
+                    return Err(Error::invalid(
+                        0,
+                        "EMR_POLYTEXTOUT dx buffers overlap or precede their strings",
+                    ));
+                }
+                text.undefined_space_before_dx = data[highest_consumed..dx_start].to_vec();
+                highest_consumed = ranges.dx_end.expect("dx end is present with dx start");
+            }
+        }
         let padding = data
             .get(highest_consumed..)
             .ok_or_else(|| Error::invalid(0, "EMR_POLYTEXTOUT data range is out of bounds"))?
@@ -6590,10 +6795,18 @@ impl EmrPolyTextOut {
         }
 
         for (text, layout) in self.texts.iter().zip(&layouts) {
-            pad_writer_to_record_offset(&mut writer, layout.string_offset)?;
+            if text.undefined_space_before_string.is_empty() {
+                pad_writer_to_record_offset(&mut writer, layout.string_offset)?;
+            } else {
+                writer.write_all(&text.undefined_space_before_string)?;
+            }
             writer.write_all(&layout.text_bytes)?;
             if let Some(dx_offset) = layout.dx_offset {
-                pad_writer_to_record_offset(&mut writer, dx_offset)?;
+                if text.undefined_space_before_dx.is_empty() {
+                    pad_writer_to_record_offset(&mut writer, dx_offset)?;
+                } else {
+                    writer.write_all(&text.undefined_space_before_dx)?;
+                }
                 for value in &text.dx {
                     writer.write_u32(*value)?;
                 }
@@ -6638,7 +6851,7 @@ impl EmrSmallTextOut {
             Some(RectL::read_from(&mut reader)?)
         };
         let (encoding, text_len) = if options.contains(ExtTextOutOptions::SMALL_CHARS) {
-            (SdkEncoding::Windows1252, chars)
+            (SdkEncoding::UnicodeLowByte, chars)
         } else {
             (
                 SdkEncoding::Utf16Le,
@@ -6715,8 +6928,17 @@ impl EmrSmallTextOut {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EmrBitmapBuffer {
+    pub undefined_space_before_bitmap_info: Vec<u8>,
     pub bitmap_info: Vec<u8>,
+    pub undefined_space_before_bitmap_bits: Vec<u8>,
     pub bitmap_bits: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EmrBitmapBufferOrder {
+    #[default]
+    SourceThenMask,
+    MaskThenSource,
 }
 
 impl EmrBitmapBuffer {
@@ -6734,6 +6956,7 @@ pub struct EmrCreateMonoBrush {
     pub brush_index: u32,
     pub color_usage: u32,
     pub bitmap: EmrBitmapBuffer,
+    pub padding: Vec<u8>,
 }
 
 impl EmrCreateMonoBrush {
@@ -6742,11 +6965,13 @@ impl EmrCreateMonoBrush {
     }
 
     pub fn read_data(data: &[u8]) -> Result<Self> {
-        let (brush_index, color_usage, bitmap) = read_dib_brush_data(data, "EMR_CREATEMONOBRUSH")?;
+        let (brush_index, color_usage, bitmap, padding) =
+            read_dib_brush_data(data, "EMR_CREATEMONOBRUSH")?;
         Ok(Self {
             brush_index,
             color_usage,
             bitmap,
+            padding,
         })
     }
 
@@ -6755,6 +6980,7 @@ impl EmrCreateMonoBrush {
             self.brush_index,
             self.color_usage,
             &self.bitmap,
+            &self.padding,
             "EMR_CREATEMONOBRUSH",
         )
     }
@@ -6765,6 +6991,7 @@ pub struct EmrCreateDibPatternBrushPt {
     pub brush_index: u32,
     pub color_usage: u32,
     pub bitmap: EmrBitmapBuffer,
+    pub padding: Vec<u8>,
 }
 
 impl EmrCreateDibPatternBrushPt {
@@ -6773,12 +7000,13 @@ impl EmrCreateDibPatternBrushPt {
     }
 
     pub fn read_data(data: &[u8]) -> Result<Self> {
-        let (brush_index, color_usage, bitmap) =
+        let (brush_index, color_usage, bitmap, padding) =
             read_dib_brush_data(data, "EMR_CREATEDIBPATTERNBRUSHPT")?;
         Ok(Self {
             brush_index,
             color_usage,
             bitmap,
+            padding,
         })
     }
 
@@ -6787,12 +7015,16 @@ impl EmrCreateDibPatternBrushPt {
             self.brush_index,
             self.color_usage,
             &self.bitmap,
+            &self.padding,
             "EMR_CREATEDIBPATTERNBRUSHPT",
         )
     }
 }
 
-fn read_dib_brush_data(data: &[u8], record_name: &str) -> Result<(u32, u32, EmrBitmapBuffer)> {
+fn read_dib_brush_data(
+    data: &[u8],
+    record_name: &str,
+) -> Result<(u32, u32, EmrBitmapBuffer, Vec<u8>)> {
     let mut reader = Reader::new(Cursor::new(data));
     let brush_index = reader.read_u32()?;
     validate_emr_created_object_index(brush_index, record_name, "ihBrush")?;
@@ -6802,43 +7034,37 @@ fn read_dib_brush_data(data: &[u8], record_name: &str) -> Result<(u32, u32, EmrB
     let cb_bmi = reader.read_u32()? as usize;
     let off_bits = reader.read_u32()? as usize;
     let cb_bits = reader.read_u32()? as usize;
-    Ok((
-        brush_index,
-        color_usage,
-        read_bitmap_buffer(data, off_bmi, cb_bmi, off_bits, cb_bits)?,
-    ))
+    let (bitmap, bitmap_end) =
+        read_bitmap_buffer(data, 24, off_bmi, cb_bmi, off_bits, cb_bits, record_name)?;
+    let padding = read_bitmap_record_padding(data, bitmap_end, record_name)?;
+    Ok((brush_index, color_usage, bitmap, padding))
 }
 
 fn write_dib_brush_data(
     brush_index: u32,
     color_usage: u32,
     bitmap: &EmrBitmapBuffer,
+    padding: &[u8],
     record_name: &str,
 ) -> Result<Vec<u8>> {
     validate_emr_created_object_index(brush_index, record_name, "ihBrush")?;
     validate_dib_color_usage(color_usage, "EMF DIB brush ColorUsage")?;
-    let fixed = 24usize;
-    let off_bmi = 8 + fixed;
-    let off_bits = align_to_u32(off_bmi + bitmap.bitmap_info.len());
-    let mut writer = Writer::new(Cursor::new(Vec::with_capacity(
-        fixed + bitmap.bitmap_info.len() + bitmap.bitmap_bits.len() + 4,
-    )));
+    let layout = layout_bitmap_buffer(24, bitmap, record_name)?;
+    let mut writer = Writer::new(Cursor::new(Vec::with_capacity(layout.data_end + 3)));
     writer.write_u32(brush_index)?;
     writer.write_u32(color_usage)?;
     writer.write_u32(usize_to_u32(
-        off_bmi,
+        layout.off_bmi,
         format!("{record_name} bitmap info offset"),
     )?)?;
     writer.write_u32(usize_to_u32(bitmap.bitmap_info.len(), "bitmap info size")?)?;
     writer.write_u32(usize_to_u32(
-        off_bits,
+        layout.off_bits,
         format!("{record_name} bitmap bits offset"),
     )?)?;
     writer.write_u32(usize_to_u32(bitmap.bitmap_bits.len(), "bitmap bits size")?)?;
-    writer.write_all(&bitmap.bitmap_info)?;
-    pad_writer_to_record_offset(&mut writer, off_bits)?;
-    writer.write_all(&bitmap.bitmap_bits)?;
-    pad_writer_to_4(&mut writer)?;
+    write_bitmap_buffer(&mut writer, bitmap)?;
+    write_emf_record_alignment_padding(&mut writer, padding, record_name)?;
     Ok(writer.into_inner().into_inner())
 }
 
@@ -6851,6 +7077,7 @@ pub struct EmrSetDiBitsToDevice {
     pub start_scan: u32,
     pub scan_lines: u32,
     pub bitmap: EmrBitmapBuffer,
+    pub padding: Vec<u8>,
 }
 
 impl EmrSetDiBitsToDevice {
@@ -6870,6 +7097,15 @@ impl EmrSetDiBitsToDevice {
         let color_usage = reader.read_u32()?;
         let start_scan = reader.read_u32()?;
         let scan_lines = reader.read_u32()?;
+        let (bitmap, bitmap_end) = read_bitmap_buffer(
+            data,
+            68,
+            off_bmi,
+            cb_bmi,
+            off_bits,
+            cb_bits,
+            "EMR_SETDIBITSTODEVICE",
+        )?;
         let value = Self {
             bounds,
             dest,
@@ -6877,30 +7113,24 @@ impl EmrSetDiBitsToDevice {
             color_usage,
             start_scan,
             scan_lines,
-            bitmap: read_bitmap_buffer(data, off_bmi, cb_bmi, off_bits, cb_bits)?,
+            bitmap,
+            padding: read_bitmap_record_padding(data, bitmap_end, "EMR_SETDIBITSTODEVICE")?,
         };
         validate_dib_color_usage(value.color_usage, "EMR_SETDIBITSTODEVICE ColorUsage")?;
-        validate_bitmap_buffer_tail(
-            data,
-            &[(off_bmi, cb_bmi), (off_bits, cb_bits)],
-            "EMR_SETDIBITSTODEVICE",
-        )?;
         Ok(value)
     }
 
     pub fn to_data(&self) -> Result<Vec<u8>> {
         validate_dib_color_usage(self.color_usage, "EMR_SETDIBITSTODEVICE ColorUsage")?;
-        let fixed = 68usize;
-        let off_bmi = 8 + fixed;
-        let off_bits = align_to_u32(off_bmi + self.bitmap.bitmap_info.len());
+        let layout = layout_bitmap_buffer(68, &self.bitmap, "EMR_SETDIBITSTODEVICE")?;
         let mut writer = Writer::new(Cursor::new(Vec::with_capacity(
-            fixed + self.bitmap.bitmap_info.len() + self.bitmap.bitmap_bits.len() + 4,
+            layout.data_end + self.padding.len() + 3,
         )));
         self.bounds.write_to(&mut writer)?;
         self.dest.write_to(&mut writer)?;
         self.source.write_to(&mut writer)?;
         writer.write_u32(usize_to_u32(
-            off_bmi,
+            layout.off_bmi,
             "EMR_SETDIBITSTODEVICE bitmap info offset",
         )?)?;
         writer.write_u32(usize_to_u32(
@@ -6908,7 +7138,7 @@ impl EmrSetDiBitsToDevice {
             "bitmap info size",
         )?)?;
         writer.write_u32(usize_to_u32(
-            off_bits,
+            layout.off_bits,
             "EMR_SETDIBITSTODEVICE bitmap bits offset",
         )?)?;
         writer.write_u32(usize_to_u32(
@@ -6918,10 +7148,8 @@ impl EmrSetDiBitsToDevice {
         writer.write_u32(self.color_usage)?;
         writer.write_u32(self.start_scan)?;
         writer.write_u32(self.scan_lines)?;
-        writer.write_all(&self.bitmap.bitmap_info)?;
-        pad_writer_to_record_offset(&mut writer, off_bits)?;
-        writer.write_all(&self.bitmap.bitmap_bits)?;
-        pad_writer_to_4(&mut writer)?;
+        write_bitmap_buffer(&mut writer, &self.bitmap)?;
+        write_emf_record_alignment_padding(&mut writer, &self.padding, "EMR_SETDIBITSTODEVICE")?;
         Ok(writer.into_inner().into_inner())
     }
 }
@@ -6935,6 +7163,7 @@ pub struct EmrStretchDiBits {
     pub raster_operation: u32,
     pub dest_size: SizeL,
     pub bitmap: EmrBitmapBuffer,
+    pub padding: Vec<u8>,
 }
 
 impl EmrStretchDiBits {
@@ -6962,6 +7191,15 @@ impl EmrStretchDiBits {
         let color_usage = reader.read_u32()?;
         let raster_operation = reader.read_u32()?;
         let dest_size = SizeL::read_from(&mut reader)?;
+        let (bitmap, bitmap_end) = read_bitmap_buffer(
+            data,
+            72,
+            off_bmi,
+            cb_bmi,
+            off_bits,
+            cb_bits,
+            "EMR_STRETCHDIBITS",
+        )?;
         let value = Self {
             bounds,
             dest,
@@ -6969,30 +7207,24 @@ impl EmrStretchDiBits {
             color_usage,
             raster_operation,
             dest_size,
-            bitmap: read_bitmap_buffer(data, off_bmi, cb_bmi, off_bits, cb_bits)?,
+            bitmap,
+            padding: read_bitmap_record_padding(data, bitmap_end, "EMR_STRETCHDIBITS")?,
         };
         validate_dib_color_usage(value.color_usage, "EMR_STRETCHDIBITS ColorUsage")?;
-        validate_bitmap_buffer_tail(
-            data,
-            &[(off_bmi, cb_bmi), (off_bits, cb_bits)],
-            "EMR_STRETCHDIBITS",
-        )?;
         Ok(value)
     }
 
     pub fn to_data(&self) -> Result<Vec<u8>> {
         validate_dib_color_usage(self.color_usage, "EMR_STRETCHDIBITS ColorUsage")?;
-        let fixed = 72usize;
-        let off_bmi = 8 + fixed;
-        let off_bits = align_to_u32(off_bmi + self.bitmap.bitmap_info.len());
+        let layout = layout_bitmap_buffer(72, &self.bitmap, "EMR_STRETCHDIBITS")?;
         let mut writer = Writer::new(Cursor::new(Vec::with_capacity(
-            fixed + self.bitmap.bitmap_info.len() + self.bitmap.bitmap_bits.len() + 4,
+            layout.data_end + self.padding.len() + 3,
         )));
         self.bounds.write_to(&mut writer)?;
         self.dest.write_to(&mut writer)?;
         self.source.write_to(&mut writer)?;
         writer.write_u32(usize_to_u32(
-            off_bmi,
+            layout.off_bmi,
             "EMR_STRETCHDIBITS bitmap info offset",
         )?)?;
         writer.write_u32(usize_to_u32(
@@ -7000,7 +7232,7 @@ impl EmrStretchDiBits {
             "bitmap info size",
         )?)?;
         writer.write_u32(usize_to_u32(
-            off_bits,
+            layout.off_bits,
             "EMR_STRETCHDIBITS bitmap bits offset",
         )?)?;
         writer.write_u32(usize_to_u32(
@@ -7010,10 +7242,8 @@ impl EmrStretchDiBits {
         writer.write_u32(self.color_usage)?;
         writer.write_u32(self.raster_operation)?;
         self.dest_size.write_to(&mut writer)?;
-        writer.write_all(&self.bitmap.bitmap_info)?;
-        pad_writer_to_record_offset(&mut writer, off_bits)?;
-        writer.write_all(&self.bitmap.bitmap_bits)?;
-        pad_writer_to_4(&mut writer)?;
+        write_bitmap_buffer(&mut writer, &self.bitmap)?;
+        write_emf_record_alignment_padding(&mut writer, &self.padding, "EMR_STRETCHDIBITS")?;
         Ok(writer.into_inner().into_inner())
     }
 }
@@ -7029,6 +7259,7 @@ pub struct EmrBitBlt {
     pub background_color_source: ColorRef,
     pub color_usage: u32,
     pub bitmap: Option<EmrBitmapBuffer>,
+    pub padding: Vec<u8>,
 }
 
 impl EmrBitBlt {
@@ -7058,6 +7289,8 @@ impl EmrBitBlt {
         let cb_bmi = reader.read_u32()? as usize;
         let off_bits = reader.read_u32()? as usize;
         let cb_bits = reader.read_u32()? as usize;
+        let (bitmap, bitmap_end) =
+            read_optional_bitmap_buffer(data, 92, off_bmi, cb_bmi, off_bits, cb_bits)?;
         let value = Self {
             bounds,
             dest,
@@ -7067,16 +7300,10 @@ impl EmrBitBlt {
             xform_source,
             background_color_source,
             color_usage,
-            bitmap: read_optional_bitmap_buffer(data, off_bmi, cb_bmi, off_bits, cb_bits)?,
+            bitmap,
+            padding: read_bitmap_record_padding(data, bitmap_end, "EMR_BITBLT")?,
         };
         validate_dib_color_usage(value.color_usage, "EMR_BITBLT ColorUsage")?;
-        validate_optional_bitmap_record_tail(
-            data,
-            92,
-            value.bitmap.is_some(),
-            &[(off_bmi, cb_bmi), (off_bits, cb_bits)],
-            "EMR_BITBLT",
-        )?;
         validate_optional_source_bitmap(
             value.raster_operation,
             value.bitmap.is_some(),
@@ -7103,6 +7330,7 @@ impl EmrBitBlt {
             self.color_usage,
             None,
             self.bitmap.as_ref(),
+            &self.padding,
             "EMR_BITBLT",
         )
     }
@@ -7120,6 +7348,7 @@ pub struct EmrStretchBlt {
     pub color_usage: u32,
     pub source_size: SizeL,
     pub bitmap: Option<EmrBitmapBuffer>,
+    pub padding: Vec<u8>,
 }
 
 impl EmrStretchBlt {
@@ -7150,6 +7379,8 @@ impl EmrStretchBlt {
         let off_bits = reader.read_u32()? as usize;
         let cb_bits = reader.read_u32()? as usize;
         let source_size = SizeL::read_from(&mut reader)?;
+        let (bitmap, bitmap_end) =
+            read_optional_bitmap_buffer(data, 100, off_bmi, cb_bmi, off_bits, cb_bits)?;
         let value = Self {
             bounds,
             dest,
@@ -7160,16 +7391,10 @@ impl EmrStretchBlt {
             background_color_source,
             color_usage,
             source_size,
-            bitmap: read_optional_bitmap_buffer(data, off_bmi, cb_bmi, off_bits, cb_bits)?,
+            bitmap,
+            padding: read_bitmap_record_padding(data, bitmap_end, "EMR_STRETCHBLT")?,
         };
         validate_dib_color_usage(value.color_usage, "EMR_STRETCHBLT ColorUsage")?;
-        validate_optional_bitmap_record_tail(
-            data,
-            100,
-            value.bitmap.is_some(),
-            &[(off_bmi, cb_bmi), (off_bits, cb_bits)],
-            "EMR_STRETCHBLT",
-        )?;
         validate_optional_source_bitmap(
             value.raster_operation,
             value.bitmap.is_some(),
@@ -7196,6 +7421,7 @@ impl EmrStretchBlt {
             self.color_usage,
             Some(self.source_size),
             self.bitmap.as_ref(),
+            &self.padding,
             "EMR_STRETCHBLT",
         )
     }
@@ -7233,6 +7459,8 @@ pub struct EmrMaskBlt {
     pub mask: PointL,
     pub mask_color_usage: u32,
     pub mask_bitmap: Option<EmrBitmapBuffer>,
+    pub bitmap_order: EmrBitmapBufferOrder,
+    pub padding: Vec<u8>,
 }
 
 impl EmrMaskBlt {
@@ -7264,6 +7492,13 @@ impl EmrMaskBlt {
         let cb_bmi_mask = reader.read_u32()? as usize;
         let off_bits_mask = reader.read_u32()? as usize;
         let cb_bits_mask = reader.read_u32()? as usize;
+        let (source_bitmap, mask_bitmap, bitmap_order, bitmap_end) = read_two_bitmap_buffers(
+            data,
+            120,
+            (off_bmi_src, cb_bmi_src, off_bits_src, cb_bits_src),
+            (off_bmi_mask, cb_bmi_mask, off_bits_mask, cb_bits_mask),
+            "EMR_MASKBLT",
+        )?;
 
         let value = Self {
             bounds,
@@ -7274,35 +7509,13 @@ impl EmrMaskBlt {
             xform_source,
             background_color_source,
             source_color_usage,
-            source_bitmap: read_optional_bitmap_buffer(
-                data,
-                off_bmi_src,
-                cb_bmi_src,
-                off_bits_src,
-                cb_bits_src,
-            )?,
+            source_bitmap,
             mask,
             mask_color_usage,
-            mask_bitmap: read_optional_bitmap_buffer(
-                data,
-                off_bmi_mask,
-                cb_bmi_mask,
-                off_bits_mask,
-                cb_bits_mask,
-            )?,
+            mask_bitmap,
+            bitmap_order,
+            padding: read_bitmap_record_padding(data, bitmap_end, "EMR_MASKBLT")?,
         };
-        validate_optional_bitmap_record_tail(
-            data,
-            120,
-            value.source_bitmap.is_some() || value.mask_bitmap.is_some(),
-            &[
-                (off_bmi_src, cb_bmi_src),
-                (off_bits_src, cb_bits_src),
-                (off_bmi_mask, cb_bmi_mask),
-                (off_bits_mask, cb_bits_mask),
-            ],
-            "EMR_MASKBLT",
-        )?;
         validate_emr_mask_blt(&value)?;
         Ok(value)
     }
@@ -7310,11 +7523,21 @@ impl EmrMaskBlt {
     pub fn to_data(&self) -> Result<Vec<u8>> {
         validate_emr_mask_blt(self)?;
         let fixed = 120usize;
-        let (source_layout, mask_layout) = layout_two_bitmap_buffers(
-            fixed,
-            self.source_bitmap.as_ref(),
-            self.mask_bitmap.as_ref(),
-        );
+        let (source_layout, mask_layout) = match self.bitmap_order {
+            EmrBitmapBufferOrder::SourceThenMask => layout_two_bitmap_buffers(
+                fixed,
+                self.source_bitmap.as_ref(),
+                self.mask_bitmap.as_ref(),
+            )?,
+            EmrBitmapBufferOrder::MaskThenSource => {
+                let (mask_layout, source_layout) = layout_two_bitmap_buffers(
+                    fixed,
+                    self.mask_bitmap.as_ref(),
+                    self.source_bitmap.as_ref(),
+                )?;
+                (source_layout, mask_layout)
+            }
+        };
         let mut writer = Writer::new(Cursor::new(Vec::new()));
         self.bounds.write_to(&mut writer)?;
         self.dest.write_to(&mut writer)?;
@@ -7338,13 +7561,22 @@ impl EmrMaskBlt {
             self.mask_bitmap.as_ref(),
             "EMR_MASKBLT mask",
         )?;
-        write_two_bitmap_buffers(
-            &mut writer,
-            source_layout,
-            self.source_bitmap.as_ref(),
-            mask_layout,
-            self.mask_bitmap.as_ref(),
-        )?;
+        match self.bitmap_order {
+            EmrBitmapBufferOrder::SourceThenMask => write_two_bitmap_buffers(
+                &mut writer,
+                self.source_bitmap.as_ref(),
+                self.mask_bitmap.as_ref(),
+                &self.padding,
+                "EMR_MASKBLT",
+            )?,
+            EmrBitmapBufferOrder::MaskThenSource => write_two_bitmap_buffers(
+                &mut writer,
+                self.mask_bitmap.as_ref(),
+                self.source_bitmap.as_ref(),
+                &self.padding,
+                "EMR_MASKBLT",
+            )?,
+        }
         Ok(writer.into_inner().into_inner())
     }
 }
@@ -7361,6 +7593,8 @@ pub struct EmrPlgBlt {
     pub mask: PointL,
     pub mask_color_usage: u32,
     pub mask_bitmap: Option<EmrBitmapBuffer>,
+    pub bitmap_order: EmrBitmapBufferOrder,
+    pub padding: Vec<u8>,
 }
 
 impl EmrPlgBlt {
@@ -7394,6 +7628,13 @@ impl EmrPlgBlt {
         let cb_bmi_mask = reader.read_u32()? as usize;
         let off_bits_mask = reader.read_u32()? as usize;
         let cb_bits_mask = reader.read_u32()? as usize;
+        let (source_bitmap, mask_bitmap, bitmap_order, bitmap_end) = read_two_bitmap_buffers(
+            data,
+            132,
+            (off_bmi_src, cb_bmi_src, off_bits_src, cb_bits_src),
+            (off_bmi_mask, cb_bmi_mask, off_bits_mask, cb_bits_mask),
+            "EMR_PLGBLT",
+        )?;
 
         let value = Self {
             bounds,
@@ -7402,35 +7643,13 @@ impl EmrPlgBlt {
             xform_source,
             background_color_source,
             source_color_usage,
-            source_bitmap: read_optional_bitmap_buffer(
-                data,
-                off_bmi_src,
-                cb_bmi_src,
-                off_bits_src,
-                cb_bits_src,
-            )?,
+            source_bitmap,
             mask,
             mask_color_usage,
-            mask_bitmap: read_optional_bitmap_buffer(
-                data,
-                off_bmi_mask,
-                cb_bmi_mask,
-                off_bits_mask,
-                cb_bits_mask,
-            )?,
+            mask_bitmap,
+            bitmap_order,
+            padding: read_bitmap_record_padding(data, bitmap_end, "EMR_PLGBLT")?,
         };
-        validate_optional_bitmap_record_tail(
-            data,
-            132,
-            value.source_bitmap.is_some() || value.mask_bitmap.is_some(),
-            &[
-                (off_bmi_src, cb_bmi_src),
-                (off_bits_src, cb_bits_src),
-                (off_bmi_mask, cb_bmi_mask),
-                (off_bits_mask, cb_bits_mask),
-            ],
-            "EMR_PLGBLT",
-        )?;
         validate_emr_plg_blt(&value)?;
         Ok(value)
     }
@@ -7438,11 +7657,21 @@ impl EmrPlgBlt {
     pub fn to_data(&self) -> Result<Vec<u8>> {
         validate_emr_plg_blt(self)?;
         let fixed = 132usize;
-        let (source_layout, mask_layout) = layout_two_bitmap_buffers(
-            fixed,
-            self.source_bitmap.as_ref(),
-            self.mask_bitmap.as_ref(),
-        );
+        let (source_layout, mask_layout) = match self.bitmap_order {
+            EmrBitmapBufferOrder::SourceThenMask => layout_two_bitmap_buffers(
+                fixed,
+                self.source_bitmap.as_ref(),
+                self.mask_bitmap.as_ref(),
+            )?,
+            EmrBitmapBufferOrder::MaskThenSource => {
+                let (mask_layout, source_layout) = layout_two_bitmap_buffers(
+                    fixed,
+                    self.mask_bitmap.as_ref(),
+                    self.source_bitmap.as_ref(),
+                )?;
+                (source_layout, mask_layout)
+            }
+        };
         let mut writer = Writer::new(Cursor::new(Vec::new()));
         self.bounds.write_to(&mut writer)?;
         for point in self.dest {
@@ -7466,13 +7695,22 @@ impl EmrPlgBlt {
             self.mask_bitmap.as_ref(),
             "EMR_PLGBLT mask",
         )?;
-        write_two_bitmap_buffers(
-            &mut writer,
-            source_layout,
-            self.source_bitmap.as_ref(),
-            mask_layout,
-            self.mask_bitmap.as_ref(),
-        )?;
+        match self.bitmap_order {
+            EmrBitmapBufferOrder::SourceThenMask => write_two_bitmap_buffers(
+                &mut writer,
+                self.source_bitmap.as_ref(),
+                self.mask_bitmap.as_ref(),
+                &self.padding,
+                "EMR_PLGBLT",
+            )?,
+            EmrBitmapBufferOrder::MaskThenSource => write_two_bitmap_buffers(
+                &mut writer,
+                self.mask_bitmap.as_ref(),
+                self.source_bitmap.as_ref(),
+                &self.padding,
+                "EMR_PLGBLT",
+            )?,
+        }
         Ok(writer.into_inner().into_inner())
     }
 }
@@ -7508,6 +7746,7 @@ pub struct EmrAlphaBlend {
     pub color_usage: u32,
     pub source_size: SizeL,
     pub bitmap: Option<EmrBitmapBuffer>,
+    pub padding: Vec<u8>,
 }
 
 impl EmrAlphaBlend {
@@ -7530,6 +7769,8 @@ impl EmrAlphaBlend {
         let off_bits = reader.read_u32()? as usize;
         let cb_bits = reader.read_u32()? as usize;
         let source_size = SizeL::read_from(&mut reader)?;
+        let (bitmap, bitmap_end) =
+            read_optional_bitmap_buffer(data, 100, off_bmi, cb_bmi, off_bits, cb_bits)?;
         let value = Self {
             bounds,
             dest,
@@ -7540,15 +7781,9 @@ impl EmrAlphaBlend {
             background_color_source,
             color_usage,
             source_size,
-            bitmap: read_optional_bitmap_buffer(data, off_bmi, cb_bmi, off_bits, cb_bits)?,
+            bitmap,
+            padding: read_bitmap_record_padding(data, bitmap_end, "EMR_ALPHABLEND")?,
         };
-        validate_optional_bitmap_record_tail(
-            data,
-            100,
-            value.bitmap.is_some(),
-            &[(off_bmi, cb_bmi), (off_bits, cb_bits)],
-            "EMR_ALPHABLEND",
-        )?;
         validate_emr_alpha_blend(&value)?;
         Ok(value)
     }
@@ -7571,6 +7806,7 @@ impl EmrAlphaBlend {
             self.color_usage,
             Some(self.source_size),
             self.bitmap.as_ref(),
+            &self.padding,
             "EMR_ALPHABLEND",
         )
     }
@@ -7588,6 +7824,7 @@ pub struct EmrTransparentBlt {
     pub color_usage: u32,
     pub source_size: SizeL,
     pub bitmap: Option<EmrBitmapBuffer>,
+    pub padding: Vec<u8>,
 }
 
 impl EmrTransparentBlt {
@@ -7610,6 +7847,8 @@ impl EmrTransparentBlt {
         let off_bits = reader.read_u32()? as usize;
         let cb_bits = reader.read_u32()? as usize;
         let source_size = SizeL::read_from(&mut reader)?;
+        let (bitmap, bitmap_end) =
+            read_optional_bitmap_buffer(data, 100, off_bmi, cb_bmi, off_bits, cb_bits)?;
         let value = Self {
             bounds,
             dest,
@@ -7620,15 +7859,9 @@ impl EmrTransparentBlt {
             background_color_source,
             color_usage,
             source_size,
-            bitmap: read_optional_bitmap_buffer(data, off_bmi, cb_bmi, off_bits, cb_bits)?,
+            bitmap,
+            padding: read_bitmap_record_padding(data, bitmap_end, "EMR_TRANSPARENTBLT")?,
         };
-        validate_optional_bitmap_record_tail(
-            data,
-            100,
-            value.bitmap.is_some(),
-            &[(off_bmi, cb_bmi), (off_bits, cb_bits)],
-            "EMR_TRANSPARENTBLT",
-        )?;
         validate_emr_transparent_blt(&value)?;
         Ok(value)
     }
@@ -7651,6 +7884,7 @@ impl EmrTransparentBlt {
             self.color_usage,
             Some(self.source_size),
             self.bitmap.as_ref(),
+            &self.padding,
             "EMR_TRANSPARENTBLT",
         )
     }
@@ -8145,6 +8379,10 @@ pub enum EmrComment {
         comment: EmrPublicComment,
         alignment_padding: Vec<u8>,
     },
+    PrivateData {
+        data: Vec<u8>,
+        alignment_padding: Vec<u8>,
+    },
     Raw {
         data_size: u32,
         identifier: u32,
@@ -8155,7 +8393,7 @@ pub enum EmrComment {
 
 impl EmrComment {
     pub fn read_data(data: &[u8]) -> Result<Self> {
-        if data.len() < 8 {
+        if data.len() < 4 {
             return Err(Error::invalid(0, "EMR_COMMENT data is too small"));
         }
         if !data.len().is_multiple_of(4) {
@@ -8163,13 +8401,21 @@ impl EmrComment {
         }
         let mut reader = Reader::new(Cursor::new(data));
         let data_size = reader.read_u32()?;
-        let identifier = reader.read_u32()?;
         if data_size < 4 {
-            return Err(Error::invalid(
-                0,
-                "EMR_COMMENT data size is smaller than its identifier",
-            ));
+            let payload_end = 4usize
+                .checked_add(data_size as usize)
+                .ok_or_else(|| Error::invalid(0, "EMR_COMMENT payload range overflows"))?;
+            let payload = data
+                .get(4..payload_end)
+                .ok_or_else(|| Error::invalid(0, "EMR_COMMENT payload is out of bounds"))?;
+            let alignment_padding = data[payload_end..].to_vec();
+            validate_emr_private_data(payload, &alignment_padding)?;
+            return Ok(Self::PrivateData {
+                data: payload.to_vec(),
+                alignment_padding,
+            });
         }
+        let identifier = reader.read_u32()?;
         let payload_len = data_size as usize - 4;
         let payload_end = 8usize
             .checked_add(payload_len)
@@ -8195,7 +8441,7 @@ impl EmrComment {
             }
             let mut reader = Reader::new(Cursor::new(payload));
             let spool_identifier = reader.read_u32()?;
-            validate_emr_comment_emf_spool(spool_identifier, &alignment_padding)?;
+            validate_emr_comment_emf_spool(spool_identifier, &payload[4..], &alignment_padding)?;
             Ok(Self::EmfSpool {
                 spool_identifier,
                 data: payload[4..].to_vec(),
@@ -8246,7 +8492,7 @@ impl EmrComment {
                 data,
                 alignment_padding,
             } => {
-                validate_emr_comment_emf_spool(*spool_identifier, alignment_padding)?;
+                validate_emr_comment_emf_spool(*spool_identifier, data, alignment_padding)?;
                 let payload_len = 8usize
                     .checked_add(data.len())
                     .ok_or_else(|| Error::invalid(0, "EMR_COMMENT_EMFSPOOL size overflows"))?;
@@ -8277,6 +8523,17 @@ impl EmrComment {
                 write_emr_comment_alignment_padding(&mut writer, alignment_padding)?;
                 Ok(writer.into_inner().into_inner())
             }
+            Self::PrivateData {
+                data,
+                alignment_padding,
+            } => {
+                validate_emr_private_data(data, alignment_padding)?;
+                let mut writer = Writer::new(Cursor::new(Vec::with_capacity(4 + data.len())));
+                writer.write_u32(usize_to_u32(data.len(), "EMR_COMMENT data size")?)?;
+                writer.write_all(data)?;
+                write_emr_comment_alignment_padding(&mut writer, alignment_padding)?;
+                Ok(writer.into_inner().into_inner())
+            }
             Self::Raw {
                 data_size,
                 identifier,
@@ -8303,6 +8560,9 @@ impl EmrComment {
                 alignment_padding, ..
             }
             | Self::Public {
+                alignment_padding, ..
+            }
+            | Self::PrivateData {
                 alignment_padding, ..
             }
             | Self::Raw {
@@ -8354,6 +8614,10 @@ pub struct EmfHeaderExtension2 {
 }
 
 impl EmfHeader {
+    pub fn version_kind(&self) -> Option<EmrMetafileVersion> {
+        EmrMetafileVersion::from_raw(self.version)
+    }
+
     pub fn from_record_data(data: &[u8]) -> Result<Self> {
         if data.len() < (EMF_HEADER_MIN_SIZE as usize - 8) {
             return Err(Error::invalid(8, "EMR_HEADER record data is too small"));
@@ -8599,17 +8863,6 @@ fn ensure_no_data(data: &[u8], record_name: &str) -> Result<()> {
     }
 }
 
-fn validate_record_data_len(data: &[u8], expected_len: usize, record_name: &str) -> Result<()> {
-    if data.len() == expected_len {
-        Ok(())
-    } else {
-        Err(Error::invalid(
-            expected_len as u64,
-            format!("{record_name} record data has undeclared trailing bytes"),
-        ))
-    }
-}
-
 fn ensure_reader_end<R: std::io::Read + std::io::Seek>(
     reader: &mut Reader<R>,
     end: u64,
@@ -8702,7 +8955,7 @@ fn read_emr_text<R: std::io::Read + std::io::Seek>(
     data: &[u8],
     wide: bool,
     record_name: &str,
-) -> Result<(EmrText, usize)> {
+) -> Result<(EmrText, EmrTextBufferRanges)> {
     let descriptor_start = reader.position()?;
     let descriptor = peek_emr_text_descriptor(reader)?;
     if descriptor.options.contains(ExtTextOutOptions::NO_RECT) {
@@ -8773,7 +9026,7 @@ fn read_emr_text_with_rectangle<R: std::io::Read + std::io::Seek>(
     wide: bool,
     record_name: &str,
     include_rectangle: bool,
-) -> Result<(EmrText, usize)> {
+) -> Result<(EmrText, EmrTextBufferRanges)> {
     let reference = PointL::read_from(reader)?;
     let chars = reader.read_u32()? as usize;
     let string_offset = reader.read_u32()? as usize;
@@ -8809,7 +9062,7 @@ fn read_emr_text_with_rectangle<R: std::io::Read + std::io::Seek>(
             SdkEncoding::Windows1252
         },
     );
-    let mut consumed_end = string_end;
+    let mut dx_range = None;
 
     let dx = if dx_offset == 0 {
         Vec::new()
@@ -8836,7 +9089,7 @@ fn read_emr_text_with_rectangle<R: std::io::Read + std::io::Seek>(
         for _ in 0..dx_count {
             values.push(dx_reader.read_u32()?);
         }
-        consumed_end = consumed_end.max(dx_end);
+        dx_range = Some((dx_start, dx_end));
         values
     };
 
@@ -8846,10 +9099,32 @@ fn read_emr_text_with_rectangle<R: std::io::Read + std::io::Seek>(
             options,
             rectangle,
             text,
+            undefined_space_before_string: Vec::new(),
+            dx_buffer_present: dx_offset != 0,
+            undefined_space_before_dx: Vec::new(),
             dx,
         },
-        consumed_end,
+        EmrTextBufferRanges {
+            string_start,
+            string_end,
+            dx_start: dx_range.map(|(start, _)| start),
+            dx_end: dx_range.map(|(_, end)| end),
+        },
     ))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EmrTextBufferRanges {
+    string_start: usize,
+    string_end: usize,
+    dx_start: Option<usize>,
+    dx_end: Option<usize>,
+}
+
+impl EmrTextBufferRanges {
+    fn consumed_end(self) -> usize {
+        self.string_end.max(self.dx_end.unwrap_or(0))
+    }
 }
 
 struct EmrTextLayout {
@@ -8879,7 +9154,7 @@ fn layout_emr_texts(
         } else {
             text_bytes.len()
         };
-        if !text.dx.is_empty() {
+        if text.dx_buffer_present {
             let expected_dx = char_count
                 .checked_mul(if text.options.contains(ExtTextOutOptions::PDY) {
                     2
@@ -8899,18 +9174,34 @@ fn layout_emr_texts(
 
     let mut layouts = Vec::with_capacity(texts.len());
     for ((text_bytes, char_count), text) in encoded.into_iter().zip(texts) {
-        if wide {
+        if text.undefined_space_before_string.is_empty() && wide {
             current = align_to_u16(current);
+        } else {
+            current = current
+                .checked_add(text.undefined_space_before_string.len())
+                .ok_or_else(|| Error::invalid(0, "EMR text string offset overflows"))?;
         }
+        validate_record_relative_alignment(
+            current,
+            if wide { 2 } else { 1 },
+            "EMR text offString",
+        )?;
         let string_offset = current;
         current = current
             .checked_add(text_bytes.len())
             .ok_or_else(|| Error::invalid(0, "EMR text string range overflows"))?;
         let dx_offset =
-            if text.dx.is_empty() {
+            if !text.dx_buffer_present {
                 None
             } else {
-                current = align_to_u32(current);
+                if text.undefined_space_before_dx.is_empty() {
+                    current = align_to_u32(current);
+                } else {
+                    current = current
+                        .checked_add(text.undefined_space_before_dx.len())
+                        .ok_or_else(|| Error::invalid(0, "EMR text dx offset overflows"))?;
+                }
+                validate_record_relative_alignment(current, 4, "EMR text offDx")?;
                 let dx_offset = current;
                 current =
                     current
@@ -8933,95 +9224,187 @@ fn layout_emr_texts(
 
 fn read_bitmap_buffer(
     data: &[u8],
+    prefix_end: usize,
     off_bmi: usize,
     cb_bmi: usize,
     off_bits: usize,
     cb_bits: usize,
-) -> Result<EmrBitmapBuffer> {
-    Ok(EmrBitmapBuffer {
-        bitmap_info: read_bitmap_range(data, off_bmi, cb_bmi, "bitmap info")?,
-        bitmap_bits: read_bitmap_range(data, off_bits, cb_bits, "bitmap bits")?,
-    })
+    record_name: &str,
+) -> Result<(EmrBitmapBuffer, usize)> {
+    let bmi_start = bitmap_range_start(off_bmi, cb_bmi, prefix_end)?;
+    if bmi_start < prefix_end {
+        return Err(Error::invalid(
+            0,
+            format!("{record_name} bitmap info overlaps preceding fields"),
+        ));
+    }
+    let bmi_end = bmi_start
+        .checked_add(cb_bmi)
+        .ok_or_else(|| Error::invalid(0, format!("{record_name} bitmap info range overflows")))?;
+    let bits_start = bitmap_range_start(off_bits, cb_bits, bmi_end)?;
+    if bits_start < bmi_end {
+        return Err(Error::invalid(
+            0,
+            format!("{record_name} bitmap bits overlap or precede bitmap info"),
+        ));
+    }
+    let bits_end = bits_start
+        .checked_add(cb_bits)
+        .ok_or_else(|| Error::invalid(0, format!("{record_name} bitmap bits range overflows")))?;
+    let undefined_space_before_bitmap_info = data
+        .get(prefix_end..bmi_start)
+        .ok_or_else(|| Error::invalid(0, format!("{record_name} bitmap info offset is invalid")))?
+        .to_vec();
+    let bitmap_info = data
+        .get(bmi_start..bmi_end)
+        .ok_or_else(|| Error::invalid(0, format!("{record_name} bitmap info range is invalid")))?
+        .to_vec();
+    let undefined_space_before_bitmap_bits = data
+        .get(bmi_end..bits_start)
+        .ok_or_else(|| Error::invalid(0, format!("{record_name} bitmap bits offset is invalid")))?
+        .to_vec();
+    let bitmap_bits = data
+        .get(bits_start..bits_end)
+        .ok_or_else(|| Error::invalid(0, format!("{record_name} bitmap bits range is invalid")))?
+        .to_vec();
+    Ok((
+        EmrBitmapBuffer {
+            undefined_space_before_bitmap_info,
+            bitmap_info,
+            undefined_space_before_bitmap_bits,
+            bitmap_bits,
+        },
+        bits_end,
+    ))
 }
 
-fn read_bitmap_range(data: &[u8], offset: usize, size: usize, name: &str) -> Result<Vec<u8>> {
-    if size == 0 {
-        return Ok(Vec::new());
+fn bitmap_range_start(offset: usize, size: usize, empty_fallback: usize) -> Result<usize> {
+    if offset == 0 && size == 0 {
+        Ok(empty_fallback)
+    } else {
+        record_relative_data_offset(offset)
     }
-    let start = record_relative_data_offset(offset)?;
-    let end = start
-        .checked_add(size)
-        .ok_or_else(|| Error::invalid(0, format!("{name} range overflows")))?;
-    Ok(data
-        .get(start..end)
-        .ok_or_else(|| Error::invalid(0, format!("{name} range is out of bounds")))?
-        .to_vec())
-}
-
-fn bitmap_range_end(offset: usize, size: usize, name: &str) -> Result<Option<usize>> {
-    if size == 0 {
-        return Ok(None);
-    }
-    let start = record_relative_data_offset(offset)?;
-    start
-        .checked_add(size)
-        .ok_or_else(|| Error::invalid(0, format!("{name} range overflows")))
-        .map(Some)
 }
 
 fn read_optional_bitmap_buffer(
     data: &[u8],
+    prefix_end: usize,
     off_bmi: usize,
     cb_bmi: usize,
     off_bits: usize,
     cb_bits: usize,
-) -> Result<Option<EmrBitmapBuffer>> {
+) -> Result<(Option<EmrBitmapBuffer>, usize)> {
     if cb_bmi == 0 && cb_bits == 0 {
-        return Ok(None);
+        return Ok((None, prefix_end));
     }
-    Ok(Some(read_bitmap_buffer(
-        data, off_bmi, cb_bmi, off_bits, cb_bits,
-    )?))
+    let (bitmap, end) = read_bitmap_buffer(
+        data,
+        prefix_end,
+        off_bmi,
+        cb_bmi,
+        off_bits,
+        cb_bits,
+        "EMF bitmap record",
+    )?;
+    Ok((Some(bitmap), end))
 }
 
-fn validate_optional_bitmap_record_tail(
-    data: &[u8],
-    fixed_data_len: usize,
-    bitmap_present: bool,
-    ranges: &[(usize, usize)],
-    record_name: &str,
-) -> Result<()> {
-    if bitmap_present {
-        validate_bitmap_buffer_tail(data, ranges, record_name)
+type BitmapBufferFields = (usize, usize, usize, usize);
+
+fn bitmap_buffer_start(fields: BitmapBufferFields) -> Result<Option<usize>> {
+    let (off_bmi, cb_bmi, off_bits, cb_bits) = fields;
+    if cb_bmi != 0 {
+        Ok(Some(record_relative_data_offset(off_bmi)?))
+    } else if cb_bits != 0 {
+        Ok(Some(record_relative_data_offset(off_bits)?))
     } else {
-        validate_record_data_len(data, fixed_data_len, record_name)
+        Ok(None)
     }
 }
 
-fn validate_bitmap_buffer_tail(
+fn read_two_bitmap_buffers(
     data: &[u8],
-    ranges: &[(usize, usize)],
+    prefix_end: usize,
+    source_fields: BitmapBufferFields,
+    mask_fields: BitmapBufferFields,
     record_name: &str,
-) -> Result<()> {
-    let mut max_end = None;
-    for (index, (offset, size)) in ranges.iter().copied().enumerate() {
-        if let Some(end) =
-            bitmap_range_end(offset, size, &format!("{record_name} bitmap range {index}"))?
-        {
-            max_end = Some(max_end.map_or(end, |value: usize| value.max(end)));
-        }
-    }
+) -> Result<(
+    Option<EmrBitmapBuffer>,
+    Option<EmrBitmapBuffer>,
+    EmrBitmapBufferOrder,
+    usize,
+)> {
+    let source_start = bitmap_buffer_start(source_fields)?;
+    let mask_start = bitmap_buffer_start(mask_fields)?;
+    let mask_first = matches!((source_start, mask_start), (Some(source), Some(mask)) if mask < source)
+        || matches!((source_start, mask_start), (None, Some(_)));
 
-    if let Some(end) = max_end {
-        let aligned_end = align_to_u32(end);
-        if data.len() != aligned_end {
+    if mask_first {
+        let (mask_bitmap, mask_end) = read_optional_bitmap_buffer(
+            data,
+            prefix_end,
+            mask_fields.0,
+            mask_fields.1,
+            mask_fields.2,
+            mask_fields.3,
+        )?;
+        let (source_bitmap, source_end) = read_optional_bitmap_buffer(
+            data,
+            mask_end,
+            source_fields.0,
+            source_fields.1,
+            source_fields.2,
+            source_fields.3,
+        )?;
+        Ok((
+            source_bitmap,
+            mask_bitmap,
+            EmrBitmapBufferOrder::MaskThenSource,
+            source_end,
+        ))
+    } else {
+        let (source_bitmap, source_end) = read_optional_bitmap_buffer(
+            data,
+            prefix_end,
+            source_fields.0,
+            source_fields.1,
+            source_fields.2,
+            source_fields.3,
+        )?;
+        let (mask_bitmap, mask_end) = read_optional_bitmap_buffer(
+            data,
+            source_end,
+            mask_fields.0,
+            mask_fields.1,
+            mask_fields.2,
+            mask_fields.3,
+        )?;
+        if source_start == mask_start && source_start.is_some() {
             return Err(Error::invalid(
-                end as u64,
-                format!("{record_name} BitmapBuffer tail must be only 32-bit alignment padding"),
+                0,
+                format!("{record_name} source and mask bitmap buffers overlap"),
             ));
         }
+        Ok((
+            source_bitmap,
+            mask_bitmap,
+            EmrBitmapBufferOrder::SourceThenMask,
+            mask_end,
+        ))
     }
-    Ok(())
+}
+
+fn read_bitmap_record_padding(
+    data: &[u8],
+    unpadded_end: usize,
+    record_name: &str,
+) -> Result<Vec<u8>> {
+    let padding = data
+        .get(unpadded_end..)
+        .ok_or_else(|| Error::invalid(0, format!("{record_name} bitmap range is out of bounds")))?
+        .to_vec();
+    validate_emf_record_alignment_padding(&padding, unpadded_end, record_name)?;
+    Ok(padding)
 }
 
 fn validate_optional_source_bitmap(
@@ -9042,26 +9425,50 @@ fn validate_optional_source_bitmap(
 struct BitmapBufferLayout {
     off_bmi: usize,
     off_bits: usize,
+    data_end: usize,
+}
+
+fn layout_bitmap_buffer(
+    prefix_end: usize,
+    bitmap: &EmrBitmapBuffer,
+    record_name: &str,
+) -> Result<BitmapBufferLayout> {
+    let bmi_start = prefix_end
+        .checked_add(bitmap.undefined_space_before_bitmap_info.len())
+        .ok_or_else(|| Error::invalid(0, format!("{record_name} bitmap info offset overflows")))?;
+    let off_bmi = bmi_start
+        .checked_add(8)
+        .ok_or_else(|| Error::invalid(0, format!("{record_name} bitmap info offset overflows")))?;
+    let bits_start = bmi_start
+        .checked_add(bitmap.bitmap_info.len())
+        .and_then(|value| value.checked_add(bitmap.undefined_space_before_bitmap_bits.len()))
+        .ok_or_else(|| Error::invalid(0, format!("{record_name} bitmap bits offset overflows")))?;
+    let off_bits = bits_start
+        .checked_add(8)
+        .ok_or_else(|| Error::invalid(0, format!("{record_name} bitmap bits offset overflows")))?;
+    let data_end = bits_start
+        .checked_add(bitmap.bitmap_bits.len())
+        .ok_or_else(|| Error::invalid(0, format!("{record_name} bitmap range overflows")))?;
+    Ok(BitmapBufferLayout {
+        off_bmi,
+        off_bits,
+        data_end,
+    })
 }
 
 fn layout_two_bitmap_buffers(
     fixed_size: usize,
     first: Option<&EmrBitmapBuffer>,
     second: Option<&EmrBitmapBuffer>,
-) -> (Option<BitmapBufferLayout>, Option<BitmapBufferLayout>) {
-    let mut next = 8 + fixed_size;
-    let first_layout = first.map(|bitmap| {
-        let off_bmi = next;
-        let off_bits = align_to_u32(off_bmi + bitmap.bitmap_info.len());
-        next = align_to_u32(off_bits + bitmap.bitmap_bits.len());
-        BitmapBufferLayout { off_bmi, off_bits }
-    });
-    let second_layout = second.map(|bitmap| {
-        let off_bmi = next;
-        let off_bits = align_to_u32(off_bmi + bitmap.bitmap_info.len());
-        BitmapBufferLayout { off_bmi, off_bits }
-    });
-    (first_layout, second_layout)
+) -> Result<(Option<BitmapBufferLayout>, Option<BitmapBufferLayout>)> {
+    let first_layout = first
+        .map(|bitmap| layout_bitmap_buffer(fixed_size, bitmap, "EMF source bitmap"))
+        .transpose()?;
+    let second_prefix = first_layout.map_or(fixed_size, |layout| layout.data_end);
+    let second_layout = second
+        .map(|bitmap| layout_bitmap_buffer(second_prefix, bitmap, "EMF mask bitmap"))
+        .transpose()?;
+    Ok((first_layout, second_layout))
 }
 
 fn write_bitmap_layout<W: std::io::Write + std::io::Seek>(
@@ -9091,24 +9498,28 @@ fn write_bitmap_layout<W: std::io::Write + std::io::Seek>(
 
 fn write_two_bitmap_buffers<W: std::io::Write + std::io::Seek>(
     writer: &mut Writer<W>,
-    first_layout: Option<BitmapBufferLayout>,
     first: Option<&EmrBitmapBuffer>,
-    second_layout: Option<BitmapBufferLayout>,
     second: Option<&EmrBitmapBuffer>,
+    padding: &[u8],
+    record_name: &str,
 ) -> Result<()> {
-    if let (Some(layout), Some(bitmap)) = (first_layout, first) {
-        pad_writer_to_record_offset(writer, layout.off_bmi)?;
-        writer.write_all(&bitmap.bitmap_info)?;
-        pad_writer_to_record_offset(writer, layout.off_bits)?;
-        writer.write_all(&bitmap.bitmap_bits)?;
+    if let Some(bitmap) = first {
+        write_bitmap_buffer(writer, bitmap)?;
     }
-    if let (Some(layout), Some(bitmap)) = (second_layout, second) {
-        pad_writer_to_record_offset(writer, layout.off_bmi)?;
-        writer.write_all(&bitmap.bitmap_info)?;
-        pad_writer_to_record_offset(writer, layout.off_bits)?;
-        writer.write_all(&bitmap.bitmap_bits)?;
+    if let Some(bitmap) = second {
+        write_bitmap_buffer(writer, bitmap)?;
     }
-    pad_writer_to_4(writer)
+    write_emf_record_alignment_padding(writer, padding, record_name)
+}
+
+fn write_bitmap_buffer<W: std::io::Write + std::io::Seek>(
+    writer: &mut Writer<W>,
+    bitmap: &EmrBitmapBuffer,
+) -> Result<()> {
+    writer.write_all(&bitmap.undefined_space_before_bitmap_info)?;
+    writer.write_all(&bitmap.bitmap_info)?;
+    writer.write_all(&bitmap.undefined_space_before_bitmap_bits)?;
+    writer.write_all(&bitmap.bitmap_bits)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -9123,6 +9534,7 @@ fn write_bit_blt_data(
     color_usage: u32,
     source_size: Option<SizeL>,
     bitmap: Option<&EmrBitmapBuffer>,
+    padding: &[u8],
     record_name: &str,
 ) -> Result<Vec<u8>> {
     let fixed = if source_size.is_some() {
@@ -9130,11 +9542,9 @@ fn write_bit_blt_data(
     } else {
         92usize
     };
-    let off_bmi = bitmap.map(|_| 8 + fixed);
-    let off_bits = match (off_bmi, bitmap) {
-        (Some(off_bmi), Some(bitmap)) => Some(align_to_u32(off_bmi + bitmap.bitmap_info.len())),
-        _ => None,
-    };
+    let layout = bitmap
+        .map(|bitmap| layout_bitmap_buffer(fixed, bitmap, record_name))
+        .transpose()?;
     let mut writer = Writer::new(Cursor::new(Vec::new()));
     bounds.write_to(&mut writer)?;
     dest.write_to(&mut writer)?;
@@ -9145,7 +9555,7 @@ fn write_bit_blt_data(
     background_color_source.write_to(&mut writer)?;
     writer.write_u32(color_usage)?;
     writer.write_u32(usize_to_u32(
-        off_bmi.unwrap_or(0),
+        layout.map_or(0, |layout| layout.off_bmi),
         format!("{record_name} bitmap info offset"),
     )?)?;
     writer.write_u32(usize_to_u32(
@@ -9153,7 +9563,7 @@ fn write_bit_blt_data(
         "bitmap info size",
     )?)?;
     writer.write_u32(usize_to_u32(
-        off_bits.unwrap_or(0),
+        layout.map_or(0, |layout| layout.off_bits),
         format!("{record_name} bitmap bits offset"),
     )?)?;
     writer.write_u32(usize_to_u32(
@@ -9164,11 +9574,9 @@ fn write_bit_blt_data(
         source_size.write_to(&mut writer)?;
     }
     if let Some(bitmap) = bitmap {
-        writer.write_all(&bitmap.bitmap_info)?;
-        pad_writer_to_record_offset(&mut writer, off_bits.expect("off_bits set for bitmap"))?;
-        writer.write_all(&bitmap.bitmap_bits)?;
-        pad_writer_to_4(&mut writer)?;
+        write_bitmap_buffer(&mut writer, bitmap)?;
     }
+    write_emf_record_alignment_padding(&mut writer, padding, record_name)?;
     Ok(writer.into_inner().into_inner())
 }
 
@@ -9270,7 +9678,9 @@ mod tests {
         bitmap_info.extend_from_slice(&0u32.to_le_bytes());
         bitmap_info.extend_from_slice(&0u32.to_le_bytes());
         EmrBitmapBuffer {
+            undefined_space_before_bitmap_info: Vec::new(),
             bitmap_info,
+            undefined_space_before_bitmap_bits: Vec::new(),
             bitmap_bits: bits,
         }
     }
@@ -9586,6 +9996,7 @@ mod tests {
         assert_eq!(header.frame_height_01mm(), 100);
         assert_eq!(header.frame_width_mm(), 1.0);
         assert_eq!(header.frame_height_mm(), 1.0);
+        assert_eq!(header.version_kind(), Some(EmrMetafileVersion::Enhanced));
         assert_eq!(header.device_size_pixels(), SizeL { cx: 1, cy: 1 });
         assert_eq!(header.device_size_millimeters(), SizeL { cx: 1, cy: 1 });
         assert_eq!(header.device_size_micrometers().unwrap(), None);
@@ -10407,6 +10818,32 @@ mod tests {
 
     #[test]
     fn typed_palette_object_records_roundtrip() {
+        let log_palette = LogPalette {
+            version: 0x0300,
+            entries: vec![LogPaletteEntry {
+                reserved: 0x7F,
+                blue: 1,
+                green: 2,
+                red: 3,
+            }],
+        };
+        let mut writer = Writer::new(Cursor::new(Vec::new()));
+        log_palette.write_to(&mut writer).unwrap();
+        let bytes = writer.into_inner().into_inner();
+        let mut reader = Reader::new(Cursor::new(bytes.clone()));
+        assert_eq!(LogPalette::read_from(&mut reader).unwrap(), log_palette);
+
+        let invalid_log_palette = LogPalette {
+            version: 0x0200,
+            entries: Vec::new(),
+        };
+        let mut writer = Writer::new(Cursor::new(Vec::new()));
+        assert!(invalid_log_palette.write_to(&mut writer).is_err());
+        let mut invalid_bytes = bytes;
+        invalid_bytes[0..2].copy_from_slice(&0x0200_u16.to_le_bytes());
+        let mut reader = Reader::new(Cursor::new(invalid_bytes));
+        assert!(LogPalette::read_from(&mut reader).is_err());
+
         let select = EmfRecordData::SelectPalette(EmrSelectPalette { palette_index: 2 });
         let record = select.to_record().unwrap();
         assert_eq!(record.record_type, EmfRecordType::SelectPalette.raw());
@@ -10610,9 +11047,19 @@ mod tests {
         };
         value.object_index = 0;
         assert!(zero_create_pen_index.to_record().is_err());
+        let mut stock_create_pen_index = create_pen.clone();
+        let EmfRecordData::CreatePen(value) = &mut stock_create_pen_index else {
+            unreachable!();
+        };
+        value.object_index = EmrStockObject::DcPen.raw();
+        assert!(stock_create_pen_index.to_record().is_err());
         let mut zero_create_pen_index_record = record.clone();
         zero_create_pen_index_record.data[0..4].copy_from_slice(&0_u32.to_le_bytes());
         assert!(zero_create_pen_index_record.parse_data().is_err());
+        let mut stock_create_pen_index_record = record.clone();
+        stock_create_pen_index_record.data[0..4]
+            .copy_from_slice(&EmrStockObject::DcPen.raw().to_le_bytes());
+        assert!(stock_create_pen_index_record.parse_data().is_err());
         let mut invalid_create_pen_record = record.clone();
         invalid_create_pen_record.data[4..8].copy_from_slice(&0x0000_0010_u32.to_le_bytes());
         assert!(invalid_create_pen_record.parse_data().is_err());
@@ -10668,6 +11115,12 @@ mod tests {
             value.brush_hatch_kind(),
             Some(EmrHatchStyle::SolidTextColor)
         );
+        let log_brush_ex = value.log_brush_ex();
+        let mut writer = Writer::new(Cursor::new(Vec::new()));
+        log_brush_ex.write_to(&mut writer).unwrap();
+        let bytes = writer.into_inner().into_inner();
+        let mut reader = Reader::new(Cursor::new(bytes));
+        assert_eq!(LogBrushEx::read_from(&mut reader).unwrap(), log_brush_ex);
         assert_eq!(parsed, create_brush);
         let mut zero_create_brush_index = create_brush.clone();
         let EmfRecordData::CreateBrushIndirect(value) = &mut zero_create_brush_index else {
@@ -10801,7 +11254,9 @@ mod tests {
         assert_eq!(
             value.bitmap().unwrap(),
             Some(EmrBitmapBuffer {
+                undefined_space_before_bitmap_info: Vec::new(),
                 bitmap_info: Vec::new(),
+                undefined_space_before_bitmap_bits: Vec::new(),
                 bitmap_bits: vec![0xAA, 0xBB],
             })
         );
@@ -11553,6 +12008,19 @@ mod tests {
             trailing_record.data.extend_from_slice(&0_u32.to_le_bytes());
             assert!(trailing_record.parse_data().is_err());
         }
+
+        let begin = EmfRecordData::BeginPath.to_record().unwrap();
+        let end = EmfRecordData::EndPath.to_record().unwrap();
+        let abort = EmfRecordData::AbortPath.to_record().unwrap();
+        assert!(validate_emf_path_brackets(&[begin.clone(), end]).is_ok());
+        assert!(validate_emf_path_brackets(&[begin.clone(), abort]).is_ok());
+        assert!(validate_emf_path_brackets(&[begin.clone(), begin]).is_err());
+        assert!(
+            validate_emf_path_brackets(&[EmfRecordData::EndPath.to_record().unwrap()]).is_err()
+        );
+        assert!(
+            validate_emf_path_brackets(&[EmfRecordData::BeginPath.to_record().unwrap()]).is_err()
+        );
     }
 
     #[test]
@@ -12535,6 +13003,18 @@ mod tests {
             3, 0, 0, 0, // Rect.right
             4, 0, 0, 0, // Rect.bottom
         ];
+        let mut header_reader = Reader::new(Cursor::new(region_data[..32].to_vec()));
+        let header = RegionDataHeader::read_from(&mut header_reader).unwrap();
+        assert_eq!(header.size, RegionDataHeader::SIZE);
+        let mut invalid_header = header.clone();
+        invalid_header.region_type = 2;
+        let mut header_writer = Writer::new(Cursor::new(Vec::new()));
+        assert!(invalid_header.write_to(&mut header_writer).is_err());
+        let mut invalid_header_bytes = region_data[..32].to_vec();
+        invalid_header_bytes[4..8].copy_from_slice(&2_u32.to_le_bytes());
+        let mut header_reader = Reader::new(Cursor::new(invalid_header_bytes));
+        assert!(RegionDataHeader::read_from(&mut header_reader).is_err());
+
         let values = [
             EmfRecordData::FillRgn(EmrFillRgn {
                 bounds,
@@ -12699,6 +13179,9 @@ mod tests {
                 options: ExtTextOutOptions::empty(),
                 rectangle: None,
                 text,
+                undefined_space_before_string: Vec::new(),
+                dx_buffer_present: false,
+                undefined_space_before_dx: Vec::new(),
                 dx: Vec::new(),
             },
             padding: Vec::new(),
@@ -12734,6 +13217,9 @@ mod tests {
                 options: ExtTextOutOptions::empty(),
                 rectangle: Some(RectL::default()),
                 text: SdkString::raw(vec![b'H', 0, b'i', 0], SdkEncoding::Utf16Le),
+                undefined_space_before_string: Vec::new(),
+                dx_buffer_present: false,
+                undefined_space_before_dx: Vec::new(),
                 dx: Vec::new(),
             },
             padding: Vec::new(),
@@ -12753,6 +13239,9 @@ mod tests {
                 options: ExtTextOutOptions::NO_RECT,
                 rectangle: Some(RectL::default()),
                 text: SdkString::raw(vec![b'H', 0, b'i', 0], SdkEncoding::Utf16Le),
+                undefined_space_before_string: Vec::new(),
+                dx_buffer_present: false,
+                undefined_space_before_dx: Vec::new(),
                 dx: Vec::new(),
             },
             padding: Vec::new(),
@@ -12768,6 +13257,9 @@ mod tests {
                 options: ExtTextOutOptions::PDY,
                 rectangle: None,
                 text: SdkString::raw(vec![b'H', 0, b'i', 0], SdkEncoding::Utf16Le),
+                undefined_space_before_string: Vec::new(),
+                dx_buffer_present: true,
+                undefined_space_before_dx: Vec::new(),
                 dx: vec![1, 2],
             },
             padding: Vec::new(),
@@ -12783,12 +13275,16 @@ mod tests {
                 options: ExtTextOutOptions::empty(),
                 rectangle: None,
                 text: SdkString::raw(vec![b'H', 0, b'i', 0], SdkEncoding::Utf16Le),
+                undefined_space_before_string: vec![0xAA, 0xBB, 0xCC, 0xDD],
+                dx_buffer_present: true,
+                undefined_space_before_dx: vec![0x11, 0x22, 0x33, 0x44],
                 dx: vec![7, 8],
             },
             padding: Vec::new(),
         })
         .to_record()
         .unwrap();
+        assert_eq!(with_dx.parse_data().unwrap().to_record().unwrap(), with_dx);
         let mut misaligned_dx = with_dx.clone();
         misaligned_dx.data[48..52].copy_from_slice(&62_u32.to_le_bytes());
         assert!(misaligned_dx.parse_data().is_err());
@@ -12807,6 +13303,9 @@ mod tests {
                 options: ExtTextOutOptions::empty(),
                 rectangle: None,
                 text: SdkString::raw(b"A".to_vec(), SdkEncoding::Windows1252),
+                undefined_space_before_string: Vec::new(),
+                dx_buffer_present: false,
+                undefined_space_before_dx: Vec::new(),
                 dx: Vec::new(),
             },
             padding: vec![0xAA, 0xBB, 0xCC],
@@ -12859,7 +13358,7 @@ mod tests {
                 right: 30,
                 bottom: 40,
             }),
-            text: SdkString::raw(b"Ansi".to_vec(), SdkEncoding::Windows1252),
+            text: SdkString::raw(b"Ansi".to_vec(), SdkEncoding::UnicodeLowByte),
             padding: Vec::new(),
         });
         let record = small_chars.to_record().unwrap();
@@ -12878,7 +13377,7 @@ mod tests {
             ex_scale: 1.0,
             ey_scale: 1.0,
             bounds: None,
-            text: SdkString::raw(b"Odd".to_vec(), SdkEncoding::Windows1252),
+            text: SdkString::raw(b"Odd".to_vec(), SdkEncoding::UnicodeLowByte),
             padding: vec![0],
         });
         let record = padded_small_chars.to_record().unwrap();
@@ -12932,6 +13431,9 @@ mod tests {
                         bottom: 26,
                     }),
                     text: SdkString::raw(b"ABC".to_vec(), SdkEncoding::Windows1252),
+                    undefined_space_before_string: vec![0x11, 0x12, 0x13, 0x14],
+                    dx_buffer_present: true,
+                    undefined_space_before_dx: vec![0x21],
                     dx: vec![8, 9, 10],
                 },
                 EmrText {
@@ -12939,6 +13441,9 @@ mod tests {
                     options: ExtTextOutOptions::empty(),
                     rectangle: None,
                     text: SdkString::raw(b"Z".to_vec(), SdkEncoding::Windows1252),
+                    undefined_space_before_string: vec![0x31, 0x32, 0x33, 0x34],
+                    dx_buffer_present: false,
+                    undefined_space_before_dx: Vec::new(),
                     dx: Vec::new(),
                 },
             ],
@@ -12969,6 +13474,9 @@ mod tests {
                 options: ExtTextOutOptions::PDY,
                 rectangle: None,
                 text: SdkString::raw(vec![b'H', 0, b'i', 0], SdkEncoding::Utf16Le),
+                undefined_space_before_string: vec![0x41, 0x42],
+                dx_buffer_present: true,
+                undefined_space_before_dx: vec![0x51, 0x52],
                 dx: vec![7, 1, 8, 2],
             }],
             padding: Vec::new(),
@@ -13019,6 +13527,7 @@ mod tests {
             raster_operation: 0x00CC_0020,
             dest_size: SizeL { cx: 2, cy: 2 },
             bitmap: EmrBitmapBuffer {
+                undefined_space_before_bitmap_info: vec![0xA1, 0xA2, 0xA3, 0xA4],
                 bitmap_info: vec![
                     40, 0, 0, 0, // HeaderSize
                     2, 0, 0, 0, // Width
@@ -13032,8 +13541,10 @@ mod tests {
                     0, 0, 0, 0, // ColorUsed
                     0, 0, 0, 0, // ColorImportant
                 ],
-                bitmap_bits: vec![1, 2, 3, 4],
+                undefined_space_before_bitmap_bits: vec![0xB1, 0xB2, 0xB3, 0xB4],
+                bitmap_bits: vec![1, 2, 3],
             },
+            padding: vec![0xCC],
         });
 
         let record = value.to_record().unwrap();
@@ -13093,6 +13604,7 @@ mod tests {
             },
             color_usage: crate::bitmap::DibColorUsage::RgbColors.raw(),
             bitmap: None,
+            padding: Vec::new(),
         });
         let record = no_source.to_record().unwrap();
         assert_eq!(record.record_type, EmfRecordType::BitBlt.raw());
@@ -13160,9 +13672,12 @@ mod tests {
             color_usage: crate::bitmap::DibColorUsage::RgbColors.raw(),
             source_size: SizeL { cx: 2, cy: 2 },
             bitmap: Some(EmrBitmapBuffer {
+                undefined_space_before_bitmap_info: Vec::new(),
                 bitmap_info,
+                undefined_space_before_bitmap_bits: Vec::new(),
                 bitmap_bits: vec![1, 2, 3, 4],
             }),
+            padding: Vec::new(),
         });
         let record = stretch.to_record().unwrap();
         assert_eq!(record.record_type, EmfRecordType::StretchBlt.raw());
@@ -13253,6 +13768,7 @@ mod tests {
             color_usage: crate::bitmap::DibColorUsage::RgbColors.raw(),
             source_size: SizeL { cx: 2, cy: 2 },
             bitmap: Some(alpha_bitmap),
+            padding: Vec::new(),
         });
         let record = alpha.to_record().unwrap();
         assert_eq!(record.record_type, EmfRecordType::AlphaBlend.raw());
@@ -13293,15 +13809,17 @@ mod tests {
         };
         invalid_alpha.blend_function.blend_operation = 0xFF;
         assert!(invalid_alpha_operation.to_record().is_err());
-        let mut invalid_alpha_flags = alpha.clone();
-        let EmfRecordData::AlphaBlend(invalid_alpha) = &mut invalid_alpha_flags else {
+        let mut ignored_alpha_flags = alpha.clone();
+        let EmfRecordData::AlphaBlend(ignored_alpha) = &mut ignored_alpha_flags else {
             unreachable!();
         };
-        invalid_alpha.blend_function.blend_flags = 1;
-        assert!(invalid_alpha_flags.to_record().is_err());
-        let mut invalid_alpha_flags_record = record.clone();
-        invalid_alpha_flags_record.data[33] = 1;
-        assert!(invalid_alpha_flags_record.parse_data().is_err());
+        ignored_alpha.blend_function.blend_flags = 1;
+        let ignored_alpha_flags_record = ignored_alpha_flags.to_record().unwrap();
+        assert_eq!(ignored_alpha_flags_record.data[33], 1);
+        assert_eq!(
+            ignored_alpha_flags_record.parse_data().unwrap(),
+            ignored_alpha_flags
+        );
         let mut invalid_alpha_format_record = record.clone();
         invalid_alpha_format_record.data[35] = 0xFF;
         assert!(invalid_alpha_format_record.parse_data().is_err());
@@ -13343,6 +13861,7 @@ mod tests {
             color_usage: crate::bitmap::DibColorUsage::RgbColors.raw(),
             source_size: SizeL { cx: 2, cy: 2 },
             bitmap: Some(EmrBitmapBuffer {
+                undefined_space_before_bitmap_info: Vec::new(),
                 bitmap_info: vec![
                     40, 0, 0, 0, // HeaderSize
                     1, 0, 0, 0, // Width
@@ -13356,8 +13875,10 @@ mod tests {
                     0, 0, 0, 0, // ColorUsed
                     0, 0, 0, 0, // ColorImportant
                 ],
+                undefined_space_before_bitmap_bits: Vec::new(),
                 bitmap_bits: vec![0xAA, 0xBB, 0xCC, 0xDD],
             }),
+            padding: Vec::new(),
         });
         let record = transparent.to_record().unwrap();
         assert_eq!(record.record_type, EmfRecordType::TransparentBlt.raw());
@@ -13399,8 +13920,12 @@ mod tests {
 
     #[test]
     fn typed_mask_and_plg_blt_records_roundtrip() {
-        let source_bitmap = rgb_bitmap(2, 2, 24, vec![1, 2, 3, 4, 5, 6, 7, 8]);
-        let mask_bitmap = rgb_bitmap(2, 2, 1, vec![0x80, 0, 0, 0, 0x40, 0, 0, 0]);
+        let mut source_bitmap = rgb_bitmap(2, 2, 24, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        source_bitmap.undefined_space_before_bitmap_info = vec![0x11, 0x12, 0x13, 0x14];
+        source_bitmap.undefined_space_before_bitmap_bits = vec![0x21, 0x22, 0x23, 0x24];
+        let mut mask_bitmap = rgb_bitmap(2, 2, 1, vec![0x80, 0, 0, 0, 0x40, 0, 0, 0]);
+        mask_bitmap.undefined_space_before_bitmap_info = vec![0x31, 0x32, 0x33, 0x34];
+        mask_bitmap.undefined_space_before_bitmap_bits = vec![0x41, 0x42, 0x43, 0x44];
         let mask_blt = EmfRecordData::MaskBlt(EmrMaskBlt {
             bounds: RectL {
                 left: 0,
@@ -13428,6 +13953,8 @@ mod tests {
             mask: PointL { x: 0, y: 1 },
             mask_color_usage: crate::bitmap::DibColorUsage::RgbColors.raw(),
             mask_bitmap: Some(mask_bitmap.clone()),
+            bitmap_order: EmrBitmapBufferOrder::SourceThenMask,
+            padding: Vec::new(),
         });
         let record = mask_blt.to_record().unwrap();
         assert_eq!(record.record_type, EmfRecordType::MaskBlt.raw());
@@ -13497,6 +14024,19 @@ mod tests {
             .copy_from_slice(&24u16.to_le_bytes());
         assert!(invalid_mask_blt_mask_record.parse_data().is_err());
 
+        let mut mask_first = mask_blt.clone();
+        let EmfRecordData::MaskBlt(value) = &mut mask_first else {
+            unreachable!();
+        };
+        value.bitmap_order = EmrBitmapBufferOrder::MaskThenSource;
+        let mask_first_record = mask_first.to_record().unwrap();
+        let source_offset = u32::from_le_bytes(mask_first_record.data[76..80].try_into().unwrap());
+        let mask_offset = u32::from_le_bytes(mask_first_record.data[104..108].try_into().unwrap());
+        assert!(mask_offset < source_offset);
+        let parsed = mask_first_record.parse_data().unwrap();
+        assert_eq!(parsed, mask_first);
+        assert_eq!(parsed.to_record().unwrap(), mask_first_record);
+
         let plg_blt = EmfRecordData::PlgBlt(EmrPlgBlt {
             bounds: RectL {
                 left: -10,
@@ -13527,6 +14067,8 @@ mod tests {
             mask: PointL { x: 1, y: 1 },
             mask_color_usage: crate::bitmap::DibColorUsage::RgbColors.raw(),
             mask_bitmap: Some(mask_bitmap),
+            bitmap_order: EmrBitmapBufferOrder::SourceThenMask,
+            padding: Vec::new(),
         });
         let record = plg_blt.to_record().unwrap();
         assert_eq!(record.record_type, EmfRecordType::PlgBlt.raw());
@@ -13575,6 +14117,19 @@ mod tests {
         invalid_plg_blt_mask_record.data[mask_bmi_offset + 14..mask_bmi_offset + 16]
             .copy_from_slice(&24u16.to_le_bytes());
         assert!(invalid_plg_blt_mask_record.parse_data().is_err());
+
+        let mut mask_first = plg_blt.clone();
+        let EmfRecordData::PlgBlt(value) = &mut mask_first else {
+            unreachable!();
+        };
+        value.bitmap_order = EmrBitmapBufferOrder::MaskThenSource;
+        let mask_first_record = mask_first.to_record().unwrap();
+        let source_offset = u32::from_le_bytes(mask_first_record.data[88..92].try_into().unwrap());
+        let mask_offset = u32::from_le_bytes(mask_first_record.data[116..120].try_into().unwrap());
+        assert!(mask_offset < source_offset);
+        let parsed = mask_first_record.parse_data().unwrap();
+        assert_eq!(parsed, mask_first);
+        assert_eq!(parsed.to_record().unwrap(), mask_first_record);
     }
 
     #[test]
@@ -13596,9 +14151,12 @@ mod tests {
             brush_index: 3,
             color_usage: crate::bitmap::DibColorUsage::RgbColors.raw(),
             bitmap: EmrBitmapBuffer {
+                undefined_space_before_bitmap_info: vec![0xAA, 0xBB, 0xCC, 0xDD],
                 bitmap_info,
+                undefined_space_before_bitmap_bits: vec![0x11, 0x22, 0x33, 0x44],
                 bitmap_bits: vec![0x89, b'P', b'N', b'G'],
             },
+            padding: Vec::new(),
         });
 
         let record = value.to_record().unwrap();
@@ -13650,6 +14208,7 @@ mod tests {
             brush_index: 4,
             color_usage: crate::bitmap::DibColorUsage::RgbColors.raw(),
             bitmap: EmrBitmapBuffer {
+                undefined_space_before_bitmap_info: Vec::new(),
                 bitmap_info: vec![
                     40, 0, 0, 0, // HeaderSize
                     2, 0, 0, 0, // Width
@@ -13665,8 +14224,10 @@ mod tests {
                     0, 0, 0, 0, // RGBQuad black
                     0xFF, 0xFF, 0xFF, 0, // RGBQuad white
                 ],
+                undefined_space_before_bitmap_bits: Vec::new(),
                 bitmap_bits: vec![0x80, 0, 0, 0, 0x40, 0, 0, 0],
             },
+            padding: Vec::new(),
         });
 
         let record = value.to_record().unwrap();
@@ -13875,6 +14436,34 @@ mod tests {
 
     #[test]
     fn raw_comment_records_validate_private_identifier_and_size() {
+        let empty = EmfRecordData::Comment(EmrComment::PrivateData {
+            data: Vec::new(),
+            alignment_padding: Vec::new(),
+        });
+        let empty_record = empty.to_record().unwrap();
+        assert_eq!(empty_record.data, vec![0, 0, 0, 0]);
+        assert_eq!(empty_record.parse_data().unwrap(), empty);
+
+        let short = EmfRecordData::Comment(EmrComment::PrivateData {
+            data: vec![1, 2, 3],
+            alignment_padding: vec![0xCD],
+        });
+        let short_record = short.to_record().unwrap();
+        assert_eq!(short_record.parse_data().unwrap(), short);
+        assert_eq!(
+            short_record.parse_data().unwrap().to_record().unwrap(),
+            short_record
+        );
+
+        assert!(
+            EmfRecordData::Comment(EmrComment::PrivateData {
+                data: vec![1, 2, 3, 4],
+                alignment_padding: Vec::new(),
+            })
+            .to_record()
+            .is_err()
+        );
+
         let value = EmfRecordData::Comment(EmrComment::Raw {
             data_size: 7,
             identifier: 0x1234_5678,
@@ -13999,16 +14588,17 @@ mod tests {
         value.description_chars = 2;
         value.description = SdkString::raw(vec![b'N', 0, b'o', 0], SdkEncoding::Utf16Le);
         assert!(unterminated_group.to_record().is_err());
-        let mut inner_padding_group = begin_group.clone();
+        let mut trailing_group_data = begin_group.clone();
         let EmfRecordData::Comment(EmrComment::Public {
             comment: EmrPublicComment::BeginGroup(value),
             ..
-        }) = &mut inner_padding_group
+        }) = &mut trailing_group_data
         else {
             unreachable!();
         };
-        value.padding = vec![0, 0];
-        assert!(inner_padding_group.to_record().is_err());
+        value.padding = vec![0xA1, 0xA2, 0xA3, 0xA4];
+        let record = trailing_group_data.to_record().unwrap();
+        assert_eq!(record.parse_data().unwrap(), trailing_group_data);
 
         let end_group = EmfRecordData::Comment(EmrComment::Public {
             comment: EmrPublicComment::EndGroup,
@@ -14095,16 +14685,20 @@ mod tests {
         oversized_format_count.data[28..32].copy_from_slice(&1_000_000_u32.to_le_bytes());
         oversized_format_count.data.truncate(32);
         assert!(oversized_format_count.parse_data().is_err());
-        let mut invalid_multi_padding = multi_formats.clone();
+        let mut trailing_multi_data = multi_formats.clone();
         let EmfRecordData::Comment(EmrComment::Public {
             comment: EmrPublicComment::MultiFormats(value),
             ..
-        }) = &mut invalid_multi_padding
+        }) = &mut trailing_multi_data
         else {
             unreachable!();
         };
-        value.padding = vec![0, 0];
-        assert!(invalid_multi_padding.to_record().is_err());
+        value.padding = vec![0xB1, 0xB2, 0xB3, 0xB4];
+        let trailing_multi_record = trailing_multi_data.to_record().unwrap();
+        assert_eq!(
+            trailing_multi_record.parse_data().unwrap(),
+            trailing_multi_data
+        );
         let mut invalid_multi_signature = multi_formats.clone();
         let EmfRecordData::Comment(EmrComment::Public {
             comment: EmrPublicComment::MultiFormats(value),
@@ -14210,16 +14804,17 @@ mod tests {
         assert_eq!(parsed_wmf.records.len(), 1);
         assert!(valid_windows_metafile.has_padding());
         assert!(valid_windows_metafile.metafile_size_matches_data());
-        let mut invalid_wmf_padding = windows_metafile.clone();
+        let mut trailing_wmf_data = windows_metafile.clone();
         let EmfRecordData::Comment(EmrComment::Public {
             comment: EmrPublicComment::WindowsMetafile(value),
             ..
-        }) = &mut invalid_wmf_padding
+        }) = &mut trailing_wmf_data
         else {
             unreachable!();
         };
-        value.padding = vec![0, 0];
-        assert!(invalid_wmf_padding.to_record().is_err());
+        value.padding = vec![0xC1, 0xC2, 0xC3, 0xC4];
+        let trailing_wmf_record = trailing_wmf_data.to_record().unwrap();
+        assert_eq!(trailing_wmf_record.parse_data().unwrap(), trailing_wmf_data);
         let mut invalid_wmf_version = windows_metafile.clone();
         let EmfRecordData::Comment(EmrComment::Public {
             comment: EmrPublicComment::WindowsMetafile(value),
@@ -14279,5 +14874,21 @@ mod tests {
             alignment_padding: Vec::new(),
         });
         assert!(invalid_identifier.to_record().is_err());
+        let empty_spool = EmfRecordData::Comment(EmrComment::EmfSpool {
+            spool_identifier: EMR_COMMENT_EMFSPOOL_FONT_DEFINITION,
+            data: Vec::new(),
+            alignment_padding: Vec::new(),
+        });
+        assert!(empty_spool.to_record().is_err());
+        let empty_spool_record = EmfRecord::new(
+            EmfRecordType::Comment.raw(),
+            [
+                8_u32.to_le_bytes(),
+                EMR_COMMENT_EMFSPOOL.to_le_bytes(),
+                EMR_COMMENT_EMFSPOOL_FONT_DEFINITION.to_le_bytes(),
+            ]
+            .concat(),
+        );
+        assert!(empty_spool_record.parse_data().is_err());
     }
 }
