@@ -947,7 +947,20 @@ impl WmfMetafile {
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
-        let mut writer = Writer::new(Cursor::new(Vec::new()));
+        let mut capacity = WMF_HEADER_SIZE as u64
+            + self
+                .placeable_header
+                .as_ref()
+                .map_or(0, |_| PLACEABLE_HEADER_SIZE as u64)
+            + self.trailing_data.len() as u64;
+        for record in &self.records {
+            capacity = capacity
+                .checked_add(u64::from(record_size_words(record)?) * 2)
+                .ok_or_else(|| Error::invalid(0, "WMF serialized size overflows"))?;
+        }
+        let capacity = usize::try_from(capacity)
+            .map_err(|_| Error::invalid(0, "WMF serialized size overflows usize"))?;
+        let mut writer = Writer::new(Cursor::new(Vec::with_capacity(capacity)));
         if let Some(header) = &self.placeable_header {
             header.write_to(&mut writer)?;
         }
@@ -1802,16 +1815,30 @@ impl<'a> WmfRecordData<'a> {
 
     pub fn to_record_with_function(&self, function: u16) -> Result<WmfRecord> {
         let mut record = self.to_record()?;
-        record.function = function;
-        {
-            let reparsed = record.parse_data()?;
-            if reparsed != *self {
+        let canonical_function = record.function;
+        if function != canonical_function {
+            let canonical_kind = normalized_wmf_record_function(canonical_function);
+            let requested_kind = normalized_wmf_record_function(function);
+            let bitmap_function_has_meaningful_high_byte = matches!(
+                canonical_kind,
+                Some(
+                    WmfRecordFunction::BitBlt
+                        | WmfRecordFunction::DibBitBlt
+                        | WmfRecordFunction::DibStretchBlt
+                        | WmfRecordFunction::StretchBlt
+                )
+            );
+            if matches!(self, Self::Unknown(_))
+                || requested_kind != canonical_kind
+                || bitmap_function_has_meaningful_high_byte
+            {
                 return Err(Error::invalid(
                     0,
                     "WMF RecordFunction does not identify the supplied typed record data",
                 ));
             }
         }
+        record.function = function;
         Ok(record)
     }
 }
@@ -1896,6 +1923,12 @@ impl SdkWrite for WmfU16Record {
     fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
         writer.write_u16(self.value)?;
         writer.write_all(&self.reserved)
+    }
+}
+
+impl SdkSize for WmfU16Record {
+    fn sdk_size(&self) -> u64 {
+        2 + self.reserved.len() as u64
     }
 }
 
@@ -2139,7 +2172,12 @@ impl WmfBitBltRecord {
 
     fn write_data(&self) -> Result<Vec<u8>> {
         validate_wmf_bitmap16_transfer_source(self, "META_BITBLT")?;
-        let mut writer = Writer::new(Cursor::new(Vec::new()));
+        let capacity = match &self.target {
+            WmfBitmap16Target::Source(target) => 16usize.checked_add(target.len()),
+            WmfBitmap16Target::NoSource { .. } => Some(18),
+        }
+        .ok_or_else(|| Error::invalid(0, "META_BITBLT serialized size overflows"))?;
+        let mut writer = Writer::new(Cursor::new(Vec::with_capacity(capacity)));
         writer.write_u32(self.raster_operation)?;
         writer.write_i16(self.y_src)?;
         writer.write_i16(self.x_src)?;
@@ -2200,22 +2238,26 @@ impl WmfDibBitBltRecord {
 
     fn write_data(&self) -> Result<Vec<u8>> {
         validate_wmf_dib_transfer_source(self, "META_DIBBITBLT")?;
-        WmfBitBltRecord {
-            raster_operation: self.raster_operation,
-            y_src: self.y_src,
-            x_src: self.x_src,
-            height: self.height,
-            width: self.width,
-            y_dest: self.y_dest,
-            x_dest: self.x_dest,
-            target: match &self.target {
-                WmfDibTarget::Source(target) => WmfBitmap16Target::Source(target.clone()),
-                WmfDibTarget::NoSource { reserved } => WmfBitmap16Target::NoSource {
-                    reserved: *reserved,
-                },
-            },
+        let capacity = match &self.target {
+            WmfDibTarget::Source(target) => 16usize.checked_add(target.len()),
+            WmfDibTarget::NoSource { .. } => Some(18),
         }
-        .write_data()
+        .ok_or_else(|| Error::invalid(0, "META_DIBBITBLT serialized size overflows"))?;
+        let mut writer = Writer::new(Cursor::new(Vec::with_capacity(capacity)));
+        writer.write_u32(self.raster_operation)?;
+        writer.write_i16(self.y_src)?;
+        writer.write_i16(self.x_src)?;
+        if let WmfDibTarget::NoSource { reserved } = self.target {
+            writer.write_u16(reserved)?;
+        }
+        writer.write_i16(self.height)?;
+        writer.write_i16(self.width)?;
+        writer.write_i16(self.y_dest)?;
+        writer.write_i16(self.x_dest)?;
+        if let WmfDibTarget::Source(target) = &self.target {
+            writer.write_all(target)?;
+        }
+        Ok(writer.into_inner().into_inner())
     }
 }
 
@@ -2283,7 +2325,12 @@ impl WmfStretchBltRecord {
 
     fn write_data(&self) -> Result<Vec<u8>> {
         validate_wmf_bitmap16_transfer_source(self, "META_STRETCHBLT")?;
-        let mut writer = Writer::new(Cursor::new(Vec::new()));
+        let capacity = match &self.target {
+            WmfBitmap16Target::Source(target) => 20usize.checked_add(target.len()),
+            WmfBitmap16Target::NoSource { .. } => Some(22),
+        }
+        .ok_or_else(|| Error::invalid(0, "META_STRETCHBLT serialized size overflows"))?;
+        let mut writer = Writer::new(Cursor::new(Vec::with_capacity(capacity)));
         writer.write_u32(self.raster_operation)?;
         writer.write_i16(self.src_height)?;
         writer.write_i16(self.src_width)?;
@@ -2350,24 +2397,28 @@ impl WmfDibStretchBltRecord {
 
     fn write_data(&self) -> Result<Vec<u8>> {
         validate_wmf_dib_stretch_transfer_source(self, "META_DIBSTRETCHBLT")?;
-        WmfStretchBltRecord {
-            raster_operation: self.raster_operation,
-            src_height: self.src_height,
-            src_width: self.src_width,
-            y_src: self.y_src,
-            x_src: self.x_src,
-            dest_height: self.dest_height,
-            dest_width: self.dest_width,
-            y_dest: self.y_dest,
-            x_dest: self.x_dest,
-            target: match &self.target {
-                WmfDibTarget::Source(target) => WmfBitmap16Target::Source(target.clone()),
-                WmfDibTarget::NoSource { reserved } => WmfBitmap16Target::NoSource {
-                    reserved: *reserved,
-                },
-            },
+        let capacity = match &self.target {
+            WmfDibTarget::Source(target) => 20usize.checked_add(target.len()),
+            WmfDibTarget::NoSource { .. } => Some(22),
         }
-        .write_data()
+        .ok_or_else(|| Error::invalid(0, "META_DIBSTRETCHBLT serialized size overflows"))?;
+        let mut writer = Writer::new(Cursor::new(Vec::with_capacity(capacity)));
+        writer.write_u32(self.raster_operation)?;
+        writer.write_i16(self.src_height)?;
+        writer.write_i16(self.src_width)?;
+        writer.write_i16(self.y_src)?;
+        writer.write_i16(self.x_src)?;
+        if let WmfDibTarget::NoSource { reserved } = self.target {
+            writer.write_u16(reserved)?;
+        }
+        writer.write_i16(self.dest_height)?;
+        writer.write_i16(self.dest_width)?;
+        writer.write_i16(self.y_dest)?;
+        writer.write_i16(self.x_dest)?;
+        if let WmfDibTarget::Source(target) = &self.target {
+            writer.write_all(target)?;
+        }
+        Ok(writer.into_inner().into_inner())
     }
 }
 
@@ -2409,7 +2460,10 @@ impl WmfSetDibToDevRecord {
 
     fn write_data(&self) -> Result<Vec<u8>> {
         validate_wmf_set_dib_to_dev_record(self)?;
-        let mut writer = Writer::new(Cursor::new(Vec::new()));
+        let capacity = 18usize
+            .checked_add(self.dib.len())
+            .ok_or_else(|| Error::invalid(0, "META_SETDIBTODEV serialized size overflows"))?;
+        let mut writer = Writer::new(Cursor::new(Vec::with_capacity(capacity)));
         writer.write_u16(self.color_usage)?;
         writer.write_u16(self.scan_count)?;
         writer.write_u16(self.start_scan)?;
@@ -2491,7 +2545,10 @@ impl WmfStretchDibRecord {
 
     fn write_data(&self) -> Result<Vec<u8>> {
         validate_wmf_stretch_dib_record(self)?;
-        let mut writer = Writer::new(Cursor::new(Vec::new()));
+        let capacity = 22usize
+            .checked_add(self.dib.len())
+            .ok_or_else(|| Error::invalid(0, "META_STRETCHDIB serialized size overflows"))?;
+        let mut writer = Writer::new(Cursor::new(Vec::with_capacity(capacity)));
         writer.write_u32(self.raster_operation)?;
         writer.write_u16(self.color_usage)?;
         writer.write_i16(self.src_height)?;
@@ -3046,7 +3103,10 @@ impl WmfBitmap16 {
 
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         validate_wmf_bitmap16(self)?;
-        let mut writer = Writer::new(Cursor::new(Vec::new()));
+        let capacity = 10usize
+            .checked_add(self.bits.len())
+            .ok_or_else(|| Error::invalid(0, "Bitmap16 serialized size overflows"))?;
+        let mut writer = Writer::new(Cursor::new(Vec::with_capacity(capacity)));
         self.header.write_to(&mut writer)?;
         writer.write_all(&self.bits)?;
         Ok(writer.into_inner().into_inner())
@@ -3086,7 +3146,10 @@ impl WmfCreatePatternBrushRecord {
 
     fn write_data(&self) -> Result<Vec<u8>> {
         validate_wmf_create_pattern_brush_record(self)?;
-        let mut writer = Writer::new(Cursor::new(Vec::new()));
+        let capacity = 32usize
+            .checked_add(self.pattern.len())
+            .ok_or_else(|| Error::invalid(0, "META_CREATEPATTERNBRUSH size overflows"))?;
+        let mut writer = Writer::new(Cursor::new(Vec::with_capacity(capacity)));
         self.bitmap.write_to(&mut writer)?;
         writer.write_u32(self.ignored_bits)?;
         writer.write_all(&self.reserved)?;
@@ -3133,7 +3196,10 @@ impl WmfDibCreatePatternBrushRecord {
 
     fn write_data(&self) -> Result<Vec<u8>> {
         validate_wmf_dib_create_pattern_brush_record(self)?;
-        let mut writer = Writer::new(Cursor::new(Vec::new()));
+        let capacity = 4usize
+            .checked_add(self.target.len())
+            .ok_or_else(|| Error::invalid(0, "META_DIBCREATEPATTERNBRUSH size overflows"))?;
+        let mut writer = Writer::new(Cursor::new(Vec::with_capacity(capacity)));
         writer.write_u16(self.style)?;
         writer.write_u16(self.color_usage)?;
         writer.write_all(&self.target)?;
@@ -3241,6 +3307,12 @@ impl SdkWrite for WmfScanObject {
     }
 }
 
+impl SdkSize for WmfScanObject {
+    fn sdk_size(&self) -> u64 {
+        8 + self.scan_lines.len() as u64 * 4
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WmfRegionObject {
     pub next_in_chain: u16,
@@ -3319,6 +3391,13 @@ impl SdkWrite for WmfRegionObject {
             scan.write_to(writer)?;
         }
         Ok(())
+    }
+}
+
+impl SdkSize for WmfRegionObject {
+    fn sdk_size(&self) -> u64 {
+        14 + self.bounding_rectangle.sdk_size()
+            + self.scans.iter().map(SdkSize::sdk_size).sum::<u64>()
     }
 }
 
@@ -5343,8 +5422,13 @@ fn read_object<T: SdkRead>(data: &[u8], name: &str) -> Result<T> {
     Ok(value)
 }
 
-fn object_record<T: SdkWrite>(function: WmfRecordFunction, value: &T) -> Result<WmfRecord> {
-    let mut writer = Writer::new(Cursor::new(Vec::new()));
+fn object_record<T: SdkWrite + SdkSize>(
+    function: WmfRecordFunction,
+    value: &T,
+) -> Result<WmfRecord> {
+    let capacity = usize::try_from(value.sdk_size())
+        .map_err(|_| Error::invalid(0, "WMF object size overflows usize"))?;
+    let mut writer = Writer::new(Cursor::new(Vec::with_capacity(capacity)));
     value.write_to(&mut writer)?;
     Ok(WmfRecord::new(
         function.raw(),
@@ -5933,6 +6017,18 @@ mod tests {
                 .is_err()
         );
         assert!(accepted_high_byte_variant.parse_data().is_err());
+        let unknown = WmfRecord::new(0x7777, vec![1, 2]);
+        assert!(matches!(
+            unknown.parse_data(),
+            Ok(WmfRecordData::Unknown(_))
+        ));
+        assert!(
+            unknown
+                .parse_data()
+                .unwrap()
+                .to_record_with_function(0x8877)
+                .is_err()
+        );
         assert_eq!(high_byte_variant.size_words().unwrap(), 4);
         assert_eq!(high_byte_variant.embedded_source_present().unwrap(), None);
         assert_eq!(WmfRecordFunction::ExtTextOut.raw(), 0x0A32);
@@ -7992,6 +8088,7 @@ mod tests {
         assert_eq!(value.object_type, 6);
         assert_eq!(value.scan_count as usize, value.scans.len());
         assert_eq!(value.max_scan, 2);
+        assert_eq!(value.sdk_size() as usize, create_region.data.len());
         assert_eq!(parsed.to_record().unwrap(), create_region);
 
         let mut invalid_region = create_region.clone();
@@ -8058,6 +8155,7 @@ mod tests {
         assert!(value.target.source_bytes().is_none());
         assert_eq!(value.target.bitmap16().unwrap(), None);
         assert_eq!(parsed.to_record().unwrap(), bit_blt_no_source);
+        assert!(parsed.to_record_with_function(0x0822).is_err());
         let invalid_bit_blt_function_size = WmfRecord::new(
             0x0822,
             [

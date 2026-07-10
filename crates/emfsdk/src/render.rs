@@ -2759,7 +2759,7 @@ fn process_emf_plus_comment(
         let mut reader = Reader::new(std::io::Cursor::new(record_bytes));
         if let Ok(record) = EmfPlusRecord::read_from(&mut reader, record_bytes.len() as u64) {
             if record.record_kind() == Some(EmfPlusRecordType::Object) {
-                if let Ok(fragment) = record.object_fragment() {
+                if let Ok(fragment) = record.into_object_fragment() {
                     process_emf_plus_object(fragment, state)?;
                 }
             } else if let Ok(parsed) = record.parse_data() {

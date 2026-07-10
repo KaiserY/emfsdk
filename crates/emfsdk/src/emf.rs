@@ -766,7 +766,10 @@ impl EmfMetafile {
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
-        let mut writer = Writer::new(Cursor::new(Vec::new()));
+        let capacity = (self.computed_bytes()? as usize)
+            .checked_add(self.trailing_data.len())
+            .ok_or_else(|| Error::invalid(0, "EMF serialized size overflows usize"))?;
+        let mut writer = Writer::new(Cursor::new(Vec::with_capacity(capacity)));
         for record in &self.records {
             record.write_to(&mut writer)?;
         }
@@ -7538,7 +7541,15 @@ impl EmrMaskBlt {
                 (source_layout, mask_layout)
             }
         };
-        let mut writer = Writer::new(Cursor::new(Vec::new()));
+        let data_end = source_layout
+            .into_iter()
+            .chain(mask_layout)
+            .fold(fixed, |end, layout| end.max(layout.data_end));
+        let capacity = data_end
+            .checked_add(self.padding.len())
+            .and_then(|size| size.checked_add(3))
+            .ok_or_else(|| Error::invalid(0, "EMR_MASKBLT serialized size overflows"))?;
+        let mut writer = Writer::new(Cursor::new(Vec::with_capacity(capacity)));
         self.bounds.write_to(&mut writer)?;
         self.dest.write_to(&mut writer)?;
         self.dest_size.write_to(&mut writer)?;
@@ -7672,7 +7683,15 @@ impl EmrPlgBlt {
                 (source_layout, mask_layout)
             }
         };
-        let mut writer = Writer::new(Cursor::new(Vec::new()));
+        let data_end = source_layout
+            .into_iter()
+            .chain(mask_layout)
+            .fold(fixed, |end, layout| end.max(layout.data_end));
+        let capacity = data_end
+            .checked_add(self.padding.len())
+            .and_then(|size| size.checked_add(3))
+            .ok_or_else(|| Error::invalid(0, "EMR_PLGBLT serialized size overflows"))?;
+        let mut writer = Writer::new(Cursor::new(Vec::with_capacity(capacity)));
         self.bounds.write_to(&mut writer)?;
         for point in self.dest {
             point.write_to(&mut writer)?;
@@ -8474,16 +8493,23 @@ impl EmrComment {
                 alignment_padding,
             } => {
                 validate_emr_comment_emf_plus(records, alignment_padding)?;
-                let mut payload = Vec::new();
-                for record in records {
-                    let mut writer = Writer::new(Cursor::new(Vec::new()));
-                    record.write_to(&mut writer)?;
-                    payload.extend_from_slice(&writer.into_inner().into_inner());
-                }
-                let mut writer = Writer::new(Cursor::new(Vec::with_capacity(8 + payload.len())));
-                writer.write_u32(usize_to_u32(payload.len() + 4, "EMR_COMMENT data size")?)?;
+                let payload_len = records.iter().try_fold(0usize, |total, record| {
+                    let record_size = usize::try_from(record.sdk_size())
+                        .map_err(|_| Error::invalid(0, "EMF+ record size overflows usize"))?;
+                    total
+                        .checked_add(record_size)
+                        .ok_or_else(|| Error::invalid(0, "EMF+ comment payload size overflows"))
+                })?;
+                let capacity = 8usize
+                    .checked_add(payload_len)
+                    .and_then(|size| size.checked_add(alignment_padding.len()))
+                    .ok_or_else(|| Error::invalid(0, "EMF+ comment size overflows usize"))?;
+                let mut writer = Writer::new(Cursor::new(Vec::with_capacity(capacity)));
+                writer.write_u32(usize_to_u32(payload_len + 4, "EMR_COMMENT data size")?)?;
                 writer.write_u32(EMR_COMMENT_EMFPLUS)?;
-                writer.write_all(&payload)?;
+                for record in records {
+                    record.write_to(&mut writer)?;
+                }
                 write_emr_comment_alignment_padding(&mut writer, alignment_padding)?;
                 Ok(writer.into_inner().into_inner())
             }
@@ -8839,8 +8865,13 @@ fn read_object<T: SdkRead>(data: &[u8]) -> Result<T> {
     Ok(value)
 }
 
-fn object_record<T: SdkWrite>(record_type: EmfRecordType, value: &T) -> Result<EmfRecord> {
-    let mut writer = Writer::new(Cursor::new(Vec::new()));
+fn object_record<T: SdkWrite + SdkSize>(
+    record_type: EmfRecordType,
+    value: &T,
+) -> Result<EmfRecord> {
+    let capacity = usize::try_from(value.sdk_size())
+        .map_err(|_| Error::invalid(0, "EMF object size overflows usize"))?;
+    let mut writer = Writer::new(Cursor::new(Vec::with_capacity(capacity)));
     value.write_to(&mut writer)?;
     Ok(EmfRecord::new(
         record_type.raw(),
@@ -9545,7 +9576,12 @@ fn write_bit_blt_data(
     let layout = bitmap
         .map(|bitmap| layout_bitmap_buffer(fixed, bitmap, record_name))
         .transpose()?;
-    let mut writer = Writer::new(Cursor::new(Vec::new()));
+    let capacity = layout
+        .map_or(fixed, |layout| layout.data_end)
+        .checked_add(padding.len())
+        .and_then(|size| size.checked_add(3))
+        .ok_or_else(|| Error::invalid(0, format!("{record_name} serialized size overflows")))?;
+    let mut writer = Writer::new(Cursor::new(Vec::with_capacity(capacity)));
     bounds.write_to(&mut writer)?;
     dest.write_to(&mut writer)?;
     dest_size.write_to(&mut writer)?;

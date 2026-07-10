@@ -4692,6 +4692,22 @@ impl EmfPlusRecord {
         Ok(fragment)
     }
 
+    pub fn into_object_fragment(self) -> Result<EmfPlusObjectRecordData> {
+        if self.record_kind() != Some(EmfPlusRecordType::Object) {
+            return Err(Error::invalid(0, "EMF+ record is not an EmfPlusObject"));
+        }
+        let flags = self.flags();
+        let fragment = EmfPlusObjectRecordData {
+            object_id: flags.object_id(),
+            object_type_raw: flags.object_type_raw(),
+            continues: flags.object_continues(),
+            total_object_size: self.total_object_size,
+            object_data: self.data,
+        };
+        validate_emf_plus_object_fragment(&fragment)?;
+        Ok(fragment)
+    }
+
     pub fn from_continued_object(
         object_id: u8,
         data: &EmfPlusObjectData,
@@ -5348,7 +5364,9 @@ impl EmfPlusRecord {
         let record_flags = data.record_flags(flags)?;
         validate_emf_plus_record_data(data, record_flags)?;
 
-        let mut record_data = Vec::new();
+        let record_data_capacity = usize::try_from(data.sdk_size())
+            .map_err(|_| Error::invalid(0, "EMF+ record data size overflows usize"))?;
+        let mut record_data = Vec::with_capacity(record_data_capacity);
         {
             let mut writer = Writer::new(std::io::Cursor::new(&mut record_data));
             match data {
@@ -5698,6 +5716,17 @@ impl EmfPlusRecord {
         writer.write_u32(self.data.len() as u32)?;
         writer.write_all(&self.data)?;
         writer.write_all(&self.padding)
+    }
+}
+
+impl SdkSize for EmfPlusRecord {
+    fn sdk_size(&self) -> u64 {
+        let header_size = if self.total_object_size.is_some() {
+            16
+        } else {
+            12
+        };
+        header_size + self.data.len() as u64 + self.padding.len() as u64
     }
 }
 
@@ -12083,6 +12112,14 @@ mod tests {
             .map(EmfPlusRecord::object_fragment)
             .collect::<Result<Vec<_>>>()
             .unwrap();
+        assert_eq!(
+            continued_records[0].clone().into_object_fragment().unwrap(),
+            fragments[0]
+        );
+        assert_eq!(
+            continued_records[0].sdk_size() as usize,
+            16 + continued_records[0].data.len() + continued_records[0].padding.len()
+        );
         let mut assembler = EmfPlusObjectAssembler::default();
         assert!(assembler.push(fragments[0].clone()).unwrap().is_none());
         assert!(assembler.push(fragments[1].clone()).unwrap().is_none());

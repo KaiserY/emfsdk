@@ -494,7 +494,25 @@ pub enum DibColorTable {
 
 impl DibColorTable {
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
-        let mut writer = Writer::new(std::io::Cursor::new(Vec::new()));
+        let capacity = match self {
+            Self::RgbQuads {
+                entries,
+                trailing_data,
+            } => entries
+                .len()
+                .checked_mul(4)
+                .and_then(|size| size.checked_add(trailing_data.len())),
+            Self::PaletteIndices {
+                entries,
+                trailing_data,
+            } => entries
+                .len()
+                .checked_mul(2)
+                .and_then(|size| size.checked_add(trailing_data.len())),
+            Self::None { trailing_data } => Some(trailing_data.len()),
+        }
+        .ok_or_else(|| Error::invalid(0, "DIB color table size overflows usize"))?;
+        let mut writer = Writer::new(std::io::Cursor::new(Vec::with_capacity(capacity)));
         match self {
             Self::RgbQuads {
                 entries,
