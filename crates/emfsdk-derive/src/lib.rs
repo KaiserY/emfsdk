@@ -59,6 +59,14 @@ fn expand_sdk_object(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
                 writer.#write_method(self.#ident)?;
             });
             size_fields.push(quote! { #size });
+        } else if let Some(len) = byte_array_len(ty) {
+            read_fields.push(quote! {
+                #ident: reader.read_array::<#len>()?
+            });
+            write_fields.push(quote! {
+                writer.write_all(&self.#ident)?;
+            });
+            size_fields.push(quote! { #len });
         } else {
             read_fields.push(quote! {
                 #ident: <#ty as ::emfsdk::common::SdkRead>::read_from(reader)?
@@ -144,9 +152,11 @@ fn sdk_validate(input: &DeriveInput) -> syn::Result<Option<Path>> {
                 } else {
                     validate = Some(value.parse()?);
                 }
-            } else if meta.input.peek(syn::Token![=]) {
+            } else if meta.path.is_ident("format") {
                 let value = meta.value()?;
-                let _: Expr = value.parse()?;
+                let _: syn::LitStr = value.parse()?;
+            } else {
+                return Err(meta.error("unsupported SdkObject attribute"));
             }
             Ok(())
         })?;
@@ -303,6 +313,19 @@ fn primitive_io(ty: &Type) -> Option<(proc_macro2::Ident, proc_macro2::Ident, u6
     ))
 }
 
+fn byte_array_len(ty: &Type) -> Option<&Expr> {
+    let Type::Array(array) = ty else {
+        return None;
+    };
+    let Type::Path(element) = array.elem.as_ref() else {
+        return None;
+    };
+    if !element.path.is_ident("u8") {
+        return None;
+    }
+    Some(&array.len)
+}
+
 fn primitive_size_by_name(name: &str) -> Option<u64> {
     match name {
         "u8" | "i8" => Some(1),
@@ -333,5 +356,34 @@ fn validate_integer_discriminant(expr: &Expr) -> syn::Result<()> {
             expr.span(),
             "SdkEnum discriminants must be integer literals",
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use syn::parse_quote;
+
+    #[test]
+    fn sdk_object_rejects_unknown_attributes() {
+        let input: DeriveInput = parse_quote! {
+            #[sdk(formt = "emf")]
+            struct Value { field: u32 }
+        };
+        let error = expand_sdk_object(&input).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported SdkObject attribute")
+        );
+    }
+
+    #[test]
+    fn sdk_object_recognizes_fixed_byte_arrays() {
+        let ty: Type = parse_quote!([u8; 32]);
+        assert!(byte_array_len(&ty).is_some());
+
+        let other: Type = parse_quote!([u16; 32]);
+        assert!(byte_array_len(&other).is_none());
     }
 }

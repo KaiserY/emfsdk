@@ -2844,7 +2844,8 @@ impl WmfPitchAndFamily {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+#[sdk(validate = "validate_wmf_font_object")]
 pub struct WmfFontObject {
     pub height: i16,
     pub width: i16,
@@ -2895,69 +2896,6 @@ impl WmfFontObject {
         WmfPitchAndFamily {
             value: self.pitch_and_family,
         }
-    }
-}
-
-impl SdkRead for WmfFontObject {
-    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
-        let height = reader.read_i16()?;
-        let width = reader.read_i16()?;
-        let escapement = reader.read_i16()?;
-        let orientation = reader.read_i16()?;
-        let weight = reader.read_i16()?;
-        let italic = reader.read_u8()?;
-        let underline = reader.read_u8()?;
-        let strike_out = reader.read_u8()?;
-        let char_set = reader.read_u8()?;
-        let out_precision = reader.read_u8()?;
-        let clip_precision = reader.read_u8()?;
-        let quality = reader.read_u8()?;
-        let pitch_and_family = reader.read_u8()?;
-        let face_name = reader.read_array::<32>()?;
-        let value = Self {
-            height,
-            width,
-            escapement,
-            orientation,
-            weight,
-            italic,
-            underline,
-            strike_out,
-            char_set,
-            out_precision,
-            clip_precision,
-            quality,
-            pitch_and_family,
-            face_name,
-        };
-        validate_wmf_font_object(&value)?;
-        Ok(value)
-    }
-}
-
-impl SdkWrite for WmfFontObject {
-    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
-        validate_wmf_font_object(self)?;
-        writer.write_i16(self.height)?;
-        writer.write_i16(self.width)?;
-        writer.write_i16(self.escapement)?;
-        writer.write_i16(self.orientation)?;
-        writer.write_i16(self.weight)?;
-        writer.write_u8(self.italic)?;
-        writer.write_u8(self.underline)?;
-        writer.write_u8(self.strike_out)?;
-        writer.write_u8(self.char_set)?;
-        writer.write_u8(self.out_precision)?;
-        writer.write_u8(self.clip_precision)?;
-        writer.write_u8(self.quality)?;
-        writer.write_u8(self.pitch_and_family)?;
-        writer.write_all(&self.face_name)
-    }
-}
-
-impl SdkSize for WmfFontObject {
-    fn sdk_size(&self) -> u64 {
-        50
     }
 }
 

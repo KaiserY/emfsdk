@@ -1,6 +1,6 @@
 use emfsdk_derive::SdkObject;
 
-use crate::common::{Error, Reader, Result, SdkRead, SdkSize, SdkWrite, Writer};
+use crate::common::{Error, Result};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, SdkObject)]
 #[sdk(format = "shared")]
@@ -48,7 +48,8 @@ pub struct RectS {
     pub bottom: i16,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, SdkObject)]
+#[sdk(validate = "validate_color_ref")]
 pub struct ColorRef {
     pub red: u8,
     pub green: u8,
@@ -62,36 +63,7 @@ impl ColorRef {
     }
 }
 
-impl SdkRead for ColorRef {
-    fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
-        let value = Self {
-            red: reader.read_u8()?,
-            green: reader.read_u8()?,
-            blue: reader.read_u8()?,
-            reserved: reader.read_u8()?,
-        };
-        validate_color_ref(value)?;
-        Ok(value)
-    }
-}
-
-impl SdkWrite for ColorRef {
-    fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
-        validate_color_ref(*self)?;
-        writer.write_u8(self.red)?;
-        writer.write_u8(self.green)?;
-        writer.write_u8(self.blue)?;
-        writer.write_u8(self.reserved)
-    }
-}
-
-impl SdkSize for ColorRef {
-    fn sdk_size(&self) -> u64 {
-        4
-    }
-}
-
-fn validate_color_ref(value: ColorRef) -> Result<()> {
+fn validate_color_ref(value: &ColorRef) -> Result<()> {
     if value.is_reserved_zero() {
         Ok(())
     } else {
@@ -158,6 +130,7 @@ mod tests {
     use std::io::Cursor;
 
     use super::*;
+    use crate::common::{Reader, SdkRead, SdkWrite, Writer};
 
     #[test]
     fn color_ref_reserved_byte_must_be_zero() {
