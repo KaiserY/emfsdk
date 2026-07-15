@@ -1267,17 +1267,32 @@ impl EmfVectorState {
             rect.2.clamp(0, self.width as i32),
             rect.3.clamp(0, self.height as i32),
         );
-        let mut mask = vec![false; self.width * self.height];
-        for y in next.1.max(0) as usize..next.3.max(0) as usize {
-            for x in next.0.max(0) as usize..next.2.max(0) as usize {
-                mask[y * self.width + x] = true;
-            }
+        if combine_mode == 0 {
+            self.clip_rect = Some(next);
+            self.clip_mask = None;
+            return;
         }
+        if combine_mode == 1 && self.clip_mask.is_none() {
+            self.clip_rect = Some(match self.clip_rect {
+                Some(current) => intersect_rects(current, next),
+                None => next,
+            });
+            return;
+        }
+        let mask = self.rect_clip_mask(next);
         self.combine_clip_mask(mask, combine_mode);
     }
 
     fn set_clip_points_logical(&mut self, points: &[EmfPoint], combine_mode: u8) {
-        let mask = self.polygon_mask(points);
+        let mapped = points
+            .iter()
+            .map(|point| self.map_point(*point))
+            .collect::<Vec<_>>();
+        if let Some(rect) = axis_aligned_clip_rect(&mapped, self.width, self.height) {
+            self.set_clip_rect_device(rect, combine_mode);
+            return;
+        }
+        let mask = self.polygon_mask(&mapped);
         self.combine_clip_mask(mask, combine_mode);
     }
 
@@ -1312,7 +1327,11 @@ impl EmfVectorState {
     }
 
     fn combine_clip_mask(&mut self, next: Vec<bool>, combine_mode: u8) {
-        let mask = match (self.clip_mask.take(), combine_mode) {
+        let current = match self.clip_mask.take() {
+            Some(mask) => Some(mask),
+            None => self.clip_rect.map(|rect| self.rect_clip_mask(rect)),
+        };
+        let mask = match (current, combine_mode) {
             (_, 0) => Some(next),
             (None, 1) => Some(next),
             (Some(current), 1) => Some(
@@ -1360,6 +1379,17 @@ impl EmfVectorState {
         self.update_clip_rect_from_mask();
     }
 
+    fn rect_clip_mask(&self, rect: (i32, i32, i32, i32)) -> Vec<bool> {
+        let mut mask = vec![false; self.width * self.height];
+        for y in rect.1.max(0) as usize..rect.3.max(0) as usize {
+            let row = y * self.width;
+            for x in rect.0.max(0) as usize..rect.2.max(0) as usize {
+                mask[row + x] = true;
+            }
+        }
+        mask
+    }
+
     fn update_clip_rect_from_mask(&mut self) {
         let Some(mask) = &self.clip_mask else {
             self.clip_rect = None;
@@ -1388,35 +1418,16 @@ impl EmfVectorState {
         ));
     }
 
-    fn polygon_mask(&self, points: &[EmfPoint]) -> Vec<bool> {
+    fn polygon_mask(&self, mapped: &[(f32, f32)]) -> Vec<bool> {
         let mut mask = vec![false; self.width * self.height];
-        if points.len() < 3 {
+        if mapped.len() < 3 {
             return mask;
         }
-        let mapped = points
-            .iter()
-            .map(|point| self.map_point(*point))
-            .collect::<Vec<_>>();
-        for y in 0..self.height {
-            let scan_y = y as f32 + 0.5;
-            let mut intersections = Vec::new();
-            for index in 0..mapped.len() {
-                let (x1, y1) = mapped[index];
-                let (x2, y2) = mapped[(index + 1) % mapped.len()];
-                if (y1 <= scan_y && y2 > scan_y) || (y2 <= scan_y && y1 > scan_y) {
-                    let t = (scan_y - y1) / (y2 - y1);
-                    intersections.push(x1 + t * (x2 - x1));
-                }
+        visit_polygon_scanline_spans(mapped, self.width, self.height, |y, start, end| {
+            for x in start..end {
+                mask[y * self.width + x] = true;
             }
-            intersections.sort_by(|a, b| a.total_cmp(b));
-            for pair in intersections.chunks_exact(2) {
-                let start = pair[0].floor().max(0.0) as usize;
-                let end = pair[1].ceil().min(self.width as f32) as usize;
-                for x in start..end {
-                    mask[y * self.width + x] = true;
-                }
-            }
-        }
+        });
         mask
     }
 
@@ -1432,26 +1443,13 @@ impl EmfVectorState {
             .iter()
             .map(|point| self.map_point(*point))
             .collect::<Vec<_>>();
-        for y in 0..self.height {
-            let scan_y = y as f32 + 0.5;
-            let mut intersections = Vec::new();
-            for index in 0..mapped.len() {
-                let (x1, y1) = mapped[index];
-                let (x2, y2) = mapped[(index + 1) % mapped.len()];
-                if (y1 <= scan_y && y2 > scan_y) || (y2 <= scan_y && y1 > scan_y) {
-                    let t = (scan_y - y1) / (y2 - y1);
-                    intersections.push(x1 + t * (x2 - x1));
-                }
+        let width = self.width;
+        let height = self.height;
+        visit_polygon_scanline_spans(&mapped, width, height, |y, start, end| {
+            for x in start..end {
+                self.set_pixel(x as i32, y as i32, color);
             }
-            intersections.sort_by(|a, b| a.total_cmp(b));
-            for pair in intersections.chunks_exact(2) {
-                let start = pair[0].floor().max(0.0) as usize;
-                let end = pair[1].ceil().min(self.width as f32) as usize;
-                for x in start..end {
-                    self.set_pixel(x as i32, y as i32, color);
-                }
-            }
-        }
+        });
     }
 
     fn fill_polygon_with_emf_plus_brush(
@@ -1467,26 +1465,13 @@ impl EmfVectorState {
             .iter()
             .map(|point| self.map_point(*point))
             .collect::<Vec<_>>();
-        for y in 0..self.height {
-            let scan_y = y as f32 + 0.5;
-            let mut intersections = Vec::new();
-            for index in 0..mapped.len() {
-                let (x1, y1) = mapped[index];
-                let (x2, y2) = mapped[(index + 1) % mapped.len()];
-                if (y1 <= scan_y && y2 > scan_y) || (y2 <= scan_y && y1 > scan_y) {
-                    let t = (scan_y - y1) / (y2 - y1);
-                    intersections.push(x1 + t * (x2 - x1));
-                }
+        let width = self.width;
+        let height = self.height;
+        visit_polygon_scanline_spans(&mapped, width, height, |y, start, end| {
+            for x in start..end {
+                self.set_pixel(x as i32, y as i32, brush.color_at(x as i32, y as i32));
             }
-            intersections.sort_by(|a, b| a.total_cmp(b));
-            for pair in intersections.chunks_exact(2) {
-                let start = pair[0].floor().max(0.0) as usize;
-                let end = pair[1].ceil().min(self.width as f32) as usize;
-                for x in start..end {
-                    self.set_pixel(x as i32, y as i32, brush.color_at(x as i32, y as i32));
-                }
-            }
-        }
+        });
     }
 
     fn draw_polyline(&mut self, points: &[EmfPoint], closed: bool) {
@@ -4375,6 +4360,121 @@ fn clamp_canvas_size(width: usize, height: usize, max_pixels: Option<u32>) -> (u
     }
 }
 
+fn visit_polygon_scanline_spans(
+    points: &[(f32, f32)],
+    width: usize,
+    height: usize,
+    mut visit: impl FnMut(usize, usize, usize),
+) {
+    if points.len() < 3 || width == 0 || height == 0 {
+        return;
+    }
+
+    let mut min_y = f32::INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    for &(_, y) in points {
+        if y.is_finite() {
+            min_y = min_y.min(y);
+            max_y = max_y.max(y);
+        }
+    }
+    if !min_y.is_finite() || !max_y.is_finite() {
+        return;
+    }
+
+    // A scanline samples at y + 0.5, so rows wholly outside the polygon's
+    // vertical bounds cannot contribute. Retaining one floor/ceil boundary
+    // row preserves the existing edge rule while avoiding a full-canvas scan
+    // for every small metafile polygon.
+    let start_y = min_y.floor().max(0.0).min(height as f32) as usize;
+    let end_y = max_y.ceil().max(0.0).min(height as f32) as usize;
+    let mut intersections = Vec::new();
+    for y in start_y..end_y {
+        let scan_y = y as f32 + 0.5;
+        intersections.clear();
+        for index in 0..points.len() {
+            let (x1, y1) = points[index];
+            let (x2, y2) = points[(index + 1) % points.len()];
+            if (y1 <= scan_y && y2 > scan_y) || (y2 <= scan_y && y1 > scan_y) {
+                let t = (scan_y - y1) / (y2 - y1);
+                intersections.push(x1 + t * (x2 - x1));
+            }
+        }
+        intersections.sort_by(|a, b| a.total_cmp(b));
+        for pair in intersections.chunks_exact(2) {
+            let start_x = pair[0].floor().max(0.0).min(width as f32) as usize;
+            let end_x = pair[1].ceil().max(0.0).min(width as f32) as usize;
+            if end_x > start_x {
+                visit(y, start_x, end_x);
+            }
+        }
+    }
+}
+
+fn axis_aligned_clip_rect(
+    points: &[(f32, f32)],
+    width: usize,
+    height: usize,
+) -> Option<(i32, i32, i32, i32)> {
+    let points = if points.len() == 5 && points_approximately_equal(points[0], points[4]) {
+        &points[..4]
+    } else {
+        points
+    };
+    if points.len() != 4 || points.iter().any(|(x, y)| !x.is_finite() || !y.is_finite()) {
+        return None;
+    }
+    for index in 0..points.len() {
+        let current = points[index];
+        let next = points[(index + 1) % points.len()];
+        if !approximately_equal(current.0, next.0) && !approximately_equal(current.1, next.1) {
+            return None;
+        }
+    }
+
+    let min_x = points
+        .iter()
+        .map(|point| point.0)
+        .fold(f32::INFINITY, f32::min);
+    let max_x = points
+        .iter()
+        .map(|point| point.0)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let min_y = points
+        .iter()
+        .map(|point| point.1)
+        .fold(f32::INFINITY, f32::min);
+    let max_y = points
+        .iter()
+        .map(|point| point.1)
+        .fold(f32::NEG_INFINITY, f32::max);
+    Some((
+        min_x.floor().max(0.0).min(width as f32) as i32,
+        (min_y - 0.5).ceil().max(0.0).min(height as f32) as i32,
+        max_x.ceil().max(0.0).min(width as f32) as i32,
+        (max_y - 0.5).ceil().max(0.0).min(height as f32) as i32,
+    ))
+}
+
+fn points_approximately_equal(left: (f32, f32), right: (f32, f32)) -> bool {
+    approximately_equal(left.0, right.0) && approximately_equal(left.1, right.1)
+}
+
+fn approximately_equal(left: f32, right: f32) -> bool {
+    (left - right).abs() <= 0.001
+}
+
+fn intersect_rects(
+    left: (i32, i32, i32, i32),
+    right: (i32, i32, i32, i32),
+) -> (i32, i32, i32, i32) {
+    let x1 = left.0.max(right.0);
+    let y1 = left.1.max(right.1);
+    let x2 = left.2.min(right.2).max(x1);
+    let y2 = left.3.min(right.3).max(y1);
+    (x1, y1, x2, y2)
+}
+
 fn read_poly_polygons_i32(
     data: &[u8],
     record_offset: usize,
@@ -4711,6 +4811,41 @@ mod tests {
         data.extend_from_slice(&y.to_le_bytes());
         data.extend_from_slice(&color_ref.to_le_bytes());
         EmfRecord::new(super::EMR_SET_PIXEL_V, data)
+    }
+
+    #[test]
+    fn polygon_scanlines_are_limited_to_the_visible_vertical_bounds() {
+        let points = [(2.0, 10.0), (5.0, 10.0), (5.0, 12.0), (2.0, 12.0)];
+        let mut spans = Vec::new();
+        visit_polygon_scanline_spans(&points, 20, 10_000, |y, start, end| {
+            spans.push((y, start, end));
+        });
+
+        assert_eq!(spans, [(10, 2, 5), (11, 2, 5)]);
+
+        spans.clear();
+        visit_polygon_scanline_spans(&points, 20, 8, |y, start, end| {
+            spans.push((y, start, end));
+        });
+        assert!(spans.is_empty());
+    }
+
+    #[test]
+    fn axis_aligned_polygon_clip_uses_the_same_pixel_center_bounds() {
+        let points = [(2.2, 10.8), (5.2, 10.8), (5.2, 13.2), (2.2, 13.2)];
+        assert_eq!(
+            axis_aligned_clip_rect(&points, 20, 20),
+            Some((2, 11, 6, 13))
+        );
+
+        let rotated = [(2.0, 3.0), (4.0, 2.0), (5.0, 4.0), (3.0, 5.0)];
+        assert_eq!(axis_aligned_clip_rect(&rotated, 20, 20), None);
+    }
+
+    #[test]
+    fn rectangle_clip_intersection_preserves_empty_regions() {
+        assert_eq!(intersect_rects((1, 2, 8, 9), (4, 0, 10, 6)), (4, 2, 8, 6));
+        assert_eq!(intersect_rects((1, 1, 2, 2), (4, 4, 5, 5)), (4, 4, 4, 4));
     }
 
     #[test]
