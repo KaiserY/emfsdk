@@ -2557,7 +2557,8 @@ impl EmfPlusMetafileObject {
   }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
+#[sdk(validate = "validate_emf_plus_image_attributes_object")]
 pub struct EmfPlusImageAttributesObject {
   pub version: EmfPlusGraphicsVersion,
   pub reserved1: u32,
@@ -2577,26 +2578,11 @@ impl EmfPlusImageAttributesObject {
   }
 
   pub fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
-    let value = Self {
-      version: EmfPlusGraphicsVersion::read_from(reader)?,
-      reserved1: reader.read_u32()?,
-      wrap_mode: reader.read_u32()?,
-      clamp_color: EmfPlusArgb::read_from(reader)?,
-      object_clamp: reader.read_i32()?,
-      reserved2: reader.read_u32()?,
-    };
-    validate_emf_plus_image_attributes_object(&value)?;
-    Ok(value)
+    <Self as SdkRead>::read_from(reader)
   }
 
   pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
-    validate_emf_plus_image_attributes_object(self)?;
-    self.version.write_to(writer)?;
-    writer.write_u32(self.reserved1)?;
-    writer.write_u32(self.wrap_mode)?;
-    self.clamp_color.write_to(writer)?;
-    writer.write_i32(self.object_clamp)?;
-    writer.write_u32(self.reserved2)
+    <Self as SdkWrite>::write_to(self, writer)
   }
 }
 
@@ -14315,6 +14301,7 @@ mod tests {
       reserved2: 0,
     };
     assert_eq!(attributes.wrap_mode_kind(), Some(EmfPlusWrapMode::Clamp));
+    assert_eq!(attributes.sdk_size(), 24);
     assert_eq!(
       attributes.object_clamp_kind(),
       Some(EmfPlusObjectClamp::BitmapClamp)

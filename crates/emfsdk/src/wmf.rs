@@ -1198,7 +1198,8 @@ impl SdkWrite for WmfMetafile {
   }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, SdkObject)]
+#[sdk(validate = "validate_wmf_placeable_header_lossless")]
 pub struct WmfPlaceableHeader {
   pub key: u32,
   pub handle: u16,
@@ -1213,37 +1214,11 @@ pub struct WmfPlaceableHeader {
 
 impl WmfPlaceableHeader {
   pub fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
-    let offset = reader.position()?;
-    let key = reader.read_u32()?;
-    if key != PLACEABLE_KEY {
-      return Err(Error::invalid(offset, "invalid WMF placeable header key"));
-    }
-    let value = Self {
-      key,
-      handle: reader.read_u16()?,
-      left: reader.read_i16()?,
-      top: reader.read_i16()?,
-      right: reader.read_i16()?,
-      bottom: reader.read_i16()?,
-      inch: reader.read_u16()?,
-      reserved: reader.read_u32()?,
-      checksum: reader.read_u16()?,
-    };
-    validate_wmf_placeable_header_lossless(&value)?;
-    Ok(value)
+    <Self as SdkRead>::read_from(reader)
   }
 
   pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
-    validate_wmf_placeable_header_lossless(self)?;
-    writer.write_u32(self.key)?;
-    writer.write_u16(self.handle)?;
-    writer.write_i16(self.left)?;
-    writer.write_i16(self.top)?;
-    writer.write_i16(self.right)?;
-    writer.write_i16(self.bottom)?;
-    writer.write_u16(self.inch)?;
-    writer.write_u32(self.reserved)?;
-    writer.write_u16(self.checksum)
+    <Self as SdkWrite>::write_to(self, writer)
   }
 
   pub fn computed_checksum(&self) -> u16 {
@@ -1287,25 +1262,8 @@ impl WmfPlaceableHeader {
   }
 }
 
-impl SdkRead for WmfPlaceableHeader {
-  fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
-    Self::read_from(reader)
-  }
-}
-
-impl SdkWrite for WmfPlaceableHeader {
-  fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
-    self.write_to(writer)
-  }
-}
-
-impl SdkSize for WmfPlaceableHeader {
-  fn sdk_size(&self) -> u64 {
-    PLACEABLE_HEADER_SIZE as u64
-  }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, SdkObject)]
+#[sdk(validate = "validate_wmf_header")]
 pub struct WmfHeader {
   pub metafile_type: u16,
   pub header_size_words: u16,
@@ -1318,32 +1276,11 @@ pub struct WmfHeader {
 
 impl WmfHeader {
   pub fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
-    let offset = reader.position()?;
-    let header = Self {
-      metafile_type: reader.read_u16()?,
-      header_size_words: reader.read_u16()?,
-      version: reader.read_u16()?,
-      file_size_words: reader.read_u32()?,
-      number_of_objects: reader.read_u16()?,
-      max_record_words: reader.read_u32()?,
-      number_of_parameters: reader.read_u16()?,
-    };
-    if header.header_size_words != 9 {
-      return Err(Error::invalid(offset, "WMF header size must be 9 WORDs"));
-    }
-    validate_wmf_header(&header)?;
-    Ok(header)
+    <Self as SdkRead>::read_from(reader)
   }
 
   pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
-    validate_wmf_header(self)?;
-    writer.write_u16(self.metafile_type)?;
-    writer.write_u16(self.header_size_words)?;
-    writer.write_u16(self.version)?;
-    writer.write_u32(self.file_size_words)?;
-    writer.write_u16(self.number_of_objects)?;
-    writer.write_u32(self.max_record_words)?;
-    writer.write_u16(self.number_of_parameters)
+    <Self as SdkWrite>::write_to(self, writer)
   }
 
   pub fn metafile_type_kind(&self) -> Option<WmfMetafileType> {
@@ -1368,24 +1305,6 @@ impl WmfHeader {
 
   pub fn number_of_members_is_zero(&self) -> bool {
     self.number_of_parameters == 0
-  }
-}
-
-impl SdkRead for WmfHeader {
-  fn read_from<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R>) -> Result<Self> {
-    Self::read_from(reader)
-  }
-}
-
-impl SdkWrite for WmfHeader {
-  fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
-    self.write_to(writer)
-  }
-}
-
-impl SdkSize for WmfHeader {
-  fn sdk_size(&self) -> u64 {
-    WMF_HEADER_SIZE as u64
   }
 }
 
@@ -6133,6 +6052,7 @@ mod tests {
   #[test]
   fn wmf_headers_validate_spec_fields() {
     let placeable = test_placeable_header();
+    assert_eq!(placeable.sdk_size(), PLACEABLE_HEADER_SIZE as u64);
     let mut bytes = Vec::new();
     placeable.write_to(&mut Writer::new(&mut bytes)).unwrap();
     bytes.extend_from_slice(&minimal_wmf());
@@ -6141,6 +6061,7 @@ mod tests {
     assert_eq!(placeable.bounding_box_width(), 100);
     assert_eq!(placeable.bounding_box_height(), 100);
     assert!(placeable.uses_twips());
+    assert_eq!(metafile.header.sdk_size(), WMF_HEADER_SIZE as u64);
     assert_eq!(metafile.header.header_size_bytes(), WMF_HEADER_SIZE as u32);
     assert_eq!(metafile.header.file_size_bytes(), 24);
     assert_eq!(metafile.header.max_record_bytes(), 6);

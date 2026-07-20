@@ -38,6 +38,9 @@ All notable changes to this project are documented in this file.
   tracks successful writes internally, top-level streams accept ordinary
   `Write` sinks, and preallocated byte serialization writes directly into
   `Vec<u8>`.
+- Moved the fixed WMF headers and EMF+ image-attributes object layout onto
+  `SdkObject`, keeping their compatibility validation and public convenience
+  methods while removing duplicate read, write, and size implementations.
 
 ### Testing
 
