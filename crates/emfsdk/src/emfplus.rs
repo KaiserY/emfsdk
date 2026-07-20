@@ -1329,7 +1329,7 @@ impl EmfPlusObjectData {
     }
   }
 
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     match self {
       Self::Brush(value) => value.write_to(writer),
       Self::CustomLineCap(value) => value.write_to(writer),
@@ -1352,7 +1352,7 @@ impl EmfPlusObjectData {
 
   pub fn to_bytes(&self) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    let mut writer = Writer::new(std::io::Cursor::new(&mut bytes));
+    let mut writer = Writer::new(&mut bytes);
     self.write_to(&mut writer)?;
     Ok(bytes)
   }
@@ -1423,7 +1423,7 @@ impl EmfPlusBrushObject {
     }
   }
 
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     validate_brush_object(self)?;
     self.version.write_to(writer)?;
     writer.write_u32(self.brush_type)?;
@@ -1453,7 +1453,7 @@ impl EmfPlusBrushData {
     }
   }
 
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     match self {
       Self::Solid(value) => value.write_to(writer),
       Self::Hatch(value) => value.write_to(writer),
@@ -1469,7 +1469,7 @@ impl EmfPlusBrushData {
 
   pub fn to_bytes(&self) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    let mut writer = Writer::new(std::io::Cursor::new(&mut bytes));
+    let mut writer = Writer::new(&mut bytes);
     self.write_to(&mut writer)?;
     Ok(bytes)
   }
@@ -1482,7 +1482,7 @@ pub struct EmfPlusSolidBrushData {
 }
 
 impl EmfPlusSolidBrushData {
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     validate_solid_brush_data(self)?;
     self.solid_color.write_to(writer)?;
     writer.write_all(&self.trailing_data)
@@ -1502,7 +1502,7 @@ impl EmfPlusHatchBrushData {
     EmfPlusHatchStyle::from_raw(self.hatch_style)
   }
 
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     validate_hatch_brush_data(self)?;
     writer.write_u32(self.hatch_style)?;
     self.fore_color.write_to(writer)?;
@@ -1541,7 +1541,7 @@ impl EmfPlusLinearGradientBrushData {
     )
   }
 
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     validate_linear_gradient_brush_data(self)?;
     writer.write_u32(self.brush_data_flags)?;
     writer.write_i32(self.wrap_mode)?;
@@ -1584,7 +1584,7 @@ impl EmfPlusPathGradientBrushData {
     )
   }
 
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     validate_path_gradient_brush_data(self)?;
     writer.write_u32(self.brush_data_flags)?;
     writer.write_i32(self.wrap_mode)?;
@@ -1609,7 +1609,7 @@ pub struct EmfPlusLinearGradientBrushOptionalData {
 }
 
 impl EmfPlusLinearGradientBrushOptionalData {
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     validate_linear_gradient_brush_optional_data(self)?;
     if let Some(transform_matrix) = &self.transform_matrix {
       transform_matrix.write_to(writer)?;
@@ -1622,7 +1622,7 @@ impl EmfPlusLinearGradientBrushOptionalData {
 
   pub fn to_bytes(&self) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    let mut writer = Writer::new(std::io::Cursor::new(&mut bytes));
+    let mut writer = Writer::new(&mut bytes);
     self.write_to(&mut writer)?;
     Ok(bytes)
   }
@@ -1636,7 +1636,7 @@ pub struct EmfPlusPathGradientBrushTailData {
 }
 
 impl EmfPlusPathGradientBrushTailData {
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     validate_path_gradient_brush_tail_data(self)?;
     if let Some(boundary_data) = &self.boundary_data {
       boundary_data.write_to(writer)?;
@@ -1647,7 +1647,7 @@ impl EmfPlusPathGradientBrushTailData {
 
   pub fn to_bytes(&self) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    let mut writer = Writer::new(std::io::Cursor::new(&mut bytes));
+    let mut writer = Writer::new(&mut bytes);
     self.write_to(&mut writer)?;
     Ok(bytes)
   }
@@ -1661,7 +1661,7 @@ pub struct EmfPlusPathGradientBrushOptionalData {
 }
 
 impl EmfPlusPathGradientBrushOptionalData {
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     validate_path_gradient_brush_optional_data(self)?;
     if let Some(transform_matrix) = &self.transform_matrix {
       transform_matrix.write_to(writer)?;
@@ -1687,7 +1687,7 @@ pub enum EmfPlusBlendPattern {
 }
 
 impl EmfPlusBlendPattern {
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     match self {
       Self::Colors(value) => value.write_to(writer),
       Self::Factors(value) => value.write_to(writer),
@@ -1710,7 +1710,7 @@ pub struct EmfPlusBlendColors {
 }
 
 impl EmfPlusBlendColors {
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     if self.positions.len() != self.colors.len() {
       return Err(Error::invalid(
         0,
@@ -1741,7 +1741,7 @@ pub struct EmfPlusBlendFactors {
 }
 
 impl EmfPlusBlendFactors {
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     if self.positions.len() != self.factors.len() {
       return Err(Error::invalid(
         0,
@@ -1771,7 +1771,7 @@ pub enum EmfPlusBoundaryData {
 }
 
 impl EmfPlusBoundaryData {
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     match self {
       Self::Path(value) => value.write_to(writer),
       Self::Points(value) => value.write_to(writer),
@@ -1786,7 +1786,7 @@ pub struct EmfPlusBoundaryPathData {
 }
 
 impl EmfPlusBoundaryPathData {
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     validate_boundary_path_data(self)?;
     self.path_data.write_to(writer)?;
     writer.write_all(&self.trailing_data)
@@ -1800,7 +1800,7 @@ pub struct EmfPlusBoundaryPointData {
 }
 
 impl EmfPlusBoundaryPointData {
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     validate_empty_trailing_data(&self.trailing_data, "EmfPlusBoundaryPointData")?;
     writer.write_i32(len_to_i32(self.points.len(), "EMF+ boundary points")?)?;
     for point in &self.points {
@@ -1819,7 +1819,7 @@ pub struct EmfPlusFocusScaleData {
 }
 
 impl EmfPlusFocusScaleData {
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     validate_focus_scale_data(self)?;
     writer.write_u32(self.focus_scale_count)?;
     writer.write_f32(self.focus_scale_x)?;
@@ -1845,7 +1845,7 @@ impl EmfPlusPalette {
     read_emf_plus_palette(&mut reader, data.len() as u64)
   }
 
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     validate_palette(self)?;
     writer.write_u32(self.palette_style_flags)?;
     writer.write_u32(len_to_u32(self.entries.len(), "EMF+ palette entries")?)?;
@@ -1857,7 +1857,7 @@ impl EmfPlusPalette {
 
   pub fn to_bytes(&self) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    let mut writer = Writer::new(std::io::Cursor::new(&mut bytes));
+    let mut writer = Writer::new(&mut bytes);
     self.write_to(&mut writer)?;
     Ok(bytes)
   }
@@ -1887,7 +1887,7 @@ impl EmfPlusTextureBrushData {
     )
   }
 
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     validate_texture_brush_data(self)?;
     writer.write_u32(self.brush_data_flags)?;
     writer.write_i32(self.wrap_mode)?;
@@ -1903,7 +1903,7 @@ pub struct EmfPlusTextureBrushOptionalData {
 }
 
 impl EmfPlusTextureBrushOptionalData {
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     validate_texture_brush_optional_data(self)?;
     if let Some(value) = &self.transform_matrix {
       value.write_to(writer)?;
@@ -1916,7 +1916,7 @@ impl EmfPlusTextureBrushOptionalData {
 
   pub fn to_bytes(&self) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    let mut writer = Writer::new(std::io::Cursor::new(&mut bytes));
+    let mut writer = Writer::new(&mut bytes);
     self.write_to(&mut writer)?;
     Ok(bytes)
   }
@@ -1983,7 +1983,7 @@ impl EmfPlusCustomLineCapObject {
     }
   }
 
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     validate_custom_line_cap_object(self)?;
     self.version.write_to(writer)?;
     writer.write_i32(self.cap_type)?;
@@ -1992,7 +1992,7 @@ impl EmfPlusCustomLineCapObject {
 
   pub fn to_bytes(&self) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    let mut writer = Writer::new(std::io::Cursor::new(&mut bytes));
+    let mut writer = Writer::new(&mut bytes);
     self.write_to(&mut writer)?;
     Ok(bytes)
   }
@@ -2014,7 +2014,7 @@ impl EmfPlusCustomLineCapData {
     }
   }
 
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     match self {
       Self::Arrow(value) => value.write_to(writer),
       Self::Default(value) => value.write_to(writer),
@@ -2027,7 +2027,7 @@ impl EmfPlusCustomLineCapData {
 
   pub fn to_bytes(&self) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    let mut writer = Writer::new(std::io::Cursor::new(&mut bytes));
+    let mut writer = Writer::new(&mut bytes);
     self.write_to(&mut writer)?;
     Ok(bytes)
   }
@@ -2068,7 +2068,7 @@ impl EmfPlusCustomLineCapArrowData {
       .and_then(EmfPlusLineJoinType::from_raw)
   }
 
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     validate_custom_line_cap_arrow_data(self)?;
     writer.write_f32(self.width)?;
     writer.write_f32(self.height)?;
@@ -2138,7 +2138,7 @@ impl EmfPlusCustomLineCapDefaultData {
     )
   }
 
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     validate_custom_line_cap_default_data(self)?;
     writer.write_u32(self.custom_line_cap_data_flags)?;
     writer.write_u32(self.base_cap)?;
@@ -2162,7 +2162,7 @@ pub struct EmfPlusCustomLineCapOptionalData {
 }
 
 impl EmfPlusCustomLineCapOptionalData {
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     validate_custom_line_cap_optional_data(self)?;
     if let Some(fill_path) = &self.fill_path {
       fill_path.write_to(writer)?;
@@ -2175,7 +2175,7 @@ impl EmfPlusCustomLineCapOptionalData {
 
   pub fn to_bytes(&self) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    let mut writer = Writer::new(std::io::Cursor::new(&mut bytes));
+    let mut writer = Writer::new(&mut bytes);
     self.write_to(&mut writer)?;
     Ok(bytes)
   }
@@ -2188,7 +2188,7 @@ pub struct EmfPlusFillPathObject {
 }
 
 impl EmfPlusFillPathObject {
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     validate_fill_path_object(self)?;
     self.path_data.write_to(writer)?;
     writer.write_all(&self.trailing_data)
@@ -2202,7 +2202,7 @@ pub struct EmfPlusLinePathObject {
 }
 
 impl EmfPlusLinePathObject {
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     validate_line_path_object(self)?;
     self.path_data.write_to(writer)?;
     writer.write_all(&self.trailing_data)
@@ -2229,7 +2229,7 @@ impl EmfPlusFontObject {
     EmfPlusFontStyleFlags::from_bits_retain(self.font_style_flags as u32)
   }
 
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     validate_font_object(self)?;
     self.version.write_to(writer)?;
     writer.write_f32(self.em_size)?;
@@ -2304,7 +2304,7 @@ impl EmfPlusImageObject {
     }
   }
 
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     validate_image_object(self)?;
     self.version.write_to(writer)?;
     writer.write_u32(self.image_type)?;
@@ -2328,7 +2328,7 @@ impl EmfPlusImageData {
     }
   }
 
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     match self {
       Self::Bitmap(value) => value.write_to(writer),
       Self::Metafile(value) => value.write_to(writer),
@@ -2341,7 +2341,7 @@ impl EmfPlusImageData {
 
   pub fn to_bytes(&self) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    let mut writer = Writer::new(std::io::Cursor::new(&mut bytes));
+    let mut writer = Writer::new(&mut bytes);
     self.write_to(&mut writer)?;
     Ok(bytes)
   }
@@ -2368,7 +2368,7 @@ impl EmfPlusBitmapPayload {
     }
   }
 
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     match self {
       Self::Pixel(value) => value.write_to(writer),
       Self::Compressed(value) => value.write_to(writer),
@@ -2384,7 +2384,7 @@ impl EmfPlusBitmapPayload {
 
   pub fn to_bytes(&self) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    let mut writer = Writer::new(std::io::Cursor::new(&mut bytes));
+    let mut writer = Writer::new(&mut bytes);
     self.write_to(&mut writer)?;
     Ok(bytes)
   }
@@ -2397,7 +2397,7 @@ pub struct EmfPlusBitmapDataObject {
 }
 
 impl EmfPlusBitmapDataObject {
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     if let Some(palette) = &self.palette {
       if !palette.trailing_data.is_empty() {
         return Err(Error::invalid(
@@ -2412,7 +2412,7 @@ impl EmfPlusBitmapDataObject {
 
   pub fn to_bytes(&self) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    let mut writer = Writer::new(std::io::Cursor::new(&mut bytes));
+    let mut writer = Writer::new(&mut bytes);
     self.write_to(&mut writer)?;
     Ok(bytes)
   }
@@ -2424,13 +2424,13 @@ pub struct EmfPlusCompressedImageObject {
 }
 
 impl EmfPlusCompressedImageObject {
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     writer.write_all(&self.compressed_image_data)
   }
 
   pub fn to_bytes(&self) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    let mut writer = Writer::new(std::io::Cursor::new(&mut bytes));
+    let mut writer = Writer::new(&mut bytes);
     self.write_to(&mut writer)?;
     Ok(bytes)
   }
@@ -2521,7 +2521,7 @@ impl EmfPlusBitmapObject {
     Ok(())
   }
 
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     validate_emf_plus_bitmap_object(self)?;
     writer.write_i32(self.width)?;
     writer.write_i32(self.height)?;
@@ -2548,7 +2548,7 @@ impl EmfPlusMetafileObject {
     EmfPlusMetafileDataType::from_raw(self.metafile_type)
   }
 
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     validate_metafile_object(self)?;
     writer.write_u32(self.metafile_type)?;
     writer.write_u32(len_to_u32(self.metafile_data.len(), "EMF+ metafile data")?)?;
@@ -2589,7 +2589,7 @@ impl EmfPlusImageAttributesObject {
     Ok(value)
   }
 
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     validate_emf_plus_image_attributes_object(self)?;
     self.version.write_to(writer)?;
     writer.write_u32(self.reserved1)?;
@@ -2616,12 +2616,12 @@ impl EmfPlusPathObject {
 
   pub fn to_bytes(&self) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    let mut writer = Writer::new(std::io::Cursor::new(&mut bytes));
+    let mut writer = Writer::new(&mut bytes);
     self.write_to(&mut writer)?;
     Ok(bytes)
   }
 
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     let point_count = self.points.len();
     validate_path_object(self)?;
     self.version.write_to(writer)?;
@@ -2657,7 +2657,7 @@ impl EmfPlusPathPointTypes {
     }
   }
 
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     validate_path_point_type_sequence(self)?;
     match self {
       Self::Values(values) => {
@@ -2815,7 +2815,7 @@ impl EmfPlusPenObject {
     Ok(())
   }
 
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     validate_pen_object(self)?;
     writer.write_u32(self.version.value)?;
     writer.write_u32(self.pen_type)?;
@@ -2830,7 +2830,7 @@ pub struct EmfPlusPenPayload {
 }
 
 impl EmfPlusPenPayload {
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     if self.brush_object.is_none() {
       return Err(Error::invalid(0, "EmfPlusPen BrushObject is missing"));
     }
@@ -2843,7 +2843,7 @@ impl EmfPlusPenPayload {
 
   pub fn to_bytes(&self) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    let mut writer = Writer::new(std::io::Cursor::new(&mut bytes));
+    let mut writer = Writer::new(&mut bytes);
     self.write_to(&mut writer)?;
     Ok(bytes)
   }
@@ -2867,7 +2867,7 @@ impl EmfPlusPenData {
     EmfPlusUnitType::from_raw(self.pen_unit)
   }
 
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     validate_pen_data(self)?;
     self.optional_data.validate_for_flags(self.flags())?;
     writer.write_u32(self.pen_data_flags)?;
@@ -2884,13 +2884,13 @@ pub struct EmfPlusDashedLineData {
 }
 
 impl EmfPlusDashedLineData {
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     write_f32_array_with_u32_count(writer, &self.dashed_line_data, "EMF+ dashed line data")
   }
 
   pub fn to_bytes(&self) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    let mut writer = Writer::new(std::io::Cursor::new(&mut bytes));
+    let mut writer = Writer::new(&mut bytes);
     self.write_to(&mut writer)?;
     Ok(bytes)
   }
@@ -2902,14 +2902,14 @@ pub struct EmfPlusCompoundLineData {
 }
 
 impl EmfPlusCompoundLineData {
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     validate_increasing_unit_interval_values(&self.compound_line_data, "EmfPlusCompoundLineData")?;
     write_f32_array_with_u32_count(writer, &self.compound_line_data, "EMF+ compound line data")
   }
 
   pub fn to_bytes(&self) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    let mut writer = Writer::new(std::io::Cursor::new(&mut bytes));
+    let mut writer = Writer::new(&mut bytes);
     self.write_to(&mut writer)?;
     Ok(bytes)
   }
@@ -2939,7 +2939,7 @@ impl EmfPlusCustomStartCapData {
     Ok(())
   }
 
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     self.parse_custom_start_cap()?;
     writer.write_u32(len_to_u32(
       self.custom_start_cap.len(),
@@ -2950,7 +2950,7 @@ impl EmfPlusCustomStartCapData {
 
   pub fn to_bytes(&self) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    let mut writer = Writer::new(std::io::Cursor::new(&mut bytes));
+    let mut writer = Writer::new(&mut bytes);
     self.write_to(&mut writer)?;
     Ok(bytes)
   }
@@ -2980,7 +2980,7 @@ impl EmfPlusCustomEndCapData {
     Ok(())
   }
 
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     self.parse_custom_end_cap()?;
     writer.write_u32(len_to_u32(
       self.custom_end_cap.len(),
@@ -2991,7 +2991,7 @@ impl EmfPlusCustomEndCapData {
 
   pub fn to_bytes(&self) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    let mut writer = Writer::new(std::io::Cursor::new(&mut bytes));
+    let mut writer = Writer::new(&mut bytes);
     self.write_to(&mut writer)?;
     Ok(bytes)
   }
@@ -3041,7 +3041,7 @@ impl EmfPlusPenOptionalData {
     self.pen_alignment.and_then(EmfPlusPenAlignment::from_raw)
   }
 
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     self.validate_arrays()?;
     if let Some(value) = &self.transform_matrix {
       value.write_to(writer)?;
@@ -3295,7 +3295,7 @@ impl EmfPlusRegionObject {
     Ok(nodes)
   }
 
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     validate_region_object(self)?;
     self.version.write_to(writer)?;
     writer.write_u32(self.region_node_count)?;
@@ -3314,7 +3314,7 @@ impl EmfPlusRegionNode {
     EmfPlusRegionNodeDataType::from_raw(self.node_type)
   }
 
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     validate_region_node_data_matches_type(self)?;
     writer.write_u32(self.node_type)?;
     self.data.write_to(writer)
@@ -3332,7 +3332,7 @@ pub enum EmfPlusRegionNodeData {
 }
 
 impl EmfPlusRegionNodeData {
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     match self {
       Self::ChildNodes(value) => value.write_to(writer),
       Self::Raw(value) => writer.write_all(value),
@@ -3364,7 +3364,7 @@ impl EmfPlusRegionNodePathData {
     }
   }
 
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     validate_region_node_path_data(self, "EmfPlusRegionNodePath")?;
     let path_bytes = self.path_bytes()?;
     writer.write_i32(len_to_i32(path_bytes.len(), "EMF+ region node path")?)?;
@@ -3383,7 +3383,7 @@ impl EmfPlusRegionNodeChildNodes {
     self.left.node_count() + self.right.node_count()
   }
 
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     self.left.write_to(writer)?;
     self.right.write_to(writer)
   }
@@ -3527,7 +3527,7 @@ impl EmfPlusStringFormatObject {
     EmfPlusStringTrimming::from_raw(self.trimming)
   }
 
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     validate_string_format_object(self)?;
     self.version.write_to(writer)?;
     writer.write_u32(self.string_format_flags)?;
@@ -3732,7 +3732,7 @@ pub enum EmfPlusImageEffect {
 }
 
 impl EmfPlusImageEffect {
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     match self {
       Self::Blur(value) => value.write_to(writer),
       Self::BrightnessContrast(value) => value.write_to(writer),
@@ -3757,7 +3757,7 @@ impl EmfPlusImageEffect {
 
   pub fn to_bytes(&self) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    let mut writer = Writer::new(std::io::Cursor::new(&mut bytes));
+    let mut writer = Writer::new(&mut bytes);
     self.write_to(&mut writer)?;
     Ok(bytes)
   }
@@ -3771,7 +3771,7 @@ pub struct EmfPlusBlurEffect {
 }
 
 impl EmfPlusBlurEffect {
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     validate_blur_effect(self)?;
     writer.write_f32(self.blur_radius)?;
     writer.write_u32(self.expand_edge)?;
@@ -3787,7 +3787,7 @@ pub struct EmfPlusBrightnessContrastEffect {
 }
 
 impl EmfPlusBrightnessContrastEffect {
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     validate_brightness_contrast_effect(self)?;
     writer.write_i32(self.brightness_level)?;
     writer.write_i32(self.contrast_level)?;
@@ -3804,7 +3804,7 @@ pub struct EmfPlusColorBalanceEffect {
 }
 
 impl EmfPlusColorBalanceEffect {
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     validate_color_balance_effect(self)?;
     writer.write_i32(self.cyan_red)?;
     writer.write_i32(self.magenta_green)?;
@@ -3830,7 +3830,7 @@ impl EmfPlusColorCurveEffect {
     EmfPlusCurveChannel::from_raw(self.curve_channel)
   }
 
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     validate_color_curve_effect(self)?;
     writer.write_u32(self.curve_adjustment)?;
     writer.write_u32(self.curve_channel)?;
@@ -3849,7 +3849,7 @@ pub struct EmfPlusColorLookupTableEffect {
 }
 
 impl EmfPlusColorLookupTableEffect {
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     validate_color_lookup_table_effect(self)?;
     writer.write_all(&self.blue_lookup_table)?;
     writer.write_all(&self.green_lookup_table)?;
@@ -3866,7 +3866,7 @@ pub struct EmfPlusColorMatrixEffect {
 }
 
 impl EmfPlusColorMatrixEffect {
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     validate_color_matrix_effect(self)?;
     for column in self.matrix {
       for value in column {
@@ -3886,7 +3886,7 @@ pub struct EmfPlusHueSaturationLightnessEffect {
 }
 
 impl EmfPlusHueSaturationLightnessEffect {
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     validate_hue_saturation_lightness_effect(self)?;
     writer.write_i32(self.hue_level)?;
     writer.write_i32(self.saturation_level)?;
@@ -3904,7 +3904,7 @@ pub struct EmfPlusLevelsEffect {
 }
 
 impl EmfPlusLevelsEffect {
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     validate_levels_effect(self)?;
     writer.write_i32(self.highlight)?;
     writer.write_i32(self.mid_tone)?;
@@ -3920,7 +3920,7 @@ pub struct EmfPlusRedEyeCorrectionEffect {
 }
 
 impl EmfPlusRedEyeCorrectionEffect {
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     validate_red_eye_correction_effect(self)?;
     writer.write_i32(len_to_i32(self.areas.len(), "EMF+ red eye areas")?)?;
     for area in &self.areas {
@@ -3938,7 +3938,7 @@ pub struct EmfPlusSharpenEffect {
 }
 
 impl EmfPlusSharpenEffect {
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     validate_sharpen_effect(self)?;
     writer.write_f32(self.radius)?;
     writer.write_f32(self.amount)?;
@@ -3954,7 +3954,7 @@ pub struct EmfPlusTintEffect {
 }
 
 impl EmfPlusTintEffect {
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     validate_tint_effect(self)?;
     writer.write_i32(self.hue)?;
     writer.write_i32(self.amount)?;
@@ -4115,7 +4115,7 @@ impl EmfPlusSetTsClipData {
     }
   }
 
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     validate_set_ts_clip(self)?;
     match &self.rects {
       EmfPlusSetTsClipRects::Rects(rects) => {
@@ -4212,7 +4212,7 @@ impl<T: SdkSize> SdkSize for EmfPlusTransformOrderData<T> {
 }
 
 impl<T: SdkWrite> EmfPlusTransformOrderData<T> {
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     self.data.write_to(writer)
   }
 }
@@ -4243,7 +4243,7 @@ impl EmfPlusSetClipRectData {
     Ok(self.flags_bits())
   }
 
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     self.checked_flags_bits()?;
     self.clip_rect.write_to(writer)
   }
@@ -4478,7 +4478,7 @@ impl EmfPlusRecordRef<'_> {
     EmfPlusRecordType::from_raw(self.record_type)
   }
 
-  pub fn to_owned(self) -> EmfPlusRecord {
+  pub fn into_owned(self) -> EmfPlusRecord {
     EmfPlusRecord {
       record_type: self.record_type,
       flags: self.flags,
@@ -4557,7 +4557,16 @@ pub struct EmfPlusStreamRef<'a> {
 
 impl<'a> EmfPlusStreamRef<'a> {
   pub fn from_bytes(bytes: &'a [u8]) -> Result<Self> {
-    let value = Self::from_bytes_compatible(bytes)?;
+    let (records_end, record_count) = scan_emf_plus_records(bytes)?;
+    Ok(Self {
+      records_bytes: &bytes[..records_end],
+      trailing_data: &bytes[records_end..],
+      record_count,
+    })
+  }
+
+  pub fn from_bytes_exact(bytes: &'a [u8]) -> Result<Self> {
+    let value = Self::from_bytes(bytes)?;
     if !value.trailing_data.is_empty() {
       return Err(Error::invalid(
         value.records_bytes.len() as u64,
@@ -4565,15 +4574,6 @@ impl<'a> EmfPlusStreamRef<'a> {
       ));
     }
     Ok(value)
-  }
-
-  pub fn from_bytes_compatible(bytes: &'a [u8]) -> Result<Self> {
-    let (records_end, record_count) = scan_emf_plus_records(bytes)?;
-    Ok(Self {
-      records_bytes: &bytes[..records_end],
-      trailing_data: &bytes[records_end..],
-      record_count,
-    })
   }
 
   pub fn records(&self) -> EmfPlusRecords<'a> {
@@ -4592,8 +4592,60 @@ impl<'a> EmfPlusStreamRef<'a> {
     self.trailing_data
   }
 
-  pub fn to_owned(self) -> Vec<EmfPlusRecord> {
-    self.records().map(EmfPlusRecordRef::to_owned).collect()
+  pub fn into_owned(self) -> EmfPlusStream {
+    EmfPlusStream {
+      records: self.records().map(EmfPlusRecordRef::into_owned).collect(),
+      trailing_data: self.trailing_data.to_vec(),
+    }
+  }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EmfPlusStream {
+  pub records: Vec<EmfPlusRecord>,
+  pub trailing_data: Vec<u8>,
+}
+
+impl EmfPlusStream {
+  pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+    Ok(EmfPlusStreamRef::from_bytes(bytes)?.into_owned())
+  }
+
+  pub fn from_bytes_exact(bytes: &[u8]) -> Result<Self> {
+    Ok(EmfPlusStreamRef::from_bytes_exact(bytes)?.into_owned())
+  }
+
+  pub fn to_bytes(&self) -> Result<Vec<u8>> {
+    let capacity = self
+      .records
+      .iter()
+      .try_fold(self.trailing_data.len(), |capacity, record| {
+        let record_size = usize::try_from(record.sdk_size())
+          .map_err(|_| Error::invalid(0, "EMF+ record size overflows usize"))?;
+        capacity
+          .checked_add(record_size)
+          .ok_or_else(|| Error::invalid(0, "EMF+ stream serialized size overflows usize"))
+      })?;
+    let mut writer = Writer::new(Vec::with_capacity(capacity));
+    self.write_to_writer(&mut writer)?;
+    Ok(writer.into_inner())
+  }
+
+  pub fn write_to<W: std::io::Write>(&self, writer: W) -> Result<()> {
+    self.write_to_writer(&mut Writer::new(writer))
+  }
+
+  fn write_to_writer<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
+    for record in &self.records {
+      record.write_to(writer)?;
+    }
+    writer.write_all(&self.trailing_data)
+  }
+}
+
+impl SdkWrite for EmfPlusStream {
+  fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
+    self.write_to_writer(writer)
   }
 }
 
@@ -4789,6 +4841,16 @@ impl EmfPlusRecord {
 
   pub fn parse_data(&self) -> Result<EmfPlusRecordData<'_>> {
     self.as_ref().parse_data()
+  }
+
+  pub fn rebuild_typed(&self) -> Result<Self> {
+    self.as_ref().rebuild_typed()
+  }
+}
+
+impl SdkWrite for EmfPlusRecord {
+  fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
+    EmfPlusRecord::write_to(self, writer)
   }
 }
 
@@ -5379,6 +5441,15 @@ impl<'a> EmfPlusRecordRef<'a> {
     validate_emf_plus_record_data(&data, flags)?;
     Ok(data)
   }
+
+  pub fn rebuild_typed(self) -> Result<EmfPlusRecord> {
+    let flags = self.flags();
+    let padding = self.padding.to_vec();
+    let data = self.parse_data()?;
+    let mut record = EmfPlusRecord::from_data(&data, flags)?;
+    record.padding = padding;
+    Ok(record)
+  }
 }
 
 impl EmfPlusRecord {
@@ -5399,7 +5470,7 @@ impl EmfPlusRecord {
       .map_err(|_| Error::invalid(0, "EMF+ record data size overflows usize"))?;
     let mut record_data = Vec::with_capacity(record_data_capacity);
     {
-      let mut writer = Writer::new(std::io::Cursor::new(&mut record_data));
+      let mut writer = Writer::new(&mut record_data);
       match data {
         EmfPlusRecordData::Header(value) => value.write_to(&mut writer)?,
         EmfPlusRecordData::Eof => {}
@@ -5584,7 +5655,7 @@ impl EmfPlusRecord {
         EmfPlusRecordData::SetTsClip(value) => value.write_to(&mut writer)?,
         EmfPlusRecordData::Unknown(record) => {
           validate_unknown_emf_plus_record(record.record_type)?;
-          return Ok(EmfPlusRecordRef::to_owned(*record));
+          return Ok(EmfPlusRecordRef::into_owned(*record));
         }
       }
     }
@@ -5684,7 +5755,7 @@ impl EmfPlusRecord {
     })
   }
 
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     let has_continued_object_header =
       self.record_type == EmfPlusRecordType::Object.raw() && self.flags().object_continues();
     if has_continued_object_header != self.total_object_size.is_some() {
@@ -7734,7 +7805,7 @@ fn read_f32_array_body<R: std::io::Read + std::io::Seek>(
   Ok(values)
 }
 
-fn write_f32_array_with_u32_count<W: std::io::Write + std::io::Seek>(
+fn write_f32_array_with_u32_count<W: std::io::Write>(
   writer: &mut Writer<W>,
   values: &[f32],
   name: &str,
@@ -7916,7 +7987,7 @@ fn finish_record_point_array<R: std::io::Read + std::io::Seek>(
   Ok(())
 }
 
-fn write_points<W: std::io::Write + std::io::Seek>(
+fn write_points<W: std::io::Write>(
   writer: &mut Writer<W>,
   points: &EmfPlusPointData,
 ) -> Result<()> {
@@ -7941,7 +8012,7 @@ fn write_points<W: std::io::Write + std::io::Seek>(
   Ok(())
 }
 
-fn write_record_points<W: std::io::Write + std::io::Seek>(
+fn write_record_points<W: std::io::Write>(
   writer: &mut Writer<W>,
   points: &EmfPlusPointData,
 ) -> Result<()> {
@@ -7949,7 +8020,7 @@ fn write_record_points<W: std::io::Write + std::io::Seek>(
   write_record_point_alignment_padding(writer, points)
 }
 
-fn write_record_point_alignment_padding<W: std::io::Write + std::io::Seek>(
+fn write_record_point_alignment_padding<W: std::io::Write>(
   writer: &mut Writer<W>,
   points: &EmfPlusPointData,
 ) -> Result<()> {
@@ -7983,10 +8054,7 @@ fn read_emf_plus_integer<R: std::io::Read + std::io::Seek>(reader: &mut Reader<R
   Ok(((raw << 1) as i16) >> 1)
 }
 
-fn write_emf_plus_integer<W: std::io::Write + std::io::Seek>(
-  writer: &mut Writer<W>,
-  value: i16,
-) -> Result<()> {
+fn write_emf_plus_integer<W: std::io::Write>(writer: &mut Writer<W>, value: i16) -> Result<()> {
   if (-64..=63).contains(&value) {
     writer.write_u8((value as i8 as u8) & 0x7F)
   } else if (-16_384..=16_383).contains(&value) {
@@ -8013,7 +8081,7 @@ fn read_brush_ref<R: std::io::Read + std::io::Seek>(
   }
 }
 
-fn write_brush_ref<W: std::io::Write + std::io::Seek>(
+fn write_brush_ref<W: std::io::Write>(
   writer: &mut Writer<W>,
   brush: EmfPlusBrushRef,
 ) -> Result<()> {
@@ -8023,10 +8091,7 @@ fn write_brush_ref<W: std::io::Write + std::io::Seek>(
   }
 }
 
-fn write_rects<W: std::io::Write + std::io::Seek>(
-  writer: &mut Writer<W>,
-  rects: &[EmfPlusRect],
-) -> Result<()> {
+fn write_rects<W: std::io::Write>(writer: &mut Writer<W>, rects: &[EmfPlusRect]) -> Result<()> {
   validate_homogeneous_rects(rects)?;
   for rect in rects {
     match rect {
@@ -9581,13 +9646,12 @@ fn wrap_mode_from_i32(value: i32) -> Option<EmfPlusWrapMode> {
 }
 
 pub fn read_records(bytes: &[u8]) -> Result<Vec<EmfPlusRecord>> {
-  Ok(EmfPlusStreamRef::from_bytes(bytes)?.to_owned())
+  Ok(EmfPlusStream::from_bytes_exact(bytes)?.records)
 }
 
 pub(crate) fn read_records_with_trailing(bytes: &[u8]) -> Result<(Vec<EmfPlusRecord>, Vec<u8>)> {
-  let stream = EmfPlusStreamRef::from_bytes_compatible(bytes)?;
-  let trailing_data = stream.trailing_data().to_vec();
-  Ok((stream.to_owned(), trailing_data))
+  let stream = EmfPlusStream::from_bytes(bytes)?;
+  Ok((stream.records, stream.trailing_data))
 }
 
 #[cfg(test)]
@@ -9665,7 +9729,7 @@ mod tests {
     assert_eq!(record.padding.as_ptr(), bytes[14..].as_ptr());
     assert_eq!(record.sdk_size(), bytes.len() as u64);
     assert!(record.parse_data().is_err());
-    assert_eq!(stream.to_owned(), read_records(&bytes).unwrap());
+    assert_eq!(stream.into_owned().records, read_records(&bytes).unwrap());
 
     let eof_bytes = [
       0x02, 0x40, // Type: EndOfFile
@@ -9679,15 +9743,17 @@ mod tests {
       .next()
       .unwrap();
     assert!(matches!(eof.parse_data().unwrap(), EmfPlusRecordData::Eof));
+    assert_eq!(eof.rebuild_typed().unwrap().as_ref(), eof);
     let mut invalid_late_record = eof_bytes.repeat(2);
     invalid_late_record[16..20].copy_from_slice(&8u32.to_le_bytes());
     assert!(EmfPlusStreamRef::from_bytes(&invalid_late_record).is_err());
 
     let mut compatible = bytes.to_vec();
     compatible.extend_from_slice(&[0x11, 0x22]);
-    let stream = EmfPlusStreamRef::from_bytes_compatible(&compatible).unwrap();
+    let stream = EmfPlusStreamRef::from_bytes(&compatible).unwrap();
     assert_eq!(stream.trailing_data(), &[0x11, 0x22]);
-    assert!(EmfPlusStreamRef::from_bytes(&compatible).is_err());
+    assert_eq!(stream.into_owned().to_bytes().unwrap(), compatible);
+    assert!(EmfPlusStreamRef::from_bytes_exact(&compatible).is_err());
   }
 
   #[test]
@@ -10264,7 +10330,7 @@ mod tests {
     );
     let mut clip_rect_bytes = Vec::new();
     clip_rect
-      .write_to(&mut Writer::new(std::io::Cursor::new(&mut clip_rect_bytes)))
+      .write_to(&mut Writer::new(&mut clip_rect_bytes))
       .unwrap();
     assert!(
       EmfPlusRecord {
@@ -10577,9 +10643,7 @@ mod tests {
         data: {
           let mut bytes = Vec::new();
           if let EmfPlusRecordData::BeginContainer(value) = begin_container {
-            value
-              .write_to(&mut Writer::new(std::io::Cursor::new(&mut bytes)))
-              .unwrap();
+            value.write_to(&mut Writer::new(&mut bytes)).unwrap();
           }
           bytes
         },
@@ -15099,7 +15163,7 @@ mod tests {
       trailing_data: Vec::new(),
     };
     let mut bytes = Vec::new();
-    let mut writer = Writer::new(std::io::Cursor::new(&mut bytes));
+    let mut writer = Writer::new(&mut bytes);
     assert!(missing_optional_pen_data.write_to(&mut writer).is_err());
 
     let invalid_pen_unit_data = EmfPlusPenData {
@@ -15110,7 +15174,7 @@ mod tests {
       trailing_data: Vec::new(),
     };
     let mut bytes = Vec::new();
-    let mut writer = Writer::new(std::io::Cursor::new(&mut bytes));
+    let mut writer = Writer::new(&mut bytes);
     assert!(invalid_pen_unit_data.write_to(&mut writer).is_err());
 
     let invalid_pen_flags_data = EmfPlusPenData {
@@ -15121,7 +15185,7 @@ mod tests {
       trailing_data: Vec::new(),
     };
     let mut bytes = Vec::new();
-    let mut writer = Writer::new(std::io::Cursor::new(&mut bytes));
+    let mut writer = Writer::new(&mut bytes);
     assert!(invalid_pen_flags_data.write_to(&mut writer).is_err());
     let stray_optional_pen_data = EmfPlusPenData {
       pen_data_flags: 0,
@@ -15134,7 +15198,7 @@ mod tests {
       trailing_data: Vec::new(),
     };
     let mut bytes = Vec::new();
-    let mut writer = Writer::new(std::io::Cursor::new(&mut bytes));
+    let mut writer = Writer::new(&mut bytes);
     assert!(stray_optional_pen_data.write_to(&mut writer).is_err());
 
     let trailing_pen_data = EmfPlusPenData {
@@ -15145,7 +15209,7 @@ mod tests {
       trailing_data: vec![0xAA],
     };
     let mut bytes = Vec::new();
-    let mut writer = Writer::new(std::io::Cursor::new(&mut bytes));
+    let mut writer = Writer::new(&mut bytes);
     assert!(trailing_pen_data.write_to(&mut writer).is_err());
 
     let invalid_pen_flags = EmfPlusPenObject {
@@ -15221,7 +15285,7 @@ mod tests {
       trailing_data: Vec::new(),
     };
     let mut bytes = Vec::new();
-    let mut writer = Writer::new(std::io::Cursor::new(&mut bytes));
+    let mut writer = Writer::new(&mut bytes);
     assert!(invalid_compound_pen_data.write_to(&mut writer).is_err());
 
     let region_node = EmfPlusRegionNode {
@@ -15234,7 +15298,7 @@ mod tests {
       }),
     };
     let mut node_bytes = Vec::new();
-    let mut writer = Writer::new(std::io::Cursor::new(&mut node_bytes));
+    let mut writer = Writer::new(&mut node_bytes);
     region_node.write_to(&mut writer).unwrap();
     let region = EmfPlusRegionObject {
       version: test_graphics_version(),
@@ -15245,7 +15309,7 @@ mod tests {
     assert_eq!(parsed_nodes, vec![region_node.clone()]);
     assert_eq!(parsed_nodes[0].node_count(), 1);
     let mut rewritten_node = Vec::new();
-    let mut writer = Writer::new(std::io::Cursor::new(&mut rewritten_node));
+    let mut writer = Writer::new(&mut rewritten_node);
     parsed_nodes[0].write_to(&mut writer).unwrap();
     assert_eq!(rewritten_node, node_bytes);
     let invalid_region_node = EmfPlusRegionNode {
@@ -15270,7 +15334,7 @@ mod tests {
       data: EmfPlusRegionNodeData::Raw(vec![1, 2, 3, 4]),
     };
     let mut unknown_region_node_bytes = Vec::new();
-    let mut writer = Writer::new(std::io::Cursor::new(&mut unknown_region_node_bytes));
+    let mut writer = Writer::new(&mut unknown_region_node_bytes);
     unknown_region_node.write_to(&mut writer).unwrap();
     assert_eq!(
       unknown_region_node_bytes,
@@ -15288,7 +15352,7 @@ mod tests {
       })),
     };
     let mut path_node_bytes = Vec::new();
-    let mut writer = Writer::new(std::io::Cursor::new(&mut path_node_bytes));
+    let mut writer = Writer::new(&mut path_node_bytes);
     path_node.write_to(&mut writer).unwrap();
     let path_region = EmfPlusRegionObject {
       version: test_graphics_version(),
@@ -15302,7 +15366,7 @@ mod tests {
     };
     assert!(parsed_path_data.path().is_some());
     let mut rewritten_path_node = Vec::new();
-    let mut writer = Writer::new(std::io::Cursor::new(&mut rewritten_path_node));
+    let mut writer = Writer::new(&mut rewritten_path_node);
     parsed_path_nodes[0].write_to(&mut writer).unwrap();
     assert_eq!(rewritten_path_node, path_node_bytes);
 
@@ -15342,7 +15406,7 @@ mod tests {
       })),
     };
     let mut child_node_bytes = Vec::new();
-    let mut writer = Writer::new(std::io::Cursor::new(&mut child_node_bytes));
+    let mut writer = Writer::new(&mut child_node_bytes);
     child_region_node.write_to(&mut writer).unwrap();
     let child_region = EmfPlusRegionObject {
       version: test_graphics_version(),
@@ -15353,7 +15417,7 @@ mod tests {
     assert_eq!(parsed_child_nodes, vec![child_region_node]);
     assert_eq!(parsed_child_nodes[0].node_count(), 3);
     let mut rewritten_child_node = Vec::new();
-    let mut writer = Writer::new(std::io::Cursor::new(&mut rewritten_child_node));
+    let mut writer = Writer::new(&mut rewritten_child_node);
     parsed_child_nodes[0].write_to(&mut writer).unwrap();
     assert_eq!(rewritten_child_node, child_node_bytes);
 
@@ -15689,7 +15753,7 @@ mod tests {
       custom_line_cap_data: Vec::new(),
     };
     let mut bytes = Vec::new();
-    let mut writer = Writer::new(std::io::Cursor::new(&mut bytes));
+    let mut writer = Writer::new(&mut bytes);
     assert!(invalid_cap.write_to(&mut writer).is_err());
 
     let mut invalid_arrow_bytes = arrow_cap.to_bytes().unwrap();
@@ -15899,7 +15963,7 @@ mod tests {
     };
     let mut expected_hv_bytes = Vec::new();
     {
-      let mut writer = Writer::new(std::io::Cursor::new(&mut expected_hv_bytes));
+      let mut writer = Writer::new(&mut expected_hv_bytes);
       vertical_factors.write_to(&mut writer).unwrap();
       horizontal_factors.write_to(&mut writer).unwrap();
     }

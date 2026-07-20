@@ -60,7 +60,7 @@ pub fn read_wmf_log_color_space<R: std::io::Read + std::io::Seek>(
   WmfLogColorSpace::read_from(reader, SdkEncoding::Windows1252, 260)
 }
 
-pub fn write_wmf_log_color_space<W: std::io::Write + std::io::Seek>(
+pub fn write_wmf_log_color_space<W: std::io::Write>(
   value: &WmfLogColorSpace,
   writer: &mut Writer<W>,
 ) -> Result<()> {
@@ -73,7 +73,7 @@ pub fn read_wmf_log_color_space_w<R: std::io::Read + std::io::Seek>(
   WmfLogColorSpaceW::read_from(reader, SdkEncoding::Utf16Le, 520)
 }
 
-pub fn write_wmf_log_color_space_w<W: std::io::Write + std::io::Seek>(
+pub fn write_wmf_log_color_space_w<W: std::io::Write>(
   value: &WmfLogColorSpaceW,
   writer: &mut Writer<W>,
 ) -> Result<()> {
@@ -924,7 +924,7 @@ impl<'a> WmfRecordRef<'a> {
     record_size_words_parts(self.data.len())
   }
 
-  pub fn to_owned(self) -> WmfRecord {
+  pub fn into_owned(self) -> WmfRecord {
     WmfRecord::new(self.function, self.data.to_vec())
   }
 
@@ -945,6 +945,10 @@ impl<'a> WmfRecordRef<'a> {
 
   pub fn parse_data(self) -> Result<WmfRecordData<'a>> {
     WmfRecordData::from_record_ref(self)
+  }
+
+  pub fn rebuild_typed(self) -> Result<WmfRecord> {
+    self.parse_data()?.to_record_with_function(self.function)
   }
 }
 
@@ -997,7 +1001,7 @@ impl<'a> Iterator for WmfRecords<'a> {
 impl ExactSizeIterator for WmfRecords<'_> {}
 impl std::iter::FusedIterator for WmfRecords<'_> {}
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WmfMetafileRef<'a> {
   pub placeable_header: Option<WmfPlaceableHeader>,
   pub header: WmfHeader,
@@ -1042,8 +1046,8 @@ impl<'a> WmfMetafileRef<'a> {
     self.trailing_data
   }
 
-  pub fn to_owned(self) -> WmfMetafile {
-    let records = self.records().map(WmfRecordRef::to_owned).collect();
+  pub fn into_owned(self) -> WmfMetafile {
+    let records = self.records().map(WmfRecordRef::into_owned).collect();
     let trailing_data = self.trailing_data.to_vec();
     WmfMetafile {
       placeable_header: self.placeable_header,
@@ -1099,7 +1103,7 @@ pub struct WmfMetafile {
 
 impl WmfMetafile {
   pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-    Ok(WmfMetafileRef::from_bytes(bytes)?.to_owned())
+    Ok(WmfMetafileRef::from_bytes(bytes)?.into_owned())
   }
 
   pub fn to_bytes(&self) -> Result<Vec<u8>> {
@@ -1116,16 +1120,24 @@ impl WmfMetafile {
     }
     let capacity = usize::try_from(capacity)
       .map_err(|_| Error::invalid(0, "WMF serialized size overflows usize"))?;
-    let mut writer = Writer::new(Cursor::new(Vec::with_capacity(capacity)));
+    let mut writer = Writer::new(Vec::with_capacity(capacity));
+    self.write_to_writer(&mut writer)?;
+    Ok(writer.into_inner())
+  }
+
+  pub fn write_to<W: std::io::Write>(&self, writer: W) -> Result<()> {
+    self.write_to_writer(&mut Writer::new(writer))
+  }
+
+  fn write_to_writer<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     if let Some(header) = &self.placeable_header {
-      header.write_to(&mut writer)?;
+      header.write_to(writer)?;
     }
-    self.header.write_to(&mut writer)?;
+    self.header.write_to(writer)?;
     for record in &self.records {
-      record.write_to(&mut writer)?;
+      record.write_to(writer)?;
     }
-    writer.write_all(&self.trailing_data)?;
-    Ok(writer.into_inner().into_inner())
+    writer.write_all(&self.trailing_data)
   }
 
   pub fn computed_file_size_words(&self) -> Result<u32> {
@@ -1180,7 +1192,13 @@ impl WmfMetafile {
   }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+impl SdkWrite for WmfMetafile {
+  fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
+    self.write_to_writer(writer)
+  }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WmfPlaceableHeader {
   pub key: u32,
   pub handle: u16,
@@ -1215,7 +1233,7 @@ impl WmfPlaceableHeader {
     Ok(value)
   }
 
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     validate_wmf_placeable_header_lossless(self)?;
     writer.write_u32(self.key)?;
     writer.write_u16(self.handle)?;
@@ -1276,7 +1294,7 @@ impl SdkRead for WmfPlaceableHeader {
 }
 
 impl SdkWrite for WmfPlaceableHeader {
-  fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     self.write_to(writer)
   }
 }
@@ -1287,7 +1305,7 @@ impl SdkSize for WmfPlaceableHeader {
   }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WmfHeader {
   pub metafile_type: u16,
   pub header_size_words: u16,
@@ -1317,7 +1335,7 @@ impl WmfHeader {
     Ok(header)
   }
 
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     validate_wmf_header(self)?;
     writer.write_u16(self.metafile_type)?;
     writer.write_u16(self.header_size_words)?;
@@ -1360,7 +1378,7 @@ impl SdkRead for WmfHeader {
 }
 
 impl SdkWrite for WmfHeader {
-  fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     self.write_to(writer)
   }
 }
@@ -1418,7 +1436,7 @@ impl WmfRecord {
   }
 
   pub fn rebuild_typed(&self) -> Result<Self> {
-    self.parse_data()?.to_record_with_function(self.function)
+    self.as_ref().rebuild_typed()
   }
 
   pub fn read_from<R: std::io::Read + std::io::Seek>(
@@ -1450,7 +1468,7 @@ impl WmfRecord {
     Ok(Self { function, data })
   }
 
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     let size_bytes = self
       .data
       .len()
@@ -1472,6 +1490,12 @@ impl WmfRecord {
     writer.write_u32(size_words as u32)?;
     writer.write_u16(self.function)?;
     writer.write_all(&self.data)
+  }
+}
+
+impl SdkWrite for WmfRecord {
+  fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
+    WmfRecord::write_to(self, writer)
   }
 }
 
@@ -1976,7 +2000,7 @@ impl<'a> WmfRecordData<'a> {
       Self::Escape(value) => WmfRecord::new(WmfRecordFunction::Escape.raw(), value.write_data()?),
       Self::Unknown(record) => {
         validate_unknown_wmf_record(record.function)?;
-        WmfRecordRef::to_owned(*record)
+        WmfRecordRef::into_owned(*record)
       }
     })
   }
@@ -2088,7 +2112,7 @@ impl SdkRead for WmfU16Record {
 }
 
 impl SdkWrite for WmfU16Record {
-  fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     writer.write_u16(self.value)?;
     writer.write_all(&self.reserved)
   }
@@ -2948,7 +2972,7 @@ impl WmfLogBrushObject {
     WmfHatchStyle::from_raw(self.brush_hatch)
   }
 
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     validate_wmf_log_brush_object(self)?;
     writer.write_u16(self.brush_style)?;
     self.color_ref.write_to(writer)?;
@@ -3031,7 +3055,7 @@ impl WmfPenObject {
     self.pen_style & 0x00F0
   }
 
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     validate_wmf_pen_object(self)?;
     writer.write_u16(self.pen_style)?;
     self.width.write_to(writer)?;
@@ -3209,7 +3233,7 @@ impl WmfPaletteEntry {
     self.values & !WmfPaletteEntryFlags::all().bits()
   }
 
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     validate_wmf_palette_entry(self)?;
     writer.write_u8(self.red)?;
     writer.write_u8(self.green)?;
@@ -3509,7 +3533,7 @@ impl WmfScanObject {
 }
 
 impl SdkWrite for WmfScanObject {
-  fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     validate_wmf_scan_object(self)?;
     writer.write_u16(self.count)?;
     writer.write_u16(self.top)?;
@@ -3592,7 +3616,7 @@ impl WmfRegionObject {
 }
 
 impl SdkWrite for WmfRegionObject {
-  fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     validate_wmf_region_object(self)?;
     writer.write_u16(self.next_in_chain)?;
     writer.write_i16(self.object_type)?;
@@ -6093,9 +6117,10 @@ mod tests {
     let eof = records.next().unwrap();
     assert_eq!(eof.data.as_ptr(), bytes[24..24].as_ptr());
     assert!(matches!(eof.parse_data().unwrap(), WmfRecordData::Eof(_)));
+    assert_eq!(eof.rebuild_typed().unwrap().as_ref(), eof);
     assert!(records.next().is_none());
 
-    let owned = view.to_owned();
+    let owned = view.into_owned();
     assert_eq!(owned.to_bytes().unwrap(), bytes);
 
     let mut invalid_late_record = minimal_wmf();
@@ -6109,12 +6134,10 @@ mod tests {
   fn wmf_headers_validate_spec_fields() {
     let placeable = test_placeable_header();
     let mut bytes = Vec::new();
-    placeable
-      .write_to(&mut Writer::new(Cursor::new(&mut bytes)))
-      .unwrap();
+    placeable.write_to(&mut Writer::new(&mut bytes)).unwrap();
     bytes.extend_from_slice(&minimal_wmf());
     let metafile = WmfMetafile::from_bytes(&bytes).unwrap();
-    assert_eq!(metafile.placeable_header, Some(placeable.clone()));
+    assert_eq!(metafile.placeable_header, Some(placeable));
     assert_eq!(placeable.bounding_box_width(), 100);
     assert_eq!(placeable.bounding_box_height(), 100);
     assert!(placeable.uses_twips());
@@ -6236,7 +6259,7 @@ mod tests {
       invalid_checksum
     );
 
-    let mut invalid_reserved = placeable.clone();
+    let mut invalid_reserved = placeable;
     invalid_reserved.reserved = 1;
     invalid_reserved.checksum = invalid_reserved.computed_checksum();
     assert!(invalid_reserved.validate().is_err());
@@ -6246,7 +6269,7 @@ mod tests {
         .is_ok()
     );
 
-    let mut invalid_inch = placeable.clone();
+    let mut invalid_inch = placeable;
     invalid_inch.inch = 0;
     invalid_inch.checksum = invalid_inch.computed_checksum();
     assert!(
@@ -6294,7 +6317,7 @@ mod tests {
     let missing_eof = minimal_wmf()[..18].to_vec();
     assert!(WmfMetafile::from_bytes(&missing_eof).is_err());
 
-    let mut invalid_header = metafile.header.clone();
+    let mut invalid_header = metafile.header;
     invalid_header.version = 0;
     assert!(
       invalid_header

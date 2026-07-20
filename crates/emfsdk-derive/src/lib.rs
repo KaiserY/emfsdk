@@ -111,7 +111,7 @@ fn expand_sdk_object(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
       }
 
       impl ::emfsdk::common::SdkWrite for #name {
-          fn write_to<W: ::std::io::Write + ::std::io::Seek>(
+          fn write_to<W: ::std::io::Write>(
               &self,
               writer: &mut ::emfsdk::common::Writer<W>,
           ) -> ::emfsdk::common::Result<()> {
@@ -245,7 +245,7 @@ fn expand_sdk_enum(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream>
       }
 
       impl ::emfsdk::common::SdkWrite for #name {
-          fn write_to<W: ::std::io::Write + ::std::io::Seek>(
+          fn write_to<W: ::std::io::Write>(
               &self,
               writer: &mut ::emfsdk::common::Writer<W>,
           ) -> ::emfsdk::common::Result<()> {

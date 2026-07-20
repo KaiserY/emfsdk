@@ -144,9 +144,7 @@ mod tests {
       reserved: 0,
     };
     let mut bytes = Vec::new();
-    valid
-      .write_to(&mut Writer::new(Cursor::new(&mut bytes)))
-      .unwrap();
+    valid.write_to(&mut Writer::new(&mut bytes)).unwrap();
     assert_eq!(bytes, [1, 2, 3, 0]);
 
     let parsed = ColorRef::read_from(&mut Reader::new(Cursor::new(bytes))).unwrap();
@@ -158,7 +156,7 @@ mod tests {
     assert!(parsed.validate_strict().is_err());
     let mut roundtripped = Vec::new();
     parsed
-      .write_to(&mut Writer::new(Cursor::new(&mut roundtripped)))
+      .write_to(&mut Writer::new(&mut roundtripped))
       .unwrap();
     assert_eq!(roundtripped, invalid);
   }

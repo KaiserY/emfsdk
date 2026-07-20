@@ -292,7 +292,7 @@ impl SdkRead for BitmapV5Header {
 }
 
 impl SdkWrite for BitmapV5Header {
-  fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     validate_bitmap_v5_header(self)?;
     self.v4.base.write_to(writer)?;
     writer.write_u32(self.v4.red_mask)?;
@@ -444,7 +444,7 @@ impl DibHeader {
     }
   }
 
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     match self {
       Self::Core(value) => value.write_to(writer),
       Self::Info { base, extension } => {

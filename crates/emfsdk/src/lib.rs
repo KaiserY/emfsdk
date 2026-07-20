@@ -39,7 +39,7 @@ pub use crate::emfplus::{
   EmfPlusBrushRef, EmfPlusDrawRectsData, EmfPlusFillRectsData, EmfPlusGraphicsVersion,
   EmfPlusGraphicsVersionValue, EmfPlusHeaderData, EmfPlusRecord, EmfPlusRecordData,
   EmfPlusRecordFlags, EmfPlusRecordRef, EmfPlusRecordType, EmfPlusRecords, EmfPlusRect,
-  EmfPlusRectS, EmfPlusScaleWorldTransformData, EmfPlusStreamRef,
+  EmfPlusRectS, EmfPlusScaleWorldTransformData, EmfPlusStream, EmfPlusStreamRef,
   EmfPlusTranslateWorldTransformData,
 };
 pub use crate::string::{SdkEncoding, SdkString};
@@ -74,10 +74,10 @@ impl<'a> MetafileRef<'a> {
     }
   }
 
-  pub fn to_owned(self) -> Metafile {
+  pub fn into_owned(self) -> Metafile {
     match self {
-      Self::Emf(value) => Metafile::Emf(value.to_owned()),
-      Self::Wmf(value) => Metafile::Wmf(value.to_owned()),
+      Self::Emf(value) => Metafile::Emf(value.into_owned()),
+      Self::Wmf(value) => Metafile::Wmf(value.into_owned()),
     }
   }
 }
@@ -118,6 +118,13 @@ impl Metafile {
     }
   }
 
+  pub fn write_to<W: std::io::Write>(&self, writer: W) -> Result<()> {
+    match self {
+      Self::Emf(value) => value.write_to(writer),
+      Self::Wmf(value) => value.write_to(writer),
+    }
+  }
+
   pub fn format(&self) -> Format {
     match self {
       Self::Emf(_) => Format::Emf,
@@ -136,6 +143,15 @@ impl Metafile {
     match self {
       Self::Emf(value) => emf_compatibility_diagnostics(value),
       Self::Wmf(value) => wmf_compatibility_diagnostics(value),
+    }
+  }
+}
+
+impl SdkWrite for Metafile {
+  fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
+    match self {
+      Self::Emf(value) => SdkWrite::write_to(value, writer),
+      Self::Wmf(value) => SdkWrite::write_to(value, writer),
     }
   }
 }
@@ -554,7 +570,11 @@ mod tests {
     let bytes = minimal_wmf();
     let view = MetafileRef::from_bytes(&bytes).unwrap();
     assert_eq!(view.format(), Format::Wmf);
-    let owned = view.to_owned();
+    let owned = view.into_owned();
     assert_eq!(owned.to_bytes().unwrap(), bytes);
+
+    let mut output = Vec::new();
+    owned.write_to(&mut output).unwrap();
+    assert_eq!(output, bytes);
   }
 }

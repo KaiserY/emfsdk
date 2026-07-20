@@ -27,6 +27,17 @@ All notable changes to this project are documented in this file.
   owned outer record requirement during typed inspection.
 - Switched WMF rendering to borrowed record framing so it no longer clones the
   complete record payload set before typed replay.
+- Renamed consuming borrowed conversions to `into_owned`, added uniform
+  record-level `rebuild_typed` methods that preserve wire metadata, and exposed
+  streaming `write_to` support through `SdkWrite` on owned metafiles and
+  records.
+- Added an owned `EmfPlusStream` so conversion from `EmfPlusStreamRef` retains
+  trailing producer bytes; exact stream consumption is now an explicit
+  `from_bytes_exact` choice.
+- Removed the `Seek` requirement from `Writer` and `SdkWrite`. The writer now
+  tracks successful writes internally, top-level streams accept ordinary
+  `Write` sinks, and preallocated byte serialization writes directly into
+  `Vec<u8>`.
 
 ### Testing
 

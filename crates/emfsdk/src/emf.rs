@@ -739,12 +739,16 @@ impl<'a> EmfRecordRef<'a> {
     EmfRecordType::from_raw(self.record_type)
   }
 
-  pub fn to_owned(self) -> EmfRecord {
+  pub fn into_owned(self) -> EmfRecord {
     EmfRecord::new(self.record_type, self.data.to_vec())
   }
 
   pub fn parse_data(self) -> Result<EmfRecordData<'a>> {
     EmfRecordData::from_record_ref(self)
+  }
+
+  pub fn rebuild_typed(self) -> Result<EmfRecord> {
+    self.parse_data()?.to_record()
   }
 
   pub fn emf_plus_payload(self) -> Option<&'a [u8]> {
@@ -825,6 +829,13 @@ impl<'a> EmfMetafileRef<'a> {
     }
   }
 
+  pub fn header(&self) -> EmfRecordRef<'a> {
+    self
+      .records()
+      .next()
+      .expect("validated EMF metafile contains an EMR_HEADER record")
+  }
+
   pub const fn record_count(&self) -> usize {
     self.record_count
   }
@@ -833,9 +844,9 @@ impl<'a> EmfMetafileRef<'a> {
     self.trailing_data
   }
 
-  pub fn to_owned(self) -> EmfMetafile {
+  pub fn into_owned(self) -> EmfMetafile {
     EmfMetafile {
-      records: self.records().map(EmfRecordRef::to_owned).collect(),
+      records: self.records().map(EmfRecordRef::into_owned).collect(),
       trailing_data: self.trailing_data.to_vec(),
     }
   }
@@ -893,19 +904,27 @@ pub struct EmfMetafile {
 
 impl EmfMetafile {
   pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-    Ok(EmfMetafileRef::from_bytes(bytes)?.to_owned())
+    Ok(EmfMetafileRef::from_bytes(bytes)?.into_owned())
   }
 
   pub fn to_bytes(&self) -> Result<Vec<u8>> {
     let capacity = (self.computed_bytes()? as usize)
       .checked_add(self.trailing_data.len())
       .ok_or_else(|| Error::invalid(0, "EMF serialized size overflows usize"))?;
-    let mut writer = Writer::new(Cursor::new(Vec::with_capacity(capacity)));
+    let mut writer = Writer::new(Vec::with_capacity(capacity));
+    self.write_to_writer(&mut writer)?;
+    Ok(writer.into_inner())
+  }
+
+  pub fn write_to<W: std::io::Write>(&self, writer: W) -> Result<()> {
+    self.write_to_writer(&mut Writer::new(writer))
+  }
+
+  fn write_to_writer<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     for record in &self.records {
-      record.write_to(&mut writer)?;
+      record.write_to(writer)?;
     }
-    writer.write_all(&self.trailing_data)?;
-    Ok(writer.into_inner().into_inner())
+    writer.write_all(&self.trailing_data)
   }
 
   pub fn header(&self) -> Option<&EmfRecord> {
@@ -959,6 +978,12 @@ impl EmfMetafile {
   }
 }
 
+impl SdkWrite for EmfMetafile {
+  fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
+    self.write_to_writer(writer)
+  }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EmfRecord {
   pub record_type: u32,
@@ -992,11 +1017,15 @@ impl EmfRecord {
     EmfRecordData::from_record(self)
   }
 
+  pub fn rebuild_typed(&self) -> Result<Self> {
+    self.as_ref().rebuild_typed()
+  }
+
   pub fn emf_plus_payload(&self) -> Option<&[u8]> {
     emf_plus_payload(self.record_type, &self.data)
   }
 
-  fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     let size = self
       .data
       .len()
@@ -1017,6 +1046,18 @@ impl EmfRecord {
     writer.write_u32(self.record_type)?;
     writer.write_u32(size as u32)?;
     writer.write_all(&self.data)
+  }
+}
+
+impl SdkWrite for EmfRecord {
+  fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
+    EmfRecord::write_to(self, writer)
+  }
+}
+
+impl SdkSize for EmfRecord {
+  fn sdk_size(&self) -> u64 {
+    8 + self.data.len() as u64
   }
 }
 
@@ -2114,7 +2155,7 @@ impl<'a> EmfRecordData<'a> {
       )),
       Self::Unknown(record) => {
         validate_unknown_emf_record(record.record_type)?;
-        Ok(EmfRecordRef::to_owned(*record))
+        Ok(EmfRecordRef::into_owned(*record))
       }
     }
   }
@@ -2158,7 +2199,7 @@ impl LogPalette {
     Ok(value)
   }
 
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     validate_log_palette(self)?;
     writer.write_u16(self.version)?;
     writer.write_u16(
@@ -3196,7 +3237,7 @@ impl LogPenEx {
     Ok(value)
   }
 
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     validate_log_pen_ex(self)?;
     writer.write_u32(self.pen_style)?;
     writer.write_u32(self.width)?;
@@ -3530,7 +3571,7 @@ impl LogFontW {
     Ok(value)
   }
 
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     validate_log_font_w(self)?;
     writer.write_i32(self.height)?;
     writer.write_i32(self.width)?;
@@ -3706,7 +3747,7 @@ impl Panose {
     EmrPanoseXHeight::from_raw(self.x_height)
   }
 
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     <Self as SdkWrite>::write_to(self, writer)
   }
 }
@@ -3733,7 +3774,7 @@ impl LogFontEx {
     })
   }
 
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     self.log_font.write_to(writer)?;
     write_fixed_bytes(
       writer,
@@ -3788,7 +3829,7 @@ impl DesignVector {
     Ok(value)
   }
 
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     validate_design_vector(self)?;
     writer.write_u32(self.signature)?;
     writer.write_u32(usize_to_u32(self.values.len(), "DesignVector axis count")?)?;
@@ -3821,7 +3862,7 @@ impl LogFontExDv {
     })
   }
 
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     self.log_font_ex.write_to(writer)?;
     self.design_vector.write_to(writer)
   }
@@ -3877,7 +3918,7 @@ impl LogFontPanose {
     Ok(value)
   }
 
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     validate_log_font_panose(self)?;
     self.log_font.write_to(writer)?;
     write_fixed_bytes(
@@ -3991,7 +4032,7 @@ impl EmrExtCreateFont {
     Ok(Self::Raw(data.to_vec()))
   }
 
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     validate_emr_ext_create_font(self)?;
     match self {
       Self::LogFont(value) => value.write_to(writer),
@@ -4180,7 +4221,7 @@ impl LogColorSpace {
     })
   }
 
-  pub fn write_to<W: std::io::Write + std::io::Seek>(
+  pub fn write_to<W: std::io::Write>(
     &self,
     writer: &mut Writer<W>,
     filename_bytes: usize,
@@ -4198,7 +4239,7 @@ impl LogColorSpace {
     write_fixed_bytes(writer, &self.filename.encoded_bytes()?, filename_bytes)
   }
 
-  fn write_compatible<W: std::io::Write + std::io::Seek>(
+  fn write_compatible<W: std::io::Write>(
     &self,
     writer: &mut Writer<W>,
     filename_bytes: usize,
@@ -4550,7 +4591,7 @@ fn read_emr_point_type_values<R: std::io::Read + std::io::Seek>(
   Ok(values)
 }
 
-fn write_emr_point_type_values<W: std::io::Write + std::io::Seek>(
+fn write_emr_point_type_values<W: std::io::Write>(
   writer: &mut Writer<W>,
   values: &[EmrPointTypeValue],
 ) -> Result<()> {
@@ -4758,7 +4799,7 @@ impl EmrGradientFillMesh {
     }
   }
 
-  fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     match self {
       Self::Rectangles {
         rectangles,
@@ -5612,7 +5653,7 @@ fn validate_emf_record_alignment_padding(
   Ok(())
 }
 
-fn write_emf_record_alignment_padding<W: std::io::Write + std::io::Seek>(
+fn write_emf_record_alignment_padding<W: std::io::Write>(
   writer: &mut Writer<W>,
   padding: &[u8],
   record_name: &str,
@@ -5991,7 +6032,7 @@ fn validate_emr_comment_alignment_padding_strict(alignment_padding: &[u8]) -> Re
   Ok(())
 }
 
-fn write_emr_comment_alignment_padding<W: std::io::Write + std::io::Seek>(
+fn write_emr_comment_alignment_padding<W: std::io::Write>(
   writer: &mut Writer<W>,
   alignment_padding: &[u8],
 ) -> Result<()> {
@@ -8286,7 +8327,7 @@ impl EmrEpsData {
     })
   }
 
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     if self.size_data as usize != 32 + self.postscript_data.len() {
       return Err(Error::invalid(
         0,
@@ -8351,7 +8392,7 @@ impl EmrCommentBeginGroup {
     Ok(value)
   }
 
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     validate_emr_comment_begin_group(self)?;
     self.rectangle.write_to(writer)?;
     writer.write_u32(self.description_chars)?;
@@ -8458,7 +8499,7 @@ impl EmrCommentMultiFormats {
     }
   }
 
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     validate_emr_comment_multi_formats(self)?;
     self.output_rect.write_to(writer)?;
     writer.write_u32(usize_to_u32(
@@ -8535,7 +8576,7 @@ impl EmrCommentWindowsMetafile {
     Ok(value)
   }
 
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     validate_emr_comment_windows_metafile(self)?;
     writer.write_u16(self.version)?;
     writer.write_u16(self.reserved)?;
@@ -8597,7 +8638,7 @@ impl EmrPublicComment {
     }
   }
 
-  pub fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  pub fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     match self {
       Self::BeginGroup(value) => value.write_to(writer),
       Self::EndGroup => Ok(()),
@@ -9099,7 +9140,7 @@ impl SdkRead for EmfHeader {
 }
 
 impl SdkWrite for EmfHeader {
-  fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
+  fn write_to<W: std::io::Write>(&self, writer: &mut Writer<W>) -> Result<()> {
     self.bounds.write_to(writer)?;
     self.frame.write_to(writer)?;
     writer.write_u32(self.signature)?;
@@ -9214,7 +9255,7 @@ fn read_remaining<R: std::io::Read + std::io::Seek>(
   )
 }
 
-fn write_fixed_bytes<W: std::io::Write + std::io::Seek>(
+fn write_fixed_bytes<W: std::io::Write>(
   writer: &mut Writer<W>,
   bytes: &[u8],
   len: usize,
@@ -9779,7 +9820,7 @@ fn layout_two_bitmap_buffers(
   Ok((first_layout, second_layout))
 }
 
-fn write_bitmap_layout<W: std::io::Write + std::io::Seek>(
+fn write_bitmap_layout<W: std::io::Write>(
   writer: &mut Writer<W>,
   layout: Option<BitmapBufferLayout>,
   bitmap: Option<&EmrBitmapBuffer>,
@@ -9804,7 +9845,7 @@ fn write_bitmap_layout<W: std::io::Write + std::io::Seek>(
   Ok(())
 }
 
-fn write_two_bitmap_buffers<W: std::io::Write + std::io::Seek>(
+fn write_two_bitmap_buffers<W: std::io::Write>(
   writer: &mut Writer<W>,
   first: Option<&EmrBitmapBuffer>,
   second: Option<&EmrBitmapBuffer>,
@@ -9820,7 +9861,7 @@ fn write_two_bitmap_buffers<W: std::io::Write + std::io::Seek>(
   write_emf_record_alignment_padding(writer, padding, record_name)
 }
 
-fn write_bitmap_buffer<W: std::io::Write + std::io::Seek>(
+fn write_bitmap_buffer<W: std::io::Write>(
   writer: &mut Writer<W>,
   bitmap: &EmrBitmapBuffer,
 ) -> Result<()> {
@@ -9901,7 +9942,7 @@ fn align_to_u16(value: usize) -> usize {
   (value + 1) & !1
 }
 
-fn pad_writer_to_4<W: std::io::Write + std::io::Seek>(writer: &mut Writer<W>) -> Result<()> {
+fn pad_writer_to_4<W: std::io::Write>(writer: &mut Writer<W>) -> Result<()> {
   let padding = (4 - (writer.position()? as usize % 4)) % 4;
   if padding != 0 {
     writer.write_all(&[0; 3][..padding])?;
@@ -9909,7 +9950,7 @@ fn pad_writer_to_4<W: std::io::Write + std::io::Seek>(writer: &mut Writer<W>) ->
   Ok(())
 }
 
-fn pad_writer_to_record_offset<W: std::io::Write + std::io::Seek>(
+fn pad_writer_to_record_offset<W: std::io::Write>(
   writer: &mut Writer<W>,
   record_offset: usize,
 ) -> Result<()> {
@@ -10251,6 +10292,7 @@ mod tests {
     let view = EmfMetafileRef::from_bytes(&bytes).unwrap();
     assert_eq!(view.record_count(), 2);
     assert!(view.trailing_data().is_empty());
+    assert_eq!(view.header().record_type, EMR_HEADER);
 
     let mut records = view.records();
     assert_eq!(records.len(), 2);
@@ -10260,9 +10302,10 @@ mod tests {
       header.parse_data().unwrap(),
       EmfRecordData::Header(_)
     ));
+    assert_eq!(header.rebuild_typed().unwrap().as_ref(), header);
     assert_eq!(records.len(), 1);
 
-    let owned = view.to_owned();
+    let owned = view.into_owned();
     assert_eq!(owned.to_bytes().unwrap(), bytes);
 
     let mut invalid_late_record = bytes;
@@ -10397,7 +10440,7 @@ mod tests {
     };
     let mut pixel_format_bytes = Vec::new();
     pixel_format
-      .write_to(&mut Writer::new(Cursor::new(&mut pixel_format_bytes)))
+      .write_to(&mut Writer::new(&mut pixel_format_bytes))
       .unwrap();
 
     let mut extension = Vec::new();
@@ -13904,7 +13947,7 @@ mod tests {
 
     let mut oversized_string_count_data = Vec::new();
     {
-      let mut writer = Writer::new(Cursor::new(&mut oversized_string_count_data));
+      let mut writer = Writer::new(&mut oversized_string_count_data);
       bounds.write_to(&mut writer).unwrap();
     }
     oversized_string_count_data.extend_from_slice(&1_u32.to_le_bytes());

@@ -50,7 +50,7 @@ pub trait SdkRead: Sized {
 }
 
 pub trait SdkWrite {
-  fn write_to<W: Write + Seek>(&self, writer: &mut Writer<W>) -> Result<()>;
+  fn write_to<W: Write>(&self, writer: &mut Writer<W>) -> Result<()>;
 }
 
 pub trait SdkSize {
@@ -164,24 +164,30 @@ impl<R: Read + Seek> Reader<R> {
 
 pub struct Writer<W> {
   inner: W,
+  position: u64,
 }
 
-impl<W: Write + Seek> Writer<W> {
+impl<W: Write> Writer<W> {
+  /// Wraps a sink at logical position zero.
   pub fn new(inner: W) -> Self {
-    Self { inner }
+    Self { inner, position: 0 }
+  }
+
+  /// Wraps a sink whose next byte has the supplied logical position.
+  pub fn with_position(inner: W, position: u64) -> Self {
+    Self { inner, position }
   }
 
   pub fn into_inner(self) -> W {
     self.inner
   }
 
-  pub fn position(&mut self) -> Result<u64> {
-    Ok(self.inner.stream_position()?)
+  pub const fn position(&self) -> Result<u64> {
+    Ok(self.position)
   }
 
   pub fn write_u8(&mut self, value: u8) -> Result<()> {
-    self.inner.write_all(&[value])?;
-    Ok(())
+    self.write_all(&[value])
   }
 
   pub fn write_i8(&mut self, value: i8) -> Result<()> {
@@ -189,33 +195,27 @@ impl<W: Write + Seek> Writer<W> {
   }
 
   pub fn write_u16(&mut self, value: u16) -> Result<()> {
-    self.inner.write_all(&value.to_le_bytes())?;
-    Ok(())
+    self.write_all(&value.to_le_bytes())
   }
 
   pub fn write_i16(&mut self, value: i16) -> Result<()> {
-    self.inner.write_all(&value.to_le_bytes())?;
-    Ok(())
+    self.write_all(&value.to_le_bytes())
   }
 
   pub fn write_u32(&mut self, value: u32) -> Result<()> {
-    self.inner.write_all(&value.to_le_bytes())?;
-    Ok(())
+    self.write_all(&value.to_le_bytes())
   }
 
   pub fn write_i32(&mut self, value: i32) -> Result<()> {
-    self.inner.write_all(&value.to_le_bytes())?;
-    Ok(())
+    self.write_all(&value.to_le_bytes())
   }
 
   pub fn write_u64(&mut self, value: u64) -> Result<()> {
-    self.inner.write_all(&value.to_le_bytes())?;
-    Ok(())
+    self.write_all(&value.to_le_bytes())
   }
 
   pub fn write_i64(&mut self, value: i64) -> Result<()> {
-    self.inner.write_all(&value.to_le_bytes())?;
-    Ok(())
+    self.write_all(&value.to_le_bytes())
   }
 
   pub fn write_f32(&mut self, value: f32) -> Result<()> {
@@ -227,7 +227,95 @@ impl<W: Write + Seek> Writer<W> {
   }
 
   pub fn write_all(&mut self, bytes: &[u8]) -> Result<()> {
-    self.inner.write_all(bytes)?;
+    Write::write_all(self, bytes)?;
     Ok(())
+  }
+}
+
+impl<W: Write> Write for Writer<W> {
+  fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+    let requested = u64::try_from(bytes.len())
+      .map_err(|_| std::io::Error::other("writer request length does not fit u64"))?;
+    self
+      .position
+      .checked_add(requested)
+      .ok_or_else(|| std::io::Error::other("writer position overflows u64"))?;
+    let written = self.inner.write(bytes)?;
+    self.position += written as u64;
+    Ok(written)
+  }
+
+  fn flush(&mut self) -> std::io::Result<()> {
+    self.inner.flush()
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[derive(Default)]
+  struct ChunkWriter {
+    bytes: Vec<u8>,
+    max_chunk: usize,
+    fail_after: Option<usize>,
+  }
+
+  impl Write for ChunkWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+      if self
+        .fail_after
+        .is_some_and(|limit| self.bytes.len() >= limit)
+      {
+        return Err(std::io::Error::other("injected write failure"));
+      }
+      let remaining = self
+        .fail_after
+        .map_or(bytes.len(), |limit| limit.saturating_sub(self.bytes.len()));
+      let written = bytes.len().min(self.max_chunk).min(remaining);
+      if written == 0 {
+        return Err(std::io::ErrorKind::WriteZero.into());
+      }
+      self.bytes.extend_from_slice(&bytes[..written]);
+      Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+      Ok(())
+    }
+  }
+
+  #[test]
+  fn writer_tracks_position_without_a_seekable_sink() {
+    let mut writer = Writer::new(Vec::new());
+    writer.write_u16(0x1234).unwrap();
+    writer.write_all(&[5, 6, 7]).unwrap();
+    assert_eq!(writer.position().unwrap(), 5);
+    assert_eq!(writer.into_inner(), [0x34, 0x12, 5, 6, 7]);
+  }
+
+  #[test]
+  fn writer_tracks_partial_writes_and_nonzero_start() {
+    let sink = ChunkWriter {
+      max_chunk: 2,
+      ..ChunkWriter::default()
+    };
+    let mut writer = Writer::with_position(sink, 11);
+    writer.write_all(&[1, 2, 3, 4, 5]).unwrap();
+    assert_eq!(writer.position().unwrap(), 16);
+    assert_eq!(writer.into_inner().bytes, [1, 2, 3, 4, 5]);
+  }
+
+  #[test]
+  fn writer_position_stops_at_the_last_successful_partial_write() {
+    let sink = ChunkWriter {
+      max_chunk: 2,
+      fail_after: Some(3),
+      ..ChunkWriter::default()
+    };
+    let mut writer = Writer::new(sink);
+    assert!(writer.write_all(&[1, 2, 3, 4, 5]).is_err());
+    assert_eq!(writer.position().unwrap(), 3);
+    assert_eq!(writer.into_inner().bytes, [1, 2, 3]);
   }
 }

@@ -33,13 +33,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 Use `EmfMetafile`, `WmfMetafile`, and each record's `parse_data` method when
-you need format-specific typed access.
+you need format-specific typed access. Owned metafiles and records implement
+`SdkWrite`; top-level `write_to` methods accept any `std::io::Write` sink and do
+not allocate an intermediate metafile buffer. Low-level `Writer` tracks its own
+position without requiring `Seek`; use `Writer::with_position` when serialization
+starts at a nonzero logical offset.
 
 For read-only framing, `MetafileRef`, `EmfMetafileRef`, `WmfMetafileRef`, and
 `EmfPlusStreamRef` validate the complete record stream and borrow record data
 directly from the input buffer. Their exact-size iterators do not allocate.
-Record-level `parse_data` remains eager. Call `to_owned` explicitly before
+Record-level `parse_data` remains eager. Call `into_owned` explicitly before
 editing or writing; borrowed views do not provide a raw pass-through writer.
+The owned `EmfPlusStream` retains both records and producer trailing bytes;
+`from_bytes_exact` is available when trailing bytes must be rejected.
 
 ## Compatible and Strict Parsing
 
