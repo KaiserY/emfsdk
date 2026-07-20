@@ -94,10 +94,10 @@ impl Metafile {
   }
 
   pub fn validate_strict(&self) -> Result<()> {
-    if let Some(diagnostic) = self.compatibility_diagnostics().into_iter().next() {
-      return Err(Error::invalid(0, diagnostic.message));
+    match self {
+      Self::Emf(value) => validate_emf_strict(value),
+      Self::Wmf(value) => validate_wmf_strict(value),
     }
-    Ok(())
   }
 
   pub fn compatibility_diagnostics(&self) -> Vec<CompatibilityDiagnostic> {
@@ -108,49 +108,227 @@ impl Metafile {
   }
 }
 
+fn validate_emf_strict(value: &EmfMetafile) -> Result<()> {
+  for (record_index, record) in value.records.iter().enumerate() {
+    let data = record.parse_data().map_err(|error| {
+      Error::invalid(
+        0,
+        format!(
+          "EMF record {record_index} is nonconforming (type {}): {error}",
+          record.record_type
+        ),
+      )
+    })?;
+    data.validate_strict().map_err(|error| {
+      Error::invalid(
+        0,
+        format!(
+          "EMF record {record_index} is nonconforming (type {}): {error}",
+          record.record_type
+        ),
+      )
+    })?;
+    if let EmfRecordData::Comment(EmrComment::EmfPlus { records, .. }) = &data {
+      for (nested_record_index, record) in records.iter().enumerate() {
+        let data = record.parse_data().map_err(|error| {
+          Error::invalid(
+            0,
+            format!(
+              "EMF+ record {nested_record_index} in EMF record {record_index} is nonconforming: {error}"
+            ),
+          )
+        })?;
+        data.validate_strict().map_err(|error| {
+          Error::invalid(
+            0,
+            format!(
+              "EMF+ record {nested_record_index} in EMF record {record_index} is nonconforming: {error}"
+            ),
+          )
+        })?;
+        let flags = EmfPlusRecordFlags::from_bits_retain(record.flags);
+        let mut rebuilt = EmfPlusRecord::from_data(&data, flags).map_err(|error| {
+          Error::invalid(
+            0,
+            format!(
+              "EMF+ record {nested_record_index} in EMF record {record_index} cannot be rebuilt: {error}"
+            ),
+          )
+        })?;
+        rebuilt.padding = record.padding.clone();
+        if rebuilt != *record {
+          return Err(Error::invalid(
+            0,
+            format!(
+              "EMF+ record {nested_record_index} in EMF record {record_index} differs after typed parse/write"
+            ),
+          ));
+        }
+      }
+    }
+    match data.to_record() {
+      Ok(rebuilt) if rebuilt == *record => {}
+      Ok(_) => {
+        return Err(Error::invalid(
+          0,
+          format!(
+            "EMF record {record_index} differs after typed parse/write (type {})",
+            record.record_type
+          ),
+        ));
+      }
+      Err(error) => {
+        return Err(Error::invalid(
+          0,
+          format!(
+            "EMF record {record_index} cannot be rebuilt (type {}): {error}",
+            record.record_type
+          ),
+        ));
+      }
+    }
+  }
+  value
+    .validate_header_metrics()
+    .map_err(|error| Error::invalid(0, error.to_string()))?;
+  if !value.trailing_data.is_empty() {
+    return Err(Error::invalid(
+      0,
+      format!(
+        "EMF contains {} bytes after EMR_EOF",
+        value.trailing_data.len()
+      ),
+    ));
+  }
+  Ok(())
+}
+
+fn validate_wmf_strict(value: &WmfMetafile) -> Result<()> {
+  if let Some(header) = &value.placeable_header {
+    header
+      .validate()
+      .map_err(|error| Error::invalid(0, error.to_string()))?;
+  }
+  for (record_index, record) in value.records.iter().enumerate() {
+    let data = record.parse_data().map_err(|error| {
+      Error::invalid(
+        0,
+        format!(
+          "WMF record {record_index} is nonconforming (function {}): {error}",
+          record.function
+        ),
+      )
+    })?;
+    data.validate_strict().map_err(|error| {
+      Error::invalid(
+        0,
+        format!(
+          "WMF record {record_index} is nonconforming (function {}): {error}",
+          record.function
+        ),
+      )
+    })?;
+    match data.to_record_with_function(record.function) {
+      Ok(rebuilt) if rebuilt == *record => {}
+      Ok(_) => {
+        return Err(Error::invalid(
+          0,
+          format!(
+            "WMF record {record_index} differs after typed parse/write (function {})",
+            record.function
+          ),
+        ));
+      }
+      Err(error) => {
+        return Err(Error::invalid(
+          0,
+          format!(
+            "WMF record {record_index} cannot be rebuilt (function {}): {error}",
+            record.function
+          ),
+        ));
+      }
+    }
+  }
+  value
+    .validate_header_metrics()
+    .map_err(|error| Error::invalid(0, error.to_string()))?;
+  if !value.trailing_data.is_empty() {
+    return Err(Error::invalid(
+      0,
+      format!(
+        "WMF contains {} bytes after META_EOF",
+        value.trailing_data.len()
+      ),
+    ));
+  }
+  Ok(())
+}
+
 fn emf_compatibility_diagnostics(value: &EmfMetafile) -> Vec<CompatibilityDiagnostic> {
   let mut diagnostics = Vec::new();
   for (record_index, record) in value.records.iter().enumerate() {
     match record.parse_data() {
       Ok(data) => {
+        if let Err(error) = data.validate_strict() {
+          diagnostics.push(CompatibilityDiagnostic {
+            format: Format::Emf,
+            record_index: Some(record_index),
+            nested_record_index: None,
+            message: format!(
+              "EMF record {record_index} is nonconforming (type {}): {error}",
+              record.record_type
+            ),
+          });
+        }
         if let EmfRecordData::Comment(EmrComment::EmfPlus { records, .. }) = &data {
           for (nested_record_index, record) in records.iter().enumerate() {
             match record.parse_data() {
-                            Ok(data) => {
-                                let flags = EmfPlusRecordFlags::from_bits_retain(record.flags);
-                                match EmfPlusRecord::from_data(&data, flags) {
-                                    Ok(mut rebuilt) => {
-                                        rebuilt.padding = record.padding.clone();
-                                        if rebuilt != *record {
-                                            diagnostics.push(CompatibilityDiagnostic {
-                                                format: Format::Emf,
-                                                record_index: Some(record_index),
-                                                nested_record_index: Some(nested_record_index),
-                                                message: format!(
-                                                    "EMF+ record {nested_record_index} in EMF record {record_index} differs after typed parse/write"
-                                                ),
-                                            });
-                                        }
-                                    }
-                                    Err(error) => diagnostics.push(CompatibilityDiagnostic {
-                                        format: Format::Emf,
-                                        record_index: Some(record_index),
-                                        nested_record_index: Some(nested_record_index),
-                                        message: format!(
-                                            "EMF+ record {nested_record_index} in EMF record {record_index} cannot be rebuilt: {error}"
-                                        ),
-                                    }),
-                                }
-                            }
-                            Err(error) => diagnostics.push(CompatibilityDiagnostic {
-                                format: Format::Emf,
-                                record_index: Some(record_index),
-                                nested_record_index: Some(nested_record_index),
-                                message: format!(
-                                    "EMF+ record {nested_record_index} in EMF record {record_index} is nonconforming: {error}"
-                                ),
-                            }),
-                        }
+              Ok(data) => {
+                if let Err(error) = data.validate_strict() {
+                  diagnostics.push(CompatibilityDiagnostic {
+                    format: Format::Emf,
+                    record_index: Some(record_index),
+                    nested_record_index: Some(nested_record_index),
+                    message: format!(
+                      "EMF+ record {nested_record_index} in EMF record {record_index} is nonconforming: {error}"
+                    ),
+                  });
+                }
+                let flags = EmfPlusRecordFlags::from_bits_retain(record.flags);
+                match EmfPlusRecord::from_data(&data, flags) {
+                  Ok(mut rebuilt) => {
+                    rebuilt.padding = record.padding.clone();
+                    if rebuilt != *record {
+                      diagnostics.push(CompatibilityDiagnostic {
+                        format: Format::Emf,
+                        record_index: Some(record_index),
+                        nested_record_index: Some(nested_record_index),
+                        message: format!(
+                          "EMF+ record {nested_record_index} in EMF record {record_index} differs after typed parse/write"
+                        ),
+                      });
+                    }
+                  }
+                  Err(error) => diagnostics.push(CompatibilityDiagnostic {
+                    format: Format::Emf,
+                    record_index: Some(record_index),
+                    nested_record_index: Some(nested_record_index),
+                    message: format!(
+                      "EMF+ record {nested_record_index} in EMF record {record_index} cannot be rebuilt: {error}"
+                    ),
+                  }),
+                }
+              }
+              Err(error) => diagnostics.push(CompatibilityDiagnostic {
+                format: Format::Emf,
+                record_index: Some(record_index),
+                nested_record_index: Some(nested_record_index),
+                message: format!(
+                  "EMF+ record {nested_record_index} in EMF record {record_index} is nonconforming: {error}"
+                ),
+              }),
+            }
           }
         }
         match data.to_record() {
@@ -212,27 +390,40 @@ fn wmf_compatibility_diagnostics(value: &WmfMetafile) -> Vec<CompatibilityDiagno
   }
   for (record_index, record) in value.records.iter().enumerate() {
     match record.parse_data() {
-      Ok(data) => match data.to_record_with_function(record.function) {
-        Ok(rebuilt) if rebuilt == *record => {}
-        Ok(_) => diagnostics.push(CompatibilityDiagnostic {
-          format: Format::Wmf,
-          record_index: Some(record_index),
-          nested_record_index: None,
-          message: format!(
-            "WMF record {record_index} differs after typed parse/write (function {})",
-            record.function
-          ),
-        }),
-        Err(error) => diagnostics.push(CompatibilityDiagnostic {
-          format: Format::Wmf,
-          record_index: Some(record_index),
-          nested_record_index: None,
-          message: format!(
-            "WMF record {record_index} cannot be rebuilt (function {}): {error}",
-            record.function
-          ),
-        }),
-      },
+      Ok(data) => {
+        if let Err(error) = data.validate_strict() {
+          diagnostics.push(CompatibilityDiagnostic {
+            format: Format::Wmf,
+            record_index: Some(record_index),
+            nested_record_index: None,
+            message: format!(
+              "WMF record {record_index} is nonconforming (function {}): {error}",
+              record.function
+            ),
+          });
+        }
+        match data.to_record_with_function(record.function) {
+          Ok(rebuilt) if rebuilt == *record => {}
+          Ok(_) => diagnostics.push(CompatibilityDiagnostic {
+            format: Format::Wmf,
+            record_index: Some(record_index),
+            nested_record_index: None,
+            message: format!(
+              "WMF record {record_index} differs after typed parse/write (function {})",
+              record.function
+            ),
+          }),
+          Err(error) => diagnostics.push(CompatibilityDiagnostic {
+            format: Format::Wmf,
+            record_index: Some(record_index),
+            nested_record_index: None,
+            message: format!(
+              "WMF record {record_index} cannot be rebuilt (function {}): {error}",
+              record.function
+            ),
+          }),
+        }
+      }
       Err(error) => diagnostics.push(CompatibilityDiagnostic {
         format: Format::Wmf,
         record_index: Some(record_index),

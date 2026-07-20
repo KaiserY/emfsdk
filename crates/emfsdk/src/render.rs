@@ -2127,7 +2127,7 @@ fn decode_wmf_as_raster(
   for record in &metafile.records {
     let parsed = record.parse_data().map_err(|err| err.to_string())?;
     match parsed {
-      WmfRecordData::Eof => break,
+      WmfRecordData::Eof(_) => break,
       WmfRecordData::SaveDc => state.save_dc(),
       WmfRecordData::RestoreDc(_) => state.restore_dc(),
       WmfRecordData::SetWindowOrg(value) => {
@@ -2167,13 +2167,13 @@ fn decode_wmf_as_raster(
         state.canvas.viewport_org_y += i32::from(value.y);
       }
       WmfRecordData::CreatePenIndirect(value) => {
-        let line_style = WmfPenLineStyle::from_raw(value.pen_line_style_raw());
+        let line_style = WmfPenLineStyle::from_raw(value.pen.pen_line_style_raw());
         let pen = if line_style == Some(WmfPenLineStyle::Null) {
           None
         } else {
           Some(EmfPen {
-            color: color_ref_to_emf(value.color_ref),
-            width: i32::from(value.width.x).unsigned_abs().max(1) as usize,
+            color: color_ref_to_emf(value.pen.color_ref),
+            width: i32::from(value.pen.width.x).unsigned_abs().max(1) as usize,
           })
         };
         state.insert_object(WmfRenderObject::Pen(pen));
@@ -2472,7 +2472,7 @@ fn wmf_initial_window(metafile: &WmfMetafile) -> (i32, i32, i32, i32) {
         ext_y = i32::from(value.y).abs().max(1);
         break;
       }
-      Ok(WmfRecordData::Eof) => break,
+      Ok(WmfRecordData::Eof(_)) => break,
       _ => {}
     }
   }

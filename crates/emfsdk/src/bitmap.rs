@@ -584,6 +584,11 @@ impl DibBitmapInfo {
     self.compression_kind()?.embedded_format()
   }
 
+  pub fn validate_strict(&self) -> Result<()> {
+    validate_dib_bitmap_info(self)?;
+    validate_dib_header_strict(&self.header)
+  }
+
   pub fn bitfield_masks(&self) -> Result<Option<[u32; 3]>> {
     dib_info_bitfield_masks(self)
   }
@@ -769,26 +774,21 @@ pub struct DeviceIndependentBitmap {
 
 impl DeviceIndependentBitmap {
   pub fn from_parts(bitmap_info: &[u8], bitmap_bits: &[u8]) -> Result<Self> {
-    let value = Self {
+    Ok(Self {
       info: DibBitmapInfo::read_from_slice(bitmap_info)?,
       bits: bitmap_bits.to_vec(),
-    };
-    validate_device_independent_bitmap(&value)?;
-    Ok(value)
+    })
   }
 
   pub fn from_packed_slice(bytes: &[u8], color_usage: DibColorUsage) -> Result<Self> {
     let (info, bits_offset) = DibBitmapInfo::read_packed_prefix_from_slice(bytes, color_usage)?;
-    let value = Self {
+    Ok(Self {
       info,
       bits: bytes[bits_offset..].to_vec(),
-    };
-    validate_device_independent_bitmap(&value)?;
-    Ok(value)
+    })
   }
 
   pub fn to_packed_bytes(&self) -> Result<Vec<u8>> {
-    validate_device_independent_bitmap(self)?;
     let info = self.info.to_bytes()?;
     let mut bytes = Vec::with_capacity(info.len() + self.bits.len());
     bytes.extend_from_slice(&info);
@@ -799,9 +799,14 @@ impl DeviceIndependentBitmap {
   pub fn embedded_format(&self) -> Option<EmbeddedBitmapFormat> {
     self.info.embedded_format()
   }
+
+  pub fn validate_strict(&self) -> Result<()> {
+    self.info.validate_strict()?;
+    validate_device_independent_bitmap_strict(self)
+  }
 }
 
-fn validate_device_independent_bitmap(value: &DeviceIndependentBitmap) -> Result<()> {
+fn validate_device_independent_bitmap_strict(value: &DeviceIndependentBitmap) -> Result<()> {
   if value.info.embedded_format().is_some() {
     let image_size = usize::try_from(value.info.header.image_size())
       .map_err(|_| Error::invalid(0, "DIB ImageSize overflows usize"))?;
@@ -889,6 +894,16 @@ fn validate_dib_header(value: &DibHeader) -> Result<()> {
   }
 }
 
+fn validate_dib_header_strict(value: &DibHeader) -> Result<()> {
+  validate_dib_header(value)?;
+  match value {
+    DibHeader::Core(_) => Ok(()),
+    DibHeader::Info { base, .. } => validate_bitmap_info_header_strict(base),
+    DibHeader::V4(value) => validate_bitmap_info_header_strict(&value.base),
+    DibHeader::V5(value) => validate_bitmap_info_header_strict(&value.v4.base),
+  }
+}
+
 fn validate_bitmap_core_header(value: &BitmapCoreHeader) -> Result<()> {
   if value.header_size != BITMAP_CORE_HEADER_SIZE {
     return Err(Error::invalid(0, "BitmapCoreHeader HeaderSize must be 12"));
@@ -956,16 +971,21 @@ fn validate_bitmap_info_header(value: &BitmapInfoHeader) -> Result<()> {
     }
     _ => {}
   }
-  if value.is_top_down() && !compression.unwrap().is_top_down_allowed() {
-    return Err(Error::invalid(
-      0,
-      "BitmapInfoHeader top-down DIB must not use a compressed format",
-    ));
-  }
   if compression.unwrap().embedded_format().is_some() && value.image_size == 0 {
     return Err(Error::invalid(
       0,
       "BitmapInfoHeader JPEG/PNG ImageSize must specify the image buffer size",
+    ));
+  }
+  Ok(())
+}
+
+fn validate_bitmap_info_header_strict(value: &BitmapInfoHeader) -> Result<()> {
+  validate_bitmap_info_header(value)?;
+  if value.is_top_down() && !value.compression_kind().unwrap().is_top_down_allowed() {
+    return Err(Error::invalid(
+      0,
+      "BitmapInfoHeader top-down DIB must not use a compressed format",
     ));
   }
   Ok(())
@@ -1309,7 +1329,13 @@ mod tests {
     invalid_top_down_compressed[8..12].copy_from_slice(&(-4i32).to_le_bytes());
     invalid_top_down_compressed[16..20]
       .copy_from_slice(&(BitmapCompression::Png.raw()).to_le_bytes());
-    assert!(DibBitmapInfo::read_from_slice(&invalid_top_down_compressed).is_err());
+    invalid_top_down_compressed[20..24].copy_from_slice(&4u32.to_le_bytes());
+    let top_down_compressed = DibBitmapInfo::read_from_slice(&invalid_top_down_compressed).unwrap();
+    assert!(top_down_compressed.validate_strict().is_err());
+    assert_eq!(
+      top_down_compressed.to_bytes().unwrap(),
+      invalid_top_down_compressed
+    );
 
     let mut valid_rle4 = base_info;
     valid_rle4[14..16].copy_from_slice(&(BitmapBitCount::Four.raw()).to_le_bytes());
@@ -1551,13 +1577,19 @@ mod tests {
 
     let mut invalid_size = bitmap_info;
     invalid_size[20..24].copy_from_slice(&5u32.to_le_bytes());
-    assert!(DeviceIndependentBitmap::from_parts(&invalid_size, &bitmap_bits).is_err());
+    let mismatched_size = DeviceIndependentBitmap::from_parts(&invalid_size, &bitmap_bits).unwrap();
+    assert!(mismatched_size.validate_strict().is_err());
+    assert_eq!(
+      mismatched_size.to_packed_bytes().unwrap(),
+      [invalid_size.as_slice(), &bitmap_bits].concat()
+    );
 
     let mut invalid_dib = dib;
     let DibHeader::Info { base, .. } = &mut invalid_dib.info.header else {
       panic!("expected BitmapInfoHeader");
     };
     base.image_size = 5;
-    assert!(invalid_dib.to_packed_bytes().is_err());
+    assert!(invalid_dib.to_packed_bytes().is_ok());
+    assert!(invalid_dib.validate_strict().is_err());
   }
 }

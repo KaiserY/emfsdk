@@ -743,6 +743,22 @@ impl EmfMetafile {
       let record = EmfRecord::read_from(&mut reader, bytes.len() as u64)?;
       let is_eof = record.record_type == EMR_EOF;
       records.push(record);
+      if records.len() == 1 && records[0].record_type == EMR_HEADER {
+        // nRecords is at bytes 44..48 of the EMR_HEADER payload. Bound the
+        // untrusted hint so a corrupt header cannot force a large allocation.
+        let declared_records = records[0]
+          .data
+          .get(44..48)
+          .map(|bytes| u32::from_le_bytes(bytes.try_into().expect("slice length checked")))
+          .unwrap_or(0) as usize;
+        let maximum_records = bytes.len() / 8;
+        records.reserve(
+          declared_records
+            .saturating_sub(1)
+            .min(maximum_records.saturating_sub(1))
+            .min(16_384),
+        );
+      }
       if is_eof {
         break;
       }
@@ -1242,7 +1258,6 @@ impl<'a> EmfRecordData<'a> {
       Some(EmfRecordType::Header) => Self::Header(EmfHeader::from_record_data(data)?),
       Some(EmfRecordType::Eof) => {
         let value = EmrEof::read_data(data)?;
-        validate_emr_eof_size_last(&value, record.data.len() + 8)?;
         Self::Eof(value)
       }
       Some(EmfRecordType::PolyBezier) => {
@@ -1577,12 +1592,49 @@ impl<'a> EmfRecordData<'a> {
     })
   }
 
+  pub fn validate_strict(&self) -> Result<()> {
+    match self {
+      Self::Header(value) => value.validate_strict(),
+      Self::Eof(value) => {
+        let data = value.to_data()?;
+        validate_emr_eof_size_last(value, data.len() + 8)
+      }
+      Self::SetPixelV(value) => value.color.validate_strict(),
+      Self::SetTextColor(value) => value.color.validate_strict(),
+      Self::SetBkColor(value) => value.color.validate_strict(),
+      Self::SetTextAlign(value) => validate_emr_set_text_align_strict(value),
+      Self::ExtFloodFill(value) => value.color.validate_strict(),
+      Self::CreatePen(value) => validate_emr_create_pen_strict(value),
+      Self::CreateBrushIndirect(value) => validate_emr_create_brush_indirect_strict(value),
+      Self::ExtCreatePen(value) => validate_emr_ext_create_pen_strict(value),
+      Self::ExtCreateFontIndirectW(value) => validate_emr_ext_create_font_strict(&value.font),
+      Self::CreateColorSpace(value) => validate_emr_create_color_space_strict(value),
+      Self::BitBlt(value) => value.background_color_source.validate_strict(),
+      Self::StretchBlt(value) => value.background_color_source.validate_strict(),
+      Self::MaskBlt(value) => value.background_color_source.validate_strict(),
+      Self::PlgBlt(value) => {
+        value.background_color_source.validate_strict()?;
+        validate_emr_plg_blt_strict(value)
+      }
+      Self::AlphaBlend(value) => value.background_color_source.validate_strict(),
+      Self::TransparentBlt(value) => {
+        value.transparent_color.validate_strict()?;
+        value.background_color_source.validate_strict()
+      }
+      Self::ExtTextOutA(value) => validate_emr_ext_text_out_strict(value, false, "EMR_EXTTEXTOUTA"),
+      Self::ExtTextOutW(value) => validate_emr_ext_text_out_strict(value, true, "EMR_EXTTEXTOUTW"),
+      Self::PolyTextOutA(value) => validate_emr_poly_text_out_strict(value, false),
+      Self::PolyTextOutW(value) => validate_emr_poly_text_out_strict(value, true),
+      Self::Comment(value) => value.validate_strict(),
+      _ => Ok(()),
+    }
+  }
+
   pub fn to_record(&self) -> Result<EmfRecord> {
     match self {
       Self::Header(value) => Ok(EmfRecord::new(EMR_HEADER, value.to_record_data()?)),
       Self::Eof(value) => {
         let data = value.to_data()?;
-        validate_emr_eof_size_last(value, data.len() + 8)?;
         Ok(EmfRecord::new(EMR_EOF, data))
       }
       Self::PolyBezier(value) => Ok(EmfRecord::new(EmfRecordType::PolyBezier.raw(), {
@@ -3437,7 +3489,11 @@ impl LogFontW {
   }
 }
 
-fn validate_log_font_w(value: &LogFontW) -> Result<()> {
+fn validate_log_font_w(_value: &LogFontW) -> Result<()> {
+  Ok(())
+}
+
+fn validate_log_font_w_strict(value: &LogFontW) -> Result<()> {
   if !(0..=1000).contains(&value.weight) {
     return Err(Error::invalid(0, "LogFont Weight must be 0 through 1000"));
   }
@@ -4006,12 +4062,48 @@ impl LogColorSpace {
     Ok(value)
   }
 
+  fn read_from_compatible<R: std::io::Read + std::io::Seek>(
+    reader: &mut Reader<R>,
+    encoding: SdkEncoding,
+    filename_bytes: usize,
+  ) -> Result<Self> {
+    Ok(Self {
+      signature: reader.read_u32()?,
+      version: reader.read_u32()?,
+      size: reader.read_u32()?,
+      color_space_type: reader.read_i32()?,
+      intent: reader.read_i32()?,
+      endpoints: CieXyzTriple::read_from(reader)?,
+      gamma_red: reader.read_u32()?,
+      gamma_green: reader.read_u32()?,
+      gamma_blue: reader.read_u32()?,
+      filename: SdkString::read_bytes(reader, filename_bytes, encoding)?,
+    })
+  }
+
   pub fn write_to<W: std::io::Write + std::io::Seek>(
     &self,
     writer: &mut Writer<W>,
     filename_bytes: usize,
   ) -> Result<()> {
     validate_log_color_space(self, filename_bytes)?;
+    writer.write_u32(self.signature)?;
+    writer.write_u32(self.version)?;
+    writer.write_u32(self.size)?;
+    writer.write_i32(self.color_space_type)?;
+    writer.write_i32(self.intent)?;
+    self.endpoints.write_to(writer)?;
+    writer.write_u32(self.gamma_red)?;
+    writer.write_u32(self.gamma_green)?;
+    writer.write_u32(self.gamma_blue)?;
+    write_fixed_bytes(writer, &self.filename.encoded_bytes()?, filename_bytes)
+  }
+
+  fn write_compatible<W: std::io::Write + std::io::Seek>(
+    &self,
+    writer: &mut Writer<W>,
+    filename_bytes: usize,
+  ) -> Result<()> {
     writer.write_u32(self.signature)?;
     writer.write_u32(self.version)?;
     writer.write_u32(self.size)?;
@@ -4038,9 +4130,18 @@ pub struct EmrCreateColorSpace {
 
 impl EmrCreateColorSpace {
   pub fn read_data(data: &[u8]) -> Result<Self> {
+    const FIXED_DATA_SIZE: usize = 4 + 68;
+    if data.len() < FIXED_DATA_SIZE {
+      return Err(Error::invalid(
+        0,
+        "EMR_CREATECOLORSPACE record is shorter than its fixed fields",
+      ));
+    }
     let mut reader = Reader::new(Cursor::new(data));
     let color_space_index = reader.read_u32()?;
-    let log_color_space = LogColorSpace::read_from(&mut reader, SdkEncoding::Windows1252, 260)?;
+    let filename_bytes = (data.len() - FIXED_DATA_SIZE).min(260);
+    let log_color_space =
+      LogColorSpace::read_from_compatible(&mut reader, SdkEncoding::Windows1252, filename_bytes)?;
     let extension = read_remaining(&mut reader, data)?;
     let value = Self {
       color_space_index,
@@ -4053,11 +4154,18 @@ impl EmrCreateColorSpace {
 
   pub fn to_data(&self) -> Result<Vec<u8>> {
     validate_emr_create_color_space(self)?;
+    let filename_bytes = self
+      .log_color_space
+      .filename
+      .raw_bytes()
+      .map_or(260, |bytes| bytes.len().min(260));
     let mut writer = Writer::new(Cursor::new(Vec::with_capacity(
-      4 + LogColorSpace::sdk_size(260) + self.extension.len(),
+      4 + LogColorSpace::sdk_size(filename_bytes) + self.extension.len(),
     )));
     writer.write_u32(self.color_space_index)?;
-    self.log_color_space.write_to(&mut writer, 260)?;
+    self
+      .log_color_space
+      .write_compatible(&mut writer, filename_bytes)?;
     writer.write_all(&self.extension)?;
     pad_writer_to_4(&mut writer)?;
     Ok(writer.into_inner().into_inner())
@@ -4808,7 +4916,12 @@ fn validate_log_pen(value: &LogPen) -> Result<()> {
     value.pen_join_kind(),
     value.pen_type_kind(),
     value.pen_reserved_bits(),
-  )?;
+  )
+}
+
+fn validate_log_pen_strict(value: &LogPen) -> Result<()> {
+  validate_log_pen(value)?;
+  value.color.validate_strict()?;
   if value.pen_type_kind() == Some(EmrPenType::Cosmetic) && value.width.x != 1 {
     return Err(Error::invalid(0, "LogPen cosmetic pen width must be 1"));
   }
@@ -4820,9 +4933,19 @@ fn validate_emr_create_pen(value: &EmrCreatePen) -> Result<()> {
   validate_log_pen(&value.log_pen())
 }
 
+fn validate_emr_create_pen_strict(value: &EmrCreatePen) -> Result<()> {
+  validate_emr_created_object_index(value.object_index, "EMR_CREATEPEN", "ihPen")?;
+  validate_log_pen_strict(&value.log_pen())
+}
+
 fn validate_emr_create_brush_indirect(value: &EmrCreateBrushIndirect) -> Result<()> {
   validate_emr_created_object_index(value.object_index, "EMR_CREATEBRUSHINDIRECT", "ihBrush")?;
   validate_log_brush_ex(&value.log_brush_ex())
+}
+
+fn validate_emr_create_brush_indirect_strict(value: &EmrCreateBrushIndirect) -> Result<()> {
+  validate_emr_create_brush_indirect(value)?;
+  value.color.validate_strict()
 }
 
 fn validate_log_brush_ex(value: &LogBrushEx) -> Result<()> {
@@ -4932,6 +5055,11 @@ fn validate_emr_set_stretch_blt_mode(_value: &EmrSetStretchBltMode) -> Result<()
 }
 
 fn validate_emr_set_text_align(value: &EmrSetTextAlign) -> Result<()> {
+  let _ = value;
+  Ok(())
+}
+
+fn validate_emr_set_text_align_strict(value: &EmrSetTextAlign) -> Result<()> {
   let text_alignment_mode = u16::try_from(value.text_alignment_mode).map_err(|_| {
     Error::invalid(
       0,
@@ -5209,27 +5337,6 @@ fn validate_ext_text_out_options(options: ExtTextOutOptions, record_name: &str) 
 
 fn validate_emr_text(value: &EmrText, wide: bool, record_name: &str) -> Result<()> {
   validate_ext_text_out_options(value.options, record_name)?;
-  if value.options.contains(ExtTextOutOptions::NO_RECT) {
-    if value.rectangle.is_some() {
-      return Err(Error::invalid(
-        0,
-        format!("{record_name} rectangle supplied with ETO_NO_RECT"),
-      ));
-    }
-    if emr_text_requires_rectangle(value.options) {
-      return Err(Error::invalid(
-        0,
-        format!("{record_name} ETO_NO_RECT cannot be combined with rectangle options"),
-      ));
-    }
-  }
-  if emr_text_requires_rectangle(value.options) && value.rectangle.is_none() {
-    return Err(Error::invalid(
-      0,
-      format!("{record_name} rectangle missing for ETO_OPAQUE or ETO_CLIPPED"),
-    ));
-  }
-
   let text_bytes = value.text.encoded_bytes()?;
   if wide && !text_bytes.len().is_multiple_of(2) {
     return Err(Error::invalid(
@@ -5273,6 +5380,32 @@ fn validate_emr_text(value: &EmrText, wide: bool, record_name: &str) -> Result<(
   Ok(())
 }
 
+fn validate_emr_text_strict(value: &EmrText, wide: bool, record_name: &str) -> Result<()> {
+  validate_emr_text(value, wide, record_name)?;
+  if value.options.contains(ExtTextOutOptions::NO_RECT) {
+    if value.rectangle.is_some() {
+      return Err(Error::invalid(
+        0,
+        format!("{record_name} rectangle supplied with ETO_NO_RECT"),
+      ));
+    }
+    if emr_text_requires_rectangle(value.options) {
+      return Err(Error::invalid(
+        0,
+        format!("{record_name} ETO_NO_RECT cannot be combined with rectangle options"),
+      ));
+    }
+  }
+  if emr_text_requires_rectangle(value.options) && value.rectangle.is_none() {
+    return Err(Error::invalid(
+      0,
+      format!("{record_name} rectangle missing for ETO_OPAQUE or ETO_CLIPPED"),
+    ));
+  }
+
+  Ok(())
+}
+
 fn validate_emr_ext_text_out(value: &EmrExtTextOut, wide: bool, record_name: &str) -> Result<()> {
   if value.graphics_mode_kind().is_none() {
     return Err(Error::invalid(
@@ -5281,6 +5414,20 @@ fn validate_emr_ext_text_out(value: &EmrExtTextOut, wide: bool, record_name: &st
     ));
   }
   validate_emr_text(&value.text, wide, record_name)
+}
+
+fn validate_emr_ext_text_out_strict(
+  value: &EmrExtTextOut,
+  wide: bool,
+  record_name: &str,
+) -> Result<()> {
+  if value.graphics_mode_kind().is_none() {
+    return Err(Error::invalid(
+      0,
+      format!("{record_name} iGraphicsMode is invalid"),
+    ));
+  }
+  validate_emr_text_strict(&value.text, wide, record_name)
 }
 
 fn validate_emr_poly_text_out(value: &EmrPolyTextOut, wide: bool) -> Result<()> {
@@ -5292,6 +5439,19 @@ fn validate_emr_poly_text_out(value: &EmrPolyTextOut, wide: bool) -> Result<()> 
   }
   for text in &value.texts {
     validate_emr_text(text, wide, "EMR_POLYTEXTOUT")?;
+  }
+  Ok(())
+}
+
+fn validate_emr_poly_text_out_strict(value: &EmrPolyTextOut, wide: bool) -> Result<()> {
+  if value.graphics_mode_kind().is_none() {
+    return Err(Error::invalid(
+      0,
+      "EMR_POLYTEXTOUT iGraphicsMode is invalid",
+    ));
+  }
+  for text in &value.texts {
+    validate_emr_text_strict(text, wide, "EMR_POLYTEXTOUT")?;
   }
   Ok(())
 }
@@ -5437,8 +5597,35 @@ fn validate_emr_ext_create_font(value: &EmrExtCreateFont) -> Result<()> {
   }
 }
 
+fn validate_emr_ext_create_font_strict(value: &EmrExtCreateFont) -> Result<()> {
+  validate_emr_ext_create_font(value)?;
+  match value {
+    EmrExtCreateFont::LogFont(value) => validate_log_font_w_strict(value),
+    EmrExtCreateFont::LogFontPanose(value) => validate_log_font_w_strict(&value.log_font),
+    EmrExtCreateFont::LogFontExDv(value) => validate_log_font_w_strict(&value.log_font_ex.log_font),
+    EmrExtCreateFont::Raw(_) => Ok(()),
+  }
+}
+
 fn validate_emr_create_color_space(value: &EmrCreateColorSpace) -> Result<()> {
   validate_emr_created_object_index(value.color_space_index, "EMR_CREATECOLORSPACE", "ihCS")
+}
+
+fn validate_emr_create_color_space_strict(value: &EmrCreateColorSpace) -> Result<()> {
+  validate_emr_create_color_space(value)?;
+  validate_log_color_space(&value.log_color_space, 260)?;
+  if value
+    .log_color_space
+    .filename
+    .raw_bytes()
+    .is_some_and(|bytes| bytes.len() != 260)
+  {
+    return Err(Error::invalid(
+      0,
+      "LogColorSpace Filename must occupy 260 bytes",
+    ));
+  }
+  Ok(())
 }
 
 fn validate_emr_create_color_space_w(value: &EmrCreateColorSpaceW) -> Result<()> {
@@ -5478,13 +5665,8 @@ fn validate_emr_comment_multi_formats(value: &EmrCommentMultiFormats) -> Result<
   let format_data_start = value.format_data_start_offset()?;
   let mut ranges = Vec::with_capacity(value.formats.len());
   for (index, format) in value.formats.iter().enumerate() {
-    let Some(signature) = format.signature_kind() else {
-      return Err(Error::invalid(
-        0,
-        "EMR_COMMENT_MULTIFORMATS Signature is invalid",
-      ));
-    };
-    if signature == EmrFormatSignature::Eps && format.version != 1 {
+    let signature = format.signature_kind();
+    if signature == Some(EmrFormatSignature::Eps) && format.version != 1 {
       return Err(Error::invalid(
         0,
         "EMR_COMMENT_MULTIFORMATS EPS Version must be 1",
@@ -5502,7 +5684,7 @@ fn validate_emr_comment_multi_formats(value: &EmrCommentMultiFormats) -> Result<
       .checked_add(format.size_data as usize)
       .ok_or_else(|| Error::invalid(0, "EMR_COMMENT_MULTIFORMATS data range overflows"))?;
     ranges.push((start, end));
-    if signature == EmrFormatSignature::Eps {
+    if signature == Some(EmrFormatSignature::Eps) {
       EmrEpsData::read_data(format_data)?;
     }
     total_size = total_size
@@ -5525,6 +5707,21 @@ fn validate_emr_comment_multi_formats(value: &EmrCommentMultiFormats) -> Result<
       ));
     }
     next = end;
+  }
+  Ok(())
+}
+
+fn validate_emr_comment_multi_formats_strict(value: &EmrCommentMultiFormats) -> Result<()> {
+  validate_emr_comment_multi_formats(value)?;
+  if value
+    .formats
+    .iter()
+    .any(|format| format.signature_kind().is_none())
+  {
+    return Err(Error::invalid(
+      0,
+      "EMR_COMMENT_MULTIFORMATS Signature is invalid",
+    ));
   }
   Ok(())
 }
@@ -5579,6 +5776,7 @@ fn validate_emr_comment_begin_group(value: &EmrCommentBeginGroup) -> Result<()> 
 
 fn validate_emr_comment_emf_plus(
   records: &[crate::emfplus::EmfPlusRecord],
+  _emf_plus_trailing_data: &[u8],
   alignment_padding: &[u8],
 ) -> Result<()> {
   if records.is_empty() {
@@ -5680,7 +5878,11 @@ fn validate_emr_raw_comment(
   Ok(())
 }
 
-fn validate_emr_comment_alignment_padding(alignment_padding: &[u8]) -> Result<()> {
+fn validate_emr_comment_alignment_padding(_alignment_padding: &[u8]) -> Result<()> {
+  Ok(())
+}
+
+fn validate_emr_comment_alignment_padding_strict(alignment_padding: &[u8]) -> Result<()> {
   if alignment_padding.len() > 3 {
     return Err(Error::invalid(
       0,
@@ -5747,15 +5949,6 @@ fn validate_emf_header(value: &EmfHeader) -> Result<()> {
   if value.reserved != 0 {
     return Err(Error::invalid(0, "EMR_HEADER Reserved must be zero"));
   }
-  if let Some(description) = value.description()? {
-    let bytes = description.encoded_bytes()?;
-    if bytes.len() < 2 || bytes[bytes.len() - 2..] != [0, 0] {
-      return Err(Error::invalid(
-        0,
-        "EMR_HEADER description must be UTF-16 null-terminated",
-      ));
-    }
-  }
   if let Some(extension1) = value.header_extension1()?
     && extension1.opengl_present().is_none()
   {
@@ -5770,6 +5963,20 @@ fn validate_emf_header(value: &EmfHeader) -> Result<()> {
     ));
   }
   value.pixel_format_descriptor()?;
+  Ok(())
+}
+
+fn validate_emf_header_strict(value: &EmfHeader) -> Result<()> {
+  validate_emf_header(value)?;
+  if let Some(description) = value.description()? {
+    let bytes = description.encoded_bytes()?;
+    if bytes.len() < 2 || bytes[bytes.len() - 2..] != [0, 0] {
+      return Err(Error::invalid(
+        0,
+        "EMR_HEADER description must be UTF-16 null-terminated",
+      ));
+    }
+  }
   Ok(())
 }
 
@@ -5954,7 +6161,11 @@ fn validate_emr_mask_blt(value: &EmrMaskBlt) -> Result<()> {
 fn validate_emr_plg_blt(value: &EmrPlgBlt) -> Result<()> {
   validate_dib_color_usage(value.source_color_usage, "EMR_PLGBLT source ColorUsage")?;
   validate_dib_color_usage(value.mask_color_usage, "EMR_PLGBLT mask ColorUsage")?;
-  validate_required_bitmap(value.source_bitmap.as_ref(), "EMR_PLGBLT", "source bitmap")?;
+  validate_required_bitmap(value.source_bitmap.as_ref(), "EMR_PLGBLT", "source bitmap")
+}
+
+fn validate_emr_plg_blt_strict(value: &EmrPlgBlt) -> Result<()> {
+  validate_emr_plg_blt(value)?;
   validate_required_monochrome_mask_bitmap(value.mask_bitmap.as_ref(), "EMR_PLGBLT")
 }
 
@@ -6050,7 +6261,11 @@ fn validate_emr_blend_function(value: &EmrBlendFunction) -> Result<()> {
   Ok(())
 }
 
-fn validate_log_pen_ex(value: &LogPenEx) -> Result<()> {
+fn validate_log_pen_ex(_value: &LogPenEx) -> Result<()> {
+  Ok(())
+}
+
+fn validate_log_pen_ex_strict(value: &LogPenEx) -> Result<()> {
   validate_emr_pen_style(
     value.pen_line_style_kind(),
     value.pen_end_cap_kind(),
@@ -6106,6 +6321,12 @@ fn validate_emr_ext_create_pen(value: &EmrExtCreatePen) -> Result<()> {
   validate_log_pen_ex(&value.log_pen_ex())?;
   value.bitmap()?;
   Ok(())
+}
+
+fn validate_emr_ext_create_pen_strict(value: &EmrExtCreatePen) -> Result<()> {
+  validate_emr_ext_create_pen(value)?;
+  validate_log_pen_ex_strict(&value.log_pen_ex())?;
+  value.color.validate_strict()
 }
 
 fn validate_emr_pen_style(
@@ -8056,7 +8277,7 @@ impl EmrCommentMultiFormats {
       .checked_mul(16)
       .ok_or_else(|| Error::invalid(0, "EMR_COMMENT_MULTIFORMATS size overflows"))?;
     usize_to_u32(
-      4 + 16 + 4 + formats_size,
+      8 + 16 + 4 + formats_size,
       "EMR_COMMENT_MULTIFORMATS FormatData offset",
     )
   }
@@ -8295,6 +8516,7 @@ impl EmrPublicComment {
 pub enum EmrComment {
   EmfPlus {
     records: Vec<crate::emfplus::EmfPlusRecord>,
+    emf_plus_trailing_data: Vec<u8>,
     alignment_padding: Vec<u8>,
   },
   EmfSpool {
@@ -8353,10 +8575,11 @@ impl EmrComment {
     let alignment_padding = data[payload_end..].to_vec();
     validate_emr_comment_alignment_padding(&alignment_padding)?;
     if identifier == EMR_COMMENT_EMFPLUS {
-      let records = crate::emfplus::read_records(payload)?;
-      validate_emr_comment_emf_plus(&records, &alignment_padding)?;
+      let (records, emf_plus_trailing_data) = crate::emfplus::read_records_with_trailing(payload)?;
+      validate_emr_comment_emf_plus(&records, &emf_plus_trailing_data, &alignment_padding)?;
       Ok(Self::EmfPlus {
         records,
+        emf_plus_trailing_data,
         alignment_padding,
       })
     } else if identifier == EMR_COMMENT_EMFSPOOL {
@@ -8398,16 +8621,21 @@ impl EmrComment {
     match self {
       Self::EmfPlus {
         records,
+        emf_plus_trailing_data,
         alignment_padding,
       } => {
-        validate_emr_comment_emf_plus(records, alignment_padding)?;
-        let payload_len = records.iter().try_fold(0usize, |total, record| {
-          let record_size = usize::try_from(record.sdk_size())
-            .map_err(|_| Error::invalid(0, "EMF+ record size overflows usize"))?;
-          total
-            .checked_add(record_size)
-            .ok_or_else(|| Error::invalid(0, "EMF+ comment payload size overflows"))
-        })?;
+        validate_emr_comment_emf_plus(records, emf_plus_trailing_data, alignment_padding)?;
+        let payload_len = records
+          .iter()
+          .try_fold(0usize, |total, record| {
+            let record_size = usize::try_from(record.sdk_size())
+              .map_err(|_| Error::invalid(0, "EMF+ record size overflows usize"))?;
+            total
+              .checked_add(record_size)
+              .ok_or_else(|| Error::invalid(0, "EMF+ comment payload size overflows"))
+          })?
+          .checked_add(emf_plus_trailing_data.len())
+          .ok_or_else(|| Error::invalid(0, "EMF+ comment payload size overflows"))?;
         let capacity = 8usize
           .checked_add(payload_len)
           .and_then(|size| size.checked_add(alignment_padding.len()))
@@ -8418,6 +8646,7 @@ impl EmrComment {
         for record in records {
           record.write_to(&mut writer)?;
         }
+        writer.write_all(emf_plus_trailing_data)?;
         write_emr_comment_alignment_padding(&mut writer, alignment_padding)?;
         Ok(writer.into_inner().into_inner())
       }
@@ -8504,6 +8733,26 @@ impl EmrComment {
       } => alignment_padding,
     }
   }
+
+  pub fn validate_strict(&self) -> Result<()> {
+    validate_emr_comment_alignment_padding_strict(self.alignment_padding())?;
+    if let Self::EmfPlus {
+      emf_plus_trailing_data,
+      ..
+    } = self
+      && !emf_plus_trailing_data.is_empty()
+    {
+      return Err(Error::invalid(0, "EMR_COMMENT_EMFPLUS has trailing data"));
+    }
+    if let Self::Public {
+      comment: EmrPublicComment::MultiFormats(value),
+      ..
+    } = self
+    {
+      validate_emr_comment_multi_formats_strict(value)?;
+    }
+    Ok(())
+  }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -8548,6 +8797,10 @@ pub struct EmfHeaderExtension2 {
 }
 
 impl EmfHeader {
+  pub fn validate_strict(&self) -> Result<()> {
+    validate_emf_header_strict(self)
+  }
+
   pub fn version_kind(&self) -> Option<EmrMetafileVersion> {
     EmrMetafileVersion::from_raw(self.version)
   }
@@ -8906,7 +9159,19 @@ fn read_emr_text<R: std::io::Read + std::io::Seek>(
   let descriptor = peek_emr_text_descriptor(reader)?;
   if descriptor.options.contains(ExtTextOutOptions::NO_RECT) {
     reader.seek(descriptor_start)?;
-    return read_emr_text_with_rectangle(reader, data, wide, record_name, false);
+    match read_emr_text_with_rectangle(reader, data, wide, record_name, false) {
+      Ok(value) => return Ok(value),
+      Err(no_rectangle_error) => {
+        reader.seek(descriptor_start)?;
+        return match read_emr_text_with_rectangle(reader, data, wide, record_name, true) {
+          Ok(value) => Ok(value),
+          Err(_) => {
+            reader.seek(descriptor_start)?;
+            Err(no_rectangle_error)
+          }
+        };
+      }
+    }
   }
   if emr_text_requires_rectangle(descriptor.options) {
     reader.seek(descriptor_start)?;
@@ -9966,7 +10231,10 @@ mod tests {
 
     let last = header.extension.len() - 1;
     header.extension[last] = b'!';
-    assert!(header.to_record_data().is_err());
+    let compatible_bytes = header.to_record_data().unwrap();
+    let reparsed = EmfHeader::from_record_data(&compatible_bytes).unwrap();
+    assert_eq!(reparsed.to_record_data().unwrap(), compatible_bytes);
+    assert!(reparsed.validate_strict().is_err());
     header.extension[last] = 0;
 
     header.description_offset = 999;
@@ -10306,7 +10574,9 @@ mod tests {
     assert_eq!(record.parse_data().unwrap(), text_color);
     let mut invalid_text_color = record.clone();
     invalid_text_color.data[3] = 1;
-    assert!(invalid_text_color.parse_data().is_err());
+    let parsed = invalid_text_color.parse_data().unwrap();
+    assert!(parsed.validate_strict().is_err());
+    assert_eq!(parsed.to_record().unwrap(), invalid_text_color);
     let mut trailing_text_color = record;
     trailing_text_color
       .data
@@ -10326,7 +10596,9 @@ mod tests {
     assert_eq!(record.parse_data().unwrap(), background_color);
     let mut invalid_background_color = record;
     invalid_background_color.data[3] = 1;
-    assert!(invalid_background_color.parse_data().is_err());
+    let parsed = invalid_background_color.parse_data().unwrap();
+    assert!(parsed.validate_strict().is_err());
+    assert_eq!(parsed.to_record().unwrap(), invalid_background_color);
 
     let restore_dc = EmfRecordData::RestoreDc(EmrRestoreDc { saved_dc: -1 });
     let record = restore_dc.to_record().unwrap();
@@ -10549,28 +10821,23 @@ mod tests {
         .vertical_text_alignment_flags()
         .contains(WmfVerticalTextAlignmentModeFlags::BASELINE)
     );
-    assert!(
-      EmfRecordData::SetTextAlign(EmrSetTextAlign {
-        text_alignment_mode: 0x0004,
-      })
-      .to_record()
-      .is_err()
+    let invalid_alignment = EmfRecordData::SetTextAlign(EmrSetTextAlign {
+      text_alignment_mode: 0x0004,
+    });
+    assert!(invalid_alignment.validate_strict().is_err());
+    assert!(invalid_alignment.to_record().is_ok());
+    let invalid_alignment_record = EmfRecord::new(
+      EmfRecordType::SetTextAlign.raw(),
+      0x0010_u32.to_le_bytes().to_vec(),
     );
-    assert!(
-      EmfRecord::new(
-        EmfRecordType::SetTextAlign.raw(),
-        0x0010_u32.to_le_bytes().to_vec(),
-      )
-      .parse_data()
-      .is_err()
-    );
-    assert!(
-      EmfRecordData::SetTextAlign(EmrSetTextAlign {
-        text_alignment_mode: 0x0001_0000,
-      })
-      .to_record()
-      .is_err()
-    );
+    let parsed = invalid_alignment_record.parse_data().unwrap();
+    assert!(parsed.validate_strict().is_err());
+    assert_eq!(parsed.to_record().unwrap(), invalid_alignment_record);
+    let oversized_alignment = EmfRecordData::SetTextAlign(EmrSetTextAlign {
+      text_alignment_mode: 0x0001_0000,
+    });
+    assert!(oversized_alignment.validate_strict().is_err());
+    assert!(oversized_alignment.to_record().is_ok());
 
     let record = EmfRecordData::SetArcDirection(EmrSetArcDirection {
       arc_direction: EmrArcDirection::Clockwise.raw(),
@@ -10725,10 +10992,13 @@ mod tests {
       palette_suffix: vec![0xEE, 0xFF, 0x11, 0x22],
       size_last: 28,
     });
-    assert!(invalid.to_record().is_err());
+    assert!(invalid.validate_strict().is_err());
+    assert!(invalid.to_record().is_ok());
     let mut invalid_record = record.clone();
     invalid_record.data[20..24].copy_from_slice(&28u32.to_le_bytes());
-    assert!(invalid_record.parse_data().is_err());
+    let parsed = invalid_record.parse_data().unwrap();
+    assert!(parsed.validate_strict().is_err());
+    assert_eq!(parsed.to_record().unwrap(), invalid_record);
     let mut fixed_field_overlap_record = record.clone();
     fixed_field_overlap_record.data[4..8].copy_from_slice(&12u32.to_le_bytes());
     assert!(fixed_field_overlap_record.parse_data().is_err());
@@ -11023,21 +11293,23 @@ mod tests {
       .to_record()
       .is_err()
     );
-    assert!(
-      EmfRecordData::CreatePen(EmrCreatePen {
-        object_index: 2,
-        pen_style: EmrPenStyleFlags::DASH.bits(),
-        width: PointL { x: 2, y: 0 },
-        color: ColorRef {
-          red: 1,
-          green: 2,
-          blue: 3,
-          reserved: 0,
-        },
-      })
-      .to_record()
-      .is_err()
+    let compatible_width_pen = EmfRecordData::CreatePen(EmrCreatePen {
+      object_index: 2,
+      pen_style: EmrPenStyleFlags::DASH.bits(),
+      width: PointL { x: 2, y: 0 },
+      color: ColorRef {
+        red: 1,
+        green: 2,
+        blue: 3,
+        reserved: 0,
+      },
+    });
+    let compatible_width_record = compatible_width_pen.to_record().unwrap();
+    assert_eq!(
+      compatible_width_record.parse_data().unwrap(),
+      compatible_width_pen
     );
+    assert!(compatible_width_pen.validate_strict().is_err());
 
     let create_brush = EmfRecordData::CreateBrushIndirect(EmrCreateBrushIndirect {
       object_index: 3,
@@ -11166,7 +11438,9 @@ mod tests {
     assert!(zero_ext_create_pen_index_record.parse_data().is_err());
     let mut invalid_ext_create_pen_record = record.clone();
     invalid_ext_create_pen_record.data[20..24].copy_from_slice(&0x0000_0010_u32.to_le_bytes());
-    assert!(invalid_ext_create_pen_record.parse_data().is_err());
+    let parsed = invalid_ext_create_pen_record.parse_data().unwrap();
+    assert!(parsed.validate_strict().is_err());
+    assert_eq!(parsed.to_record().unwrap(), invalid_ext_create_pen_record);
     let mut oversized_style_count_record = record.clone();
     oversized_style_count_record.data[40..44].copy_from_slice(&1_000_000_u32.to_le_bytes());
     assert!(oversized_style_count_record.parse_data().is_err());
@@ -11233,7 +11507,7 @@ mod tests {
         style_entries: Vec::new(),
         bitmap_buffer: Vec::new(),
       })
-      .to_record()
+      .validate_strict()
       .is_err()
     );
     assert!(
@@ -11256,7 +11530,7 @@ mod tests {
         style_entries: Vec::new(),
         bitmap_buffer: Vec::new(),
       })
-      .to_record()
+      .validate_strict()
       .is_err()
     );
     assert!(
@@ -11279,7 +11553,7 @@ mod tests {
         style_entries: Vec::new(),
         bitmap_buffer: Vec::new(),
       })
-      .to_record()
+      .validate_strict()
       .is_err()
     );
     let cosmetic_hatched_pen = EmfRecordData::ExtCreatePen(EmrExtCreatePen {
@@ -11322,7 +11596,7 @@ mod tests {
         style_entries: vec![1, 2],
         bitmap_buffer: Vec::new(),
       })
-      .to_record()
+      .validate_strict()
       .is_err()
     );
   }
@@ -11378,7 +11652,7 @@ mod tests {
         object_index: 7,
         font: EmrExtCreateFont::LogFont(invalid_log_font),
       })
-      .to_record()
+      .validate_strict()
       .is_err()
     );
     let mut invalid_log_font = log_font.clone();
@@ -11388,7 +11662,7 @@ mod tests {
         object_index: 7,
         font: EmrExtCreateFont::LogFont(invalid_log_font),
       })
-      .to_record()
+      .validate_strict()
       .is_err()
     );
     let mut invalid_log_font = log_font.clone();
@@ -11398,7 +11672,7 @@ mod tests {
         object_index: 7,
         font: EmrExtCreateFont::LogFont(invalid_log_font),
       })
-      .to_record()
+      .validate_strict()
       .is_err()
     );
     let mut invalid_log_font = log_font.clone();
@@ -11408,7 +11682,7 @@ mod tests {
         object_index: 7,
         font: EmrExtCreateFont::LogFont(invalid_log_font),
       })
-      .to_record()
+      .validate_strict()
       .is_err()
     );
     let mut invalid_log_font = log_font.clone();
@@ -11418,7 +11692,7 @@ mod tests {
         object_index: 7,
         font: EmrExtCreateFont::LogFont(invalid_log_font),
       })
-      .to_record()
+      .validate_strict()
       .is_err()
     );
     let mut invalid_log_font = log_font.clone();
@@ -11428,7 +11702,7 @@ mod tests {
         object_index: 7,
         font: EmrExtCreateFont::LogFont(invalid_log_font),
       })
-      .to_record()
+      .validate_strict()
       .is_err()
     );
     let mut invalid_log_font = log_font.clone();
@@ -11438,7 +11712,7 @@ mod tests {
         object_index: 7,
         font: EmrExtCreateFont::LogFont(invalid_log_font),
       })
-      .to_record()
+      .validate_strict()
       .is_err()
     );
     let mut invalid_log_font = log_font.clone();
@@ -11448,7 +11722,7 @@ mod tests {
         object_index: 7,
         font: EmrExtCreateFont::LogFont(invalid_log_font),
       })
-      .to_record()
+      .validate_strict()
       .is_err()
     );
     let mut invalid_log_font = log_font.clone();
@@ -11458,7 +11732,7 @@ mod tests {
         object_index: 7,
         font: EmrExtCreateFont::LogFont(invalid_log_font),
       })
-      .to_record()
+      .validate_strict()
       .is_err()
     );
     let mut invalid_log_font = log_font.clone();
@@ -11468,7 +11742,7 @@ mod tests {
         object_index: 7,
         font: EmrExtCreateFont::LogFont(invalid_log_font),
       })
-      .to_record()
+      .validate_strict()
       .is_err()
     );
     let mut invalid_log_font = log_font.clone();
@@ -11478,7 +11752,7 @@ mod tests {
         object_index: 7,
         font: EmrExtCreateFont::LogFont(invalid_log_font),
       })
-      .to_record()
+      .validate_strict()
       .is_err()
     );
     let weight_offset = 4 + 16;
@@ -11492,37 +11766,103 @@ mod tests {
     let pitch_and_family_offset = italic_offset + 7;
     let mut invalid_record = record.clone();
     invalid_record.data[weight_offset..weight_offset + 4].copy_from_slice(&1001_i32.to_le_bytes());
-    assert!(invalid_record.parse_data().is_err());
+    assert!(
+      invalid_record
+        .parse_data()
+        .unwrap()
+        .validate_strict()
+        .is_err()
+    );
     let mut invalid_record = record.clone();
     invalid_record.data[italic_offset] = 2;
-    assert!(invalid_record.parse_data().is_err());
+    assert!(
+      invalid_record
+        .parse_data()
+        .unwrap()
+        .validate_strict()
+        .is_err()
+    );
     let mut invalid_record = record.clone();
     invalid_record.data[underline_offset] = 2;
-    assert!(invalid_record.parse_data().is_err());
+    assert!(
+      invalid_record
+        .parse_data()
+        .unwrap()
+        .validate_strict()
+        .is_err()
+    );
     let mut invalid_record = record.clone();
     invalid_record.data[strike_out_offset] = 2;
-    assert!(invalid_record.parse_data().is_err());
+    assert!(
+      invalid_record
+        .parse_data()
+        .unwrap()
+        .validate_strict()
+        .is_err()
+    );
     let mut invalid_record = record.clone();
     invalid_record.data[char_set_offset] = 0x03;
-    assert!(invalid_record.parse_data().is_err());
+    assert!(
+      invalid_record
+        .parse_data()
+        .unwrap()
+        .validate_strict()
+        .is_err()
+    );
     let mut invalid_record = record.clone();
     invalid_record.data[out_precision_offset] = 0x02;
-    assert!(invalid_record.parse_data().is_err());
+    assert!(
+      invalid_record
+        .parse_data()
+        .unwrap()
+        .validate_strict()
+        .is_err()
+    );
     let mut invalid_record = record.clone();
     invalid_record.data[clip_precision_offset] = 0x08;
-    assert!(invalid_record.parse_data().is_err());
+    assert!(
+      invalid_record
+        .parse_data()
+        .unwrap()
+        .validate_strict()
+        .is_err()
+    );
     let mut invalid_record = record.clone();
     invalid_record.data[quality_offset] = 0x06;
-    assert!(invalid_record.parse_data().is_err());
+    assert!(
+      invalid_record
+        .parse_data()
+        .unwrap()
+        .validate_strict()
+        .is_err()
+    );
     let mut invalid_record = record.clone();
     invalid_record.data[pitch_and_family_offset] = 0x04;
-    assert!(invalid_record.parse_data().is_err());
+    assert!(
+      invalid_record
+        .parse_data()
+        .unwrap()
+        .validate_strict()
+        .is_err()
+    );
     let mut invalid_record = record.clone();
     invalid_record.data[pitch_and_family_offset] = 0x03;
-    assert!(invalid_record.parse_data().is_err());
+    assert!(
+      invalid_record
+        .parse_data()
+        .unwrap()
+        .validate_strict()
+        .is_err()
+    );
     let mut invalid_record = record.clone();
     invalid_record.data[pitch_and_family_offset] = (0x06 << 4) | WmfPitchFont::Variable.raw();
-    assert!(invalid_record.parse_data().is_err());
+    assert!(
+      invalid_record
+        .parse_data()
+        .unwrap()
+        .validate_strict()
+        .is_err()
+    );
 
     let panose = LogFontPanose {
       log_font: log_font.clone(),
@@ -12820,7 +13160,9 @@ mod tests {
     assert_eq!(record.parse_data().unwrap(), set_pixel);
     let mut invalid_color = record.clone();
     invalid_color.data[11] = 1;
-    assert!(invalid_color.parse_data().is_err());
+    let parsed = invalid_color.parse_data().unwrap();
+    assert!(parsed.validate_strict().is_err());
+    assert_eq!(parsed.to_record().unwrap(), invalid_color);
     let mut trailing_record = record;
     trailing_record.data.extend_from_slice(&0_u32.to_le_bytes());
     assert!(trailing_record.parse_data().is_err());
@@ -12834,7 +13176,8 @@ mod tests {
         reserved: 1,
       },
     });
-    assert!(invalid_set_pixel.to_record().is_err());
+    assert!(invalid_set_pixel.validate_strict().is_err());
+    assert!(invalid_set_pixel.to_record().is_ok());
   }
 
   #[test]
@@ -13179,7 +13522,16 @@ mod tests {
       },
       padding: Vec::new(),
     });
-    assert!(invalid_no_rect.to_record().is_err());
+    let invalid_no_rect_record = invalid_no_rect.to_record().unwrap();
+    assert_eq!(
+      invalid_no_rect_record
+        .parse_data()
+        .unwrap()
+        .to_record()
+        .unwrap(),
+      invalid_no_rect_record
+    );
+    assert!(invalid_no_rect.validate_strict().is_err());
     let invalid_dx = EmfRecordData::ExtTextOutW(EmrExtTextOut {
       bounds: RectL::default(),
       graphics_mode: EmrGraphicsMode::Compatible.raw(),
@@ -14025,16 +14377,18 @@ mod tests {
       unreachable!();
     };
     value.mask_bitmap = None;
-    assert!(missing_plg_blt_mask.to_record().is_err());
-    let mut missing_plg_blt_mask_record = record.clone();
-    missing_plg_blt_mask_record.data[116..132].fill(0);
-    assert!(missing_plg_blt_mask_record.parse_data().is_err());
+    assert!(missing_plg_blt_mask.validate_strict().is_err());
+    let missing_plg_blt_mask_record = missing_plg_blt_mask.to_record().unwrap();
+    let parsed = missing_plg_blt_mask_record.parse_data().unwrap();
+    assert_eq!(parsed.to_record().unwrap(), missing_plg_blt_mask_record);
+    assert!(parsed.validate_strict().is_err());
     let mut invalid_plg_blt_mask = plg_blt.clone();
     let EmfRecordData::PlgBlt(value) = &mut invalid_plg_blt_mask else {
       unreachable!();
     };
     value.mask_bitmap.as_mut().unwrap().bitmap_info[14..16].copy_from_slice(&24u16.to_le_bytes());
-    assert!(invalid_plg_blt_mask.to_record().is_err());
+    assert!(invalid_plg_blt_mask.to_record().is_ok());
+    assert!(invalid_plg_blt_mask.validate_strict().is_err());
     let mut invalid_plg_blt_mask_record = record.clone();
     let mask_bmi_offset = u32::from_le_bytes(
       invalid_plg_blt_mask_record.data[116..120]
@@ -14044,7 +14398,9 @@ mod tests {
       - 8;
     invalid_plg_blt_mask_record.data[mask_bmi_offset + 14..mask_bmi_offset + 16]
       .copy_from_slice(&24u16.to_le_bytes());
-    assert!(invalid_plg_blt_mask_record.parse_data().is_err());
+    let parsed = invalid_plg_blt_mask_record.parse_data().unwrap();
+    assert_eq!(parsed.to_record().unwrap(), invalid_plg_blt_mask_record);
+    assert!(parsed.validate_strict().is_err());
 
     let mut mask_first = plg_blt.clone();
     let EmfRecordData::PlgBlt(value) = &mut mask_first else {
@@ -14265,50 +14621,71 @@ mod tests {
       unreachable!();
     };
     value.log_color_space.signature = 0xFFFF_FFFF;
-    assert!(invalid_signature.to_record().is_err());
+    assert!(invalid_signature.validate_strict().is_err());
+    assert!(invalid_signature.to_record().is_ok());
     let mut invalid_signature_record = record.clone();
     invalid_signature_record.data[4..8].copy_from_slice(&0xFFFF_FFFF_u32.to_le_bytes());
-    assert!(invalid_signature_record.parse_data().is_err());
+    let parsed = invalid_signature_record.parse_data().unwrap();
+    assert!(parsed.validate_strict().is_err());
+    assert_eq!(parsed.to_record().unwrap(), invalid_signature_record);
 
     let mut invalid_version = ascii.clone();
     let EmfRecordData::CreateColorSpace(value) = &mut invalid_version else {
       unreachable!();
     };
     value.log_color_space.version = 0x0000_0300;
-    assert!(invalid_version.to_record().is_err());
+    assert!(invalid_version.validate_strict().is_err());
+    assert!(invalid_version.to_record().is_ok());
     let mut invalid_version_record = record.clone();
     invalid_version_record.data[8..12].copy_from_slice(&0x0000_0300_u32.to_le_bytes());
-    assert!(invalid_version_record.parse_data().is_err());
+    let parsed = invalid_version_record.parse_data().unwrap();
+    assert!(parsed.validate_strict().is_err());
+    assert_eq!(parsed.to_record().unwrap(), invalid_version_record);
 
     let mut invalid_size = ascii.clone();
     let EmfRecordData::CreateColorSpace(value) = &mut invalid_size else {
       unreachable!();
     };
     value.log_color_space.size = 12;
-    assert!(invalid_size.to_record().is_err());
+    assert!(invalid_size.validate_strict().is_err());
+    assert!(invalid_size.to_record().is_ok());
     let mut invalid_size_record = record.clone();
     invalid_size_record.data[12..16].copy_from_slice(&12_u32.to_le_bytes());
-    assert!(invalid_size_record.parse_data().is_err());
+    let parsed = invalid_size_record.parse_data().unwrap();
+    assert!(parsed.validate_strict().is_err());
+    assert_eq!(parsed.to_record().unwrap(), invalid_size_record);
 
     let mut invalid_color_space_type = ascii.clone();
     let EmfRecordData::CreateColorSpace(value) = &mut invalid_color_space_type else {
       unreachable!();
     };
     value.log_color_space.color_space_type = 0xFFFF_FFFF_u32 as i32;
-    assert!(invalid_color_space_type.to_record().is_err());
+    assert!(invalid_color_space_type.validate_strict().is_err());
+    assert!(invalid_color_space_type.to_record().is_ok());
     let mut invalid_color_space_type_record = record.clone();
     invalid_color_space_type_record.data[16..20].copy_from_slice(&0xFFFF_FFFF_u32.to_le_bytes());
-    assert!(invalid_color_space_type_record.parse_data().is_err());
+    let parsed = invalid_color_space_type_record.parse_data().unwrap();
+    assert!(parsed.validate_strict().is_err());
+    assert_eq!(parsed.to_record().unwrap(), invalid_color_space_type_record);
 
     let mut invalid_intent = ascii.clone();
     let EmfRecordData::CreateColorSpace(value) = &mut invalid_intent else {
       unreachable!();
     };
     value.log_color_space.intent = 0xFFFF_FFFF_u32 as i32;
-    assert!(invalid_intent.to_record().is_err());
+    assert!(invalid_intent.validate_strict().is_err());
+    assert!(invalid_intent.to_record().is_ok());
     let mut invalid_intent_record = record.clone();
     invalid_intent_record.data[20..24].copy_from_slice(&0xFFFF_FFFF_u32.to_le_bytes());
-    assert!(invalid_intent_record.parse_data().is_err());
+    let parsed = invalid_intent_record.parse_data().unwrap();
+    assert!(parsed.validate_strict().is_err());
+    assert_eq!(parsed.to_record().unwrap(), invalid_intent_record);
+
+    let mut truncated_record = record.clone();
+    truncated_record.data.truncate(96);
+    let truncated = truncated_record.parse_data().unwrap();
+    assert!(truncated.validate_strict().is_err());
+    assert_eq!(truncated.to_record().unwrap(), truncated_record);
 
     let wide = EmfRecordData::CreateColorSpaceW(EmrCreateColorSpaceW {
       color_space_index: 4,
@@ -14420,16 +14797,18 @@ mod tests {
       .to_record()
       .is_err()
     );
-    assert!(
-      EmfRecordData::Comment(EmrComment::Raw {
-        data_size: 4,
-        identifier: 0x1234_5678,
-        data: Vec::new(),
-        alignment_padding: vec![0, 0, 0, 0],
-      })
-      .to_record()
-      .is_err()
+    let excessive_padding = EmfRecordData::Comment(EmrComment::Raw {
+      data_size: 4,
+      identifier: 0x1234_5678,
+      data: Vec::new(),
+      alignment_padding: vec![0, 0, 0, 0],
+    });
+    let excessive_padding_record = excessive_padding.to_record().unwrap();
+    assert_eq!(
+      excessive_padding_record.parse_data().unwrap(),
+      excessive_padding
     );
+    assert!(excessive_padding.validate_strict().is_err());
 
     let mut unaligned_record = record.clone();
     unaligned_record.data.push(0);
@@ -14459,15 +14838,32 @@ mod tests {
         ],
         padding: Vec::new(),
       }],
+      emf_plus_trailing_data: Vec::new(),
       alignment_padding: Vec::new(),
     });
 
     let record = value.to_record().unwrap();
     assert_eq!(record.record_type, EmfRecordType::Comment.raw());
     assert_eq!(record.parse_data().unwrap(), value);
+
+    let mut with_trailing_data = value.clone();
+    let EmfRecordData::Comment(EmrComment::EmfPlus {
+      emf_plus_trailing_data,
+      ..
+    }) = &mut with_trailing_data
+    else {
+      unreachable!()
+    };
+    *emf_plus_trailing_data = vec![0x46, 0, 0, 0];
+    let record = with_trailing_data.to_record().unwrap();
+    let parsed = record.parse_data().unwrap();
+    assert_eq!(parsed, with_trailing_data);
+    assert!(parsed.validate_strict().is_err());
+
     assert!(
       EmfRecordData::Comment(EmrComment::EmfPlus {
         records: Vec::new(),
+        emf_plus_trailing_data: Vec::new(),
         alignment_padding: Vec::new(),
       })
       .to_record()
@@ -14580,7 +14976,7 @@ mod tests {
           signature: EmrFormatSignature::Eps.raw(),
           version: 1,
           size_data: 36,
-          data_offset: 40,
+          data_offset: 44,
         }],
         format_data: eps_data.to_bytes().unwrap(),
         padding: Vec::new(),
@@ -14633,10 +15029,17 @@ mod tests {
       unreachable!();
     };
     value.formats[0].signature = 0xFFFF_FFFF;
-    assert!(invalid_multi_signature.to_record().is_err());
+    let invalid_multi_signature_record = invalid_multi_signature.to_record().unwrap();
+    assert!(invalid_multi_signature.validate_strict().is_err());
     let mut invalid_multi_record = record.clone();
     invalid_multi_record.data[32..36].copy_from_slice(&0xFFFF_FFFF_u32.to_le_bytes());
-    assert!(invalid_multi_record.parse_data().is_err());
+    let parsed_invalid_multi = invalid_multi_record.parse_data().unwrap();
+    assert!(parsed_invalid_multi.validate_strict().is_err());
+    assert_eq!(
+      parsed_invalid_multi.to_record().unwrap(),
+      invalid_multi_record
+    );
+    assert_eq!(invalid_multi_signature_record, invalid_multi_record);
 
     let mut invalid_eps_version = multi_formats.clone();
     let EmfRecordData::Comment(EmrComment::Public {

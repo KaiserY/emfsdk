@@ -49,7 +49,6 @@ pub struct RectS {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, SdkObject)]
-#[sdk(validate = "validate_color_ref")]
 pub struct ColorRef {
   pub red: u8,
   pub green: u8,
@@ -60,6 +59,10 @@ pub struct ColorRef {
 impl ColorRef {
   pub const fn is_reserved_zero(self) -> bool {
     self.reserved == 0
+  }
+
+  pub fn validate_strict(self) -> Result<()> {
+    validate_color_ref(&self)
   }
 }
 
@@ -133,7 +136,7 @@ mod tests {
   use crate::common::{Reader, SdkRead, SdkWrite, Writer};
 
   #[test]
-  fn color_ref_reserved_byte_must_be_zero() {
+  fn color_ref_preserves_reserved_byte_and_validates_it_strictly() {
     let valid = ColorRef {
       red: 1,
       green: 2,
@@ -150,14 +153,13 @@ mod tests {
     assert_eq!(parsed, valid);
 
     let invalid = [1, 2, 3, 4];
-    assert!(ColorRef::read_from(&mut Reader::new(Cursor::new(invalid))).is_err());
-    assert!(
-      ColorRef {
-        reserved: 4,
-        ..valid
-      }
-      .write_to(&mut Writer::new(Cursor::new(Vec::new())))
-      .is_err()
-    );
+    let parsed = ColorRef::read_from(&mut Reader::new(Cursor::new(invalid))).unwrap();
+    assert_eq!(parsed.reserved, 4);
+    assert!(parsed.validate_strict().is_err());
+    let mut roundtripped = Vec::new();
+    parsed
+      .write_to(&mut Writer::new(Cursor::new(&mut roundtripped)))
+      .unwrap();
+    assert_eq!(roundtripped, invalid);
   }
 }

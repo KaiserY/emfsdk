@@ -1320,7 +1320,7 @@ impl SdkSize for WmfRecord {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WmfRecordData<'a> {
-  Eof,
+  Eof(WmfEofRecord),
   RealizePalette,
   SaveDc,
   SetRelabs,
@@ -1382,7 +1382,7 @@ pub enum WmfRecordData<'a> {
   CreateFontIndirect(WmfFontObject),
   CreatePalette(WmfPaletteObject),
   CreatePatternBrush(WmfCreatePatternBrushRecord),
-  CreatePenIndirect(WmfPenObject),
+  CreatePenIndirect(WmfCreatePenIndirectRecord),
   CreateRegion(WmfRegionObject),
   DibCreatePatternBrush(WmfDibCreatePatternBrushRecord),
   SetPalEntries(WmfPaletteObject),
@@ -1394,13 +1394,46 @@ pub enum WmfRecordData<'a> {
 }
 
 impl<'a> WmfRecordData<'a> {
+  pub fn validate_strict(&self) -> Result<()> {
+    match self {
+      Self::Eof(value) => ensure_empty_trailing_data(&value.trailing_data, "META_EOF"),
+      Self::SetBkColor(value) | Self::SetTextColor(value) => value.color.validate_strict(),
+      Self::SetTextAlign(value) => validate_wmf_set_text_align_strict(value),
+      Self::FloodFill(value) => {
+        value.color.validate_strict()?;
+        ensure_empty_trailing_data(&value.trailing_data, "META_FLOODFILL")
+      }
+      Self::ExtFloodFill(value) => value.color.validate_strict(),
+      Self::SetPixel(value) => value.color.validate_strict(),
+      Self::CreateBrushIndirect(value) => {
+        validate_wmf_log_brush_object_strict(value)?;
+        value.color_ref.validate_strict()
+      }
+      Self::CreateFontIndirect(value) => validate_wmf_font_object_strict(value),
+      Self::CreatePenIndirect(value) => {
+        value.pen.color_ref.validate_strict()?;
+        ensure_empty_trailing_data(&value.trailing_data, "META_CREATEPENINDIRECT")
+      }
+      Self::BitBlt(value) => validate_wmf_bitmap16_transfer_source_strict(value, "META_BITBLT"),
+      Self::DibBitBlt(value) => validate_wmf_dib_transfer_source_strict(value, "META_DIBBITBLT"),
+      Self::StretchBlt(value) => {
+        validate_wmf_bitmap16_transfer_source_strict(value, "META_STRETCHBLT")
+      }
+      Self::DibStretchBlt(value) => {
+        validate_wmf_dib_stretch_transfer_source_strict(value, "META_DIBSTRETCHBLT")
+      }
+      Self::StretchDib(value) => validate_wmf_stretch_dib_record_strict(value),
+      Self::Polygon(value) => validate_wmf_poly_points_strict(value, "META_POLYGON", 2),
+      _ => Ok(()),
+    }
+  }
+
   pub fn from_record(record: &'a WmfRecord) -> Result<Self> {
     let data = &record.data;
     Ok(match record.normalized_function_kind() {
-      Some(WmfRecordFunction::Eof) => {
-        ensure_no_data(data, "META_EOF")?;
-        Self::Eof
-      }
+      Some(WmfRecordFunction::Eof) => Self::Eof(WmfEofRecord {
+        trailing_data: data.to_vec(),
+      }),
       Some(WmfRecordFunction::RealizePalette) => {
         ensure_no_data(data, "META_REALIZEPALETTE")?;
         Self::RealizePalette
@@ -1522,7 +1555,7 @@ impl<'a> WmfRecordData<'a> {
       Some(WmfRecordFunction::DibStretchBlt) => Self::DibStretchBlt(
         WmfDibStretchBltRecord::read_data(data, has_bitmap_source(record)?)?,
       ),
-      Some(WmfRecordFunction::FloodFill) => Self::FloodFill(read_object(data, "META_FLOODFILL")?),
+      Some(WmfRecordFunction::FloodFill) => Self::FloodFill(WmfFloodFillRecord::read_data(data)?),
       Some(WmfRecordFunction::ExtFloodFill) => {
         let value = read_object(data, "META_EXTFLOODFILL")?;
         validate_wmf_ext_flood_fill(&value)?;
@@ -1542,7 +1575,7 @@ impl<'a> WmfRecordData<'a> {
       }
       Some(WmfRecordFunction::PatBlt) => Self::PatBlt(WmfPatBltRecord::read_data(data)?),
       Some(WmfRecordFunction::Polygon) => {
-        Self::Polygon(WmfPolyPointsRecord::read_data(data, "META_POLYGON", 2)?)
+        Self::Polygon(WmfPolyPointsRecord::read_data(data, "META_POLYGON", 0)?)
       }
       Some(WmfRecordFunction::Polyline) => {
         Self::Polyline(WmfPolyPointsRecord::read_data(data, "META_POLYLINE", 0)?)
@@ -1580,8 +1613,7 @@ impl<'a> WmfRecordData<'a> {
         Self::CreateBrushIndirect(value)
       }
       Some(WmfRecordFunction::CreateFontIndirect) => {
-        let value = read_object(data, "META_CREATEFONTINDIRECT")?;
-        validate_wmf_font_object(&value)?;
+        let value = WmfFontObject::read_data(data)?;
         Self::CreateFontIndirect(value)
       }
       Some(WmfRecordFunction::CreatePalette) => {
@@ -1593,9 +1625,7 @@ impl<'a> WmfRecordData<'a> {
         Self::CreatePatternBrush(WmfCreatePatternBrushRecord::read_data(data)?)
       }
       Some(WmfRecordFunction::CreatePenIndirect) => {
-        let value = read_object(data, "META_CREATEPENINDIRECT")?;
-        validate_wmf_pen_object(&value)?;
-        Self::CreatePenIndirect(value)
+        Self::CreatePenIndirect(WmfCreatePenIndirectRecord::read_data(data)?)
       }
       Some(WmfRecordFunction::CreateRegion) => {
         Self::CreateRegion(WmfRegionObject::read_data(data)?)
@@ -1620,7 +1650,7 @@ impl<'a> WmfRecordData<'a> {
 
   pub fn to_record(&self) -> Result<WmfRecord> {
     Ok(match self {
-      Self::Eof => no_data_record(WmfRecordFunction::Eof),
+      Self::Eof(value) => WmfRecord::new(WmfRecordFunction::Eof.raw(), value.trailing_data.clone()),
       Self::RealizePalette => no_data_record(WmfRecordFunction::RealizePalette),
       Self::SaveDc => no_data_record(WmfRecordFunction::SaveDc),
       Self::SetRelabs => no_data_record(WmfRecordFunction::SetRelabs),
@@ -1690,7 +1720,9 @@ impl<'a> WmfRecordData<'a> {
       Self::DibStretchBlt(value) => {
         WmfRecord::new(WmfRecordFunction::DibStretchBlt.raw(), value.write_data()?)
       }
-      Self::FloodFill(value) => object_record(WmfRecordFunction::FloodFill, value)?,
+      Self::FloodFill(value) => {
+        WmfRecord::new(WmfRecordFunction::FloodFill.raw(), value.write_data()?)
+      }
       Self::ExtFloodFill(value) => {
         validate_wmf_ext_flood_fill(value)?;
         object_record(WmfRecordFunction::ExtFloodFill, value)?
@@ -1711,7 +1743,7 @@ impl<'a> WmfRecordData<'a> {
       }
       Self::Polygon(value) => WmfRecord::new(
         WmfRecordFunction::Polygon.raw(),
-        value.write_data("META_POLYGON", 2)?,
+        value.write_data("META_POLYGON", 0)?,
       ),
       Self::Polyline(value) => WmfRecord::new(
         WmfRecordFunction::Polyline.raw(),
@@ -1734,7 +1766,10 @@ impl<'a> WmfRecordData<'a> {
       }
       Self::CreateFontIndirect(value) => {
         validate_wmf_font_object(value)?;
-        object_record(WmfRecordFunction::CreateFontIndirect, value)?
+        WmfRecord::new(
+          WmfRecordFunction::CreateFontIndirect.raw(),
+          value.write_data()?,
+        )
       }
       Self::CreatePalette(value) => {
         validate_wmf_create_palette_record(value)?;
@@ -1747,10 +1782,10 @@ impl<'a> WmfRecordData<'a> {
         WmfRecordFunction::CreatePatternBrush.raw(),
         value.write_data()?,
       ),
-      Self::CreatePenIndirect(value) => {
-        validate_wmf_pen_object(value)?;
-        object_record(WmfRecordFunction::CreatePenIndirect, value)?
-      }
+      Self::CreatePenIndirect(value) => WmfRecord::new(
+        WmfRecordFunction::CreatePenIndirect.raw(),
+        value.write_data()?,
+      ),
       Self::CreateRegion(value) => object_record(WmfRecordFunction::CreateRegion, value)?,
       Self::DibCreatePatternBrush(value) => WmfRecord::new(
         WmfRecordFunction::DibCreatePatternBrush.raw(),
@@ -1945,6 +1980,11 @@ pub struct WmfTextJustificationRecord {
   pub break_extra: u16,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WmfEofRecord {
+  pub trailing_data: Vec<u8>,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, SdkObject)]
 #[sdk(format = "wmf")]
 pub struct WmfRoundRectRecord {
@@ -1969,12 +2009,39 @@ pub struct WmfArcRecord {
   pub left: i16,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, SdkObject)]
-#[sdk(format = "wmf")]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct WmfFloodFillRecord {
   pub color: ColorRef,
   pub y_start: i16,
   pub x_start: i16,
+  pub trailing_data: Vec<u8>,
+}
+
+impl WmfFloodFillRecord {
+  fn read_data(data: &[u8]) -> Result<Self> {
+    let mut reader = Reader::new(Cursor::new(data));
+    let color = ColorRef::read_from(&mut reader)?;
+    let y_start = reader.read_i16()?;
+    let x_start = reader.read_i16()?;
+    let trailing_data = reader.read_vec(data.len() - 8)?;
+    Ok(Self {
+      color,
+      y_start,
+      x_start,
+      trailing_data,
+    })
+  }
+
+  fn write_data(&self) -> Result<Vec<u8>> {
+    let mut writer = Writer::new(Cursor::new(Vec::with_capacity(
+      8 + self.trailing_data.len(),
+    )));
+    self.color.write_to(&mut writer)?;
+    writer.write_i16(self.y_start)?;
+    writer.write_i16(self.x_start)?;
+    writer.write_all(&self.trailing_data)?;
+    Ok(writer.into_inner().into_inner())
+  }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, SdkObject)]
@@ -2727,6 +2794,32 @@ pub struct WmfPenObject {
   pub color_ref: ColorRef,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WmfCreatePenIndirectRecord {
+  pub pen: WmfPenObject,
+  pub trailing_data: Vec<u8>,
+}
+
+impl WmfCreatePenIndirectRecord {
+  fn read_data(data: &[u8]) -> Result<Self> {
+    let mut reader = Reader::new(Cursor::new(data));
+    let pen = WmfPenObject::read_from(&mut reader)?;
+    validate_wmf_pen_object(&pen)?;
+    let trailing_data = reader.read_vec(data.len() - 10)?;
+    Ok(Self { pen, trailing_data })
+  }
+
+  fn write_data(&self) -> Result<Vec<u8>> {
+    validate_wmf_pen_object(&self.pen)?;
+    let mut writer = Writer::new(Cursor::new(Vec::with_capacity(
+      10 + self.trailing_data.len(),
+    )));
+    self.pen.write_to(&mut writer)?;
+    writer.write_all(&self.trailing_data)?;
+    Ok(writer.into_inner().into_inner())
+  }
+}
+
 impl WmfPenObject {
   pub fn pen_style_flags(&self) -> WmfPenStyleFlags {
     WmfPenStyleFlags::from_bits_retain(self.pen_style)
@@ -2803,8 +2896,7 @@ impl WmfPitchAndFamily {
   }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, SdkObject)]
-#[sdk(validate = "validate_wmf_font_object")]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WmfFontObject {
   pub height: i16,
   pub width: i16,
@@ -2820,9 +2912,66 @@ pub struct WmfFontObject {
   pub quality: u8,
   pub pitch_and_family: u8,
   pub face_name: [u8; 32],
+  pub face_name_bytes: u8,
 }
 
 impl WmfFontObject {
+  const FIXED_SIZE: usize = 18;
+
+  fn read_data(data: &[u8]) -> Result<Self> {
+    if !(Self::FIXED_SIZE..=Self::FIXED_SIZE + 32).contains(&data.len()) {
+      return Err(Error::invalid(
+        0,
+        "META_CREATEFONTINDIRECT Font size is invalid",
+      ));
+    }
+    let mut reader = Reader::new(Cursor::new(data));
+    let mut face_name = [0; 32];
+    let face_name_bytes = data.len() - Self::FIXED_SIZE;
+    face_name[..face_name_bytes].copy_from_slice(&data[Self::FIXED_SIZE..]);
+    let value = Self {
+      height: reader.read_i16()?,
+      width: reader.read_i16()?,
+      escapement: reader.read_i16()?,
+      orientation: reader.read_i16()?,
+      weight: reader.read_i16()?,
+      italic: reader.read_u8()?,
+      underline: reader.read_u8()?,
+      strike_out: reader.read_u8()?,
+      char_set: reader.read_u8()?,
+      out_precision: reader.read_u8()?,
+      clip_precision: reader.read_u8()?,
+      quality: reader.read_u8()?,
+      pitch_and_family: reader.read_u8()?,
+      face_name,
+      face_name_bytes: face_name_bytes as u8,
+    };
+    validate_wmf_font_object(&value)?;
+    Ok(value)
+  }
+
+  fn write_data(&self) -> Result<Vec<u8>> {
+    validate_wmf_font_object(self)?;
+    let mut writer = Writer::new(Cursor::new(Vec::with_capacity(
+      Self::FIXED_SIZE + usize::from(self.face_name_bytes),
+    )));
+    writer.write_i16(self.height)?;
+    writer.write_i16(self.width)?;
+    writer.write_i16(self.escapement)?;
+    writer.write_i16(self.orientation)?;
+    writer.write_i16(self.weight)?;
+    writer.write_u8(self.italic)?;
+    writer.write_u8(self.underline)?;
+    writer.write_u8(self.strike_out)?;
+    writer.write_u8(self.char_set)?;
+    writer.write_u8(self.out_precision)?;
+    writer.write_u8(self.clip_precision)?;
+    writer.write_u8(self.quality)?;
+    writer.write_u8(self.pitch_and_family)?;
+    writer.write_all(&self.face_name[..usize::from(self.face_name_bytes)])?;
+    Ok(writer.into_inner().into_inner())
+  }
+
   pub fn char_set_kind(&self) -> Option<WmfCharacterSet> {
     WmfCharacterSet::from_raw(self.char_set)
   }
@@ -4407,6 +4556,11 @@ fn validate_wmf_set_stretch_blt_mode(value: &WmfU16Record) -> Result<()> {
 
 fn validate_wmf_set_text_align(value: &WmfU16Record) -> Result<()> {
   validate_wmf_optional_reserved_word(&value.reserved, "META_SETTEXTALIGN")?;
+  Ok(())
+}
+
+fn validate_wmf_set_text_align_strict(value: &WmfU16Record) -> Result<()> {
+  validate_wmf_set_text_align(value)?;
   validate_wmf_text_alignment_value(value.value, "META_SETTEXTALIGN")
 }
 
@@ -4506,6 +4660,11 @@ fn validate_wmf_ext_flood_fill(value: &WmfExtFloodFillRecord) -> Result<()> {
 }
 
 fn validate_wmf_log_brush_object(value: &WmfLogBrushObject) -> Result<()> {
+  let _ = value;
+  Ok(())
+}
+
+fn validate_wmf_log_brush_object_strict(value: &WmfLogBrushObject) -> Result<()> {
   match value.brush_style_kind() {
     Some(WmfBrushStyle::Hatched) => {
       if value.hatch_style_kind().is_none() {
@@ -4524,6 +4683,21 @@ fn validate_wmf_log_brush_object(value: &WmfLogBrushObject) -> Result<()> {
     }
   }
   Ok(())
+}
+
+fn validate_wmf_poly_points_strict(
+  value: &WmfPolyPointsRecord,
+  name: &str,
+  min_points: usize,
+) -> Result<()> {
+  if value.points.len() < min_points {
+    Err(Error::invalid(
+      0,
+      format!("{name} point count must be at least {min_points}"),
+    ))
+  } else {
+    Ok(())
+  }
 }
 
 fn validate_wmf_palette_entry(value: &WmfPaletteEntry) -> Result<()> {
@@ -4635,8 +4809,23 @@ fn validate_wmf_bitmap16_transfer_source<T: WmfBitmap16TransferSource>(
   validate_wmf_transfer_source(value.raster_operation(), value.has_embedded_source(), name)
 }
 
+fn validate_wmf_bitmap16_transfer_source_strict<T: WmfBitmap16TransferSource>(
+  value: &T,
+  name: &str,
+) -> Result<()> {
+  validate_wmf_transfer_source_strict(value.raster_operation(), value.has_embedded_source(), name)
+}
+
 fn validate_wmf_dib_transfer_source(value: &WmfDibBitBltRecord, name: &str) -> Result<()> {
   validate_wmf_transfer_source(
+    value.raster_operation,
+    matches!(value.target, WmfDibTarget::Source(_)),
+    name,
+  )
+}
+
+fn validate_wmf_dib_transfer_source_strict(value: &WmfDibBitBltRecord, name: &str) -> Result<()> {
+  validate_wmf_transfer_source_strict(
     value.raster_operation,
     matches!(value.target, WmfDibTarget::Source(_)),
     name,
@@ -4654,12 +4843,31 @@ fn validate_wmf_dib_stretch_transfer_source(
   )
 }
 
+fn validate_wmf_dib_stretch_transfer_source_strict(
+  value: &WmfDibStretchBltRecord,
+  name: &str,
+) -> Result<()> {
+  validate_wmf_transfer_source_strict(
+    value.raster_operation,
+    matches!(value.target, WmfDibTarget::Source(_)),
+    name,
+  )
+}
+
 fn validate_wmf_transfer_source(
+  raster_operation: u32,
+  _has_embedded_source: bool,
+  name: &str,
+) -> Result<()> {
+  validate_wmf_ternary_raster_operation(raster_operation, name)
+}
+
+fn validate_wmf_transfer_source_strict(
   raster_operation: u32,
   has_embedded_source: bool,
   name: &str,
 ) -> Result<()> {
-  validate_wmf_ternary_raster_operation(raster_operation, name)?;
+  validate_wmf_transfer_source(raster_operation, has_embedded_source, name)?;
   if !has_embedded_source && WmfTernaryRasterOperation::new(raster_operation).uses_source() {
     return Err(Error::invalid(
       0,
@@ -4671,8 +4879,15 @@ fn validate_wmf_transfer_source(
 
 fn validate_wmf_stretch_dib_record(value: &WmfStretchDibRecord) -> Result<()> {
   validate_wmf_ternary_raster_operation(value.raster_operation, "META_STRETCHDIB")?;
+  require_wmf_color_usage(value.color_usage)?;
+  Ok(())
+}
+
+fn validate_wmf_stretch_dib_record_strict(value: &WmfStretchDibRecord) -> Result<()> {
+  validate_wmf_stretch_dib_record(value)?;
   let color_usage = require_wmf_color_usage(value.color_usage)?;
   let dib = DeviceIndependentBitmap::from_packed_slice(&value.dib, color_usage)?;
+  dib.validate_strict()?;
   if dib.embedded_format().is_some() {
     if color_usage != DibColorUsage::RgbColors {
       return Err(Error::invalid(
@@ -4869,6 +5084,17 @@ fn validate_wmf_ext_text_out_record(value: &WmfExtTextOutRecord) -> Result<()> {
 }
 
 fn validate_wmf_font_object(value: &WmfFontObject) -> Result<()> {
+  if value.face_name_bytes > 32 {
+    return Err(Error::invalid(0, "WMF Font FaceName exceeds 32 bytes"));
+  }
+  Ok(())
+}
+
+fn validate_wmf_font_object_strict(value: &WmfFontObject) -> Result<()> {
+  validate_wmf_font_object(value)?;
+  if value.face_name_bytes != 32 {
+    return Err(Error::invalid(0, "WMF Font FaceName must occupy 32 bytes"));
+  }
   if !(0..=1000).contains(&value.weight) {
     return Err(Error::invalid(0, "WMF Font Weight must be 0 through 1000"));
   }
@@ -5316,6 +5542,14 @@ fn read_object<T: SdkRead>(data: &[u8], name: &str) -> Result<T> {
   Ok(value)
 }
 
+fn ensure_empty_trailing_data(data: &[u8], name: &str) -> Result<()> {
+  if data.is_empty() {
+    Ok(())
+  } else {
+    Err(Error::invalid(0, format!("{name} has trailing data")))
+  }
+}
+
 fn object_record<T: SdkWrite + SdkSize>(
   function: WmfRecordFunction,
   value: &T,
@@ -5718,7 +5952,12 @@ mod tests {
         max_record_words: 7,
         number_of_parameters: 0,
       },
-      records: vec![create_brush, WmfRecordData::Eof.to_record().unwrap()],
+      records: vec![
+        create_brush,
+        WmfRecordData::Eof(WmfEofRecord::default())
+          .to_record()
+          .unwrap(),
+      ],
       trailing_data: Vec::new(),
     };
     assert_eq!(object_metafile.header.file_size_bytes(), 38);
@@ -5763,7 +6002,9 @@ mod tests {
         WmfRecordData::SelectObject(WmfObjectIndexRecord { index: 0 })
           .to_record()
           .unwrap(),
-        WmfRecordData::Eof.to_record().unwrap(),
+        WmfRecordData::Eof(WmfEofRecord::default())
+          .to_record()
+          .unwrap(),
       ],
       trailing_data: Vec::new(),
     };
@@ -6006,8 +6247,12 @@ mod tests {
   fn typed_wmf_no_data_records_roundtrip() {
     assert_eq!(
       WmfRecord::new(META_EOF, Vec::new()).parse_data().unwrap(),
-      WmfRecordData::Eof
+      WmfRecordData::Eof(WmfEofRecord::default())
     );
+    let eof_with_trailing_data = WmfRecord::new(META_EOF, vec![0xAA, 0xBB]);
+    let parsed = eof_with_trailing_data.parse_data().unwrap();
+    assert_eq!(parsed.to_record().unwrap(), eof_with_trailing_data);
+    assert!(parsed.validate_strict().is_err());
     assert_typed_roundtrip(WmfRecord::new(WmfRecordFunction::SaveDc.raw(), Vec::new()));
     assert_typed_roundtrip(WmfRecord::new(
       WmfRecordFunction::RealizePalette.raw(),
@@ -6230,38 +6475,15 @@ mod tests {
         .contains(WmfVerticalTextAlignmentModeFlags::BASELINE)
     );
     assert_eq!(parsed.to_record().unwrap(), set_text_align);
-    assert!(
-      WmfRecordData::SetTextAlign(WmfU16Record {
-        value: 0x0200,
-        reserved: Vec::new(),
-      })
-      .to_record()
-      .is_err()
-    );
-    assert!(
-      WmfRecord::new(
+    for invalid_value in [0x0200_u16, 0x0004, 0x0010] {
+      let record = WmfRecord::new(
         WmfRecordFunction::SetTextAlign.raw(),
-        0x0200_u16.to_le_bytes().to_vec(),
-      )
-      .parse_data()
-      .is_err()
-    );
-    assert!(
-      WmfRecordData::SetTextAlign(WmfU16Record {
-        value: 0x0004,
-        reserved: Vec::new(),
-      })
-      .to_record()
-      .is_err()
-    );
-    assert!(
-      WmfRecord::new(
-        WmfRecordFunction::SetTextAlign.raw(),
-        0x0010_u16.to_le_bytes().to_vec(),
-      )
-      .parse_data()
-      .is_err()
-    );
+        invalid_value.to_le_bytes().to_vec(),
+      );
+      let parsed = record.parse_data().unwrap();
+      assert_eq!(parsed.to_record().unwrap(), record);
+      assert!(parsed.validate_strict().is_err());
+    }
     assert_typed_roundtrip(WmfRecord::new(
       WmfRecordFunction::RestoreDc.raw(),
       (-2i16).to_le_bytes().to_vec(),
@@ -6372,21 +6594,13 @@ mod tests {
       ]
       .concat(),
     ));
-    assert!(
-      WmfRecordData::Polygon(WmfPolyPointsRecord {
-        points: vec![PointS { x: 1, y: 2 }],
-      })
-      .to_record()
-      .is_err()
+    let one_point_polygon = WmfRecord::new(
+      WmfRecordFunction::Polygon.raw(),
+      [1i16.to_le_bytes(), 1i16.to_le_bytes(), 2i16.to_le_bytes()].concat(),
     );
-    assert!(
-      WmfRecord::new(
-        WmfRecordFunction::Polygon.raw(),
-        [1i16.to_le_bytes(), 1i16.to_le_bytes(), 2i16.to_le_bytes()].concat(),
-      )
-      .parse_data()
-      .is_err()
-    );
+    let parsed = one_point_polygon.parse_data().unwrap();
+    assert_eq!(parsed.to_record().unwrap(), one_point_polygon);
+    assert!(parsed.validate_strict().is_err());
     assert!(
       WmfRecord::new(
         WmfRecordFunction::Polyline.raw(),
@@ -7496,7 +7710,7 @@ mod tests {
       Some(WmfHatchStyle::ForwardDiagonal)
     );
     assert_eq!(parsed.to_record().unwrap(), create_brush);
-    assert!(
+    for invalid_brush in [
       WmfRecord::new(
         WmfRecordFunction::CreateBrushIndirect.raw(),
         [
@@ -7508,11 +7722,7 @@ mod tests {
             .as_slice(),
         ]
         .concat(),
-      )
-      .parse_data()
-      .is_err()
-    );
-    assert!(
+      ),
       WmfRecord::new(
         WmfRecordFunction::CreateBrushIndirect.raw(),
         [
@@ -7521,24 +7731,12 @@ mod tests {
           0xFFFF_u16.to_le_bytes().as_slice(),
         ]
         .concat(),
-      )
-      .parse_data()
-      .is_err()
-    );
-    assert!(
-      WmfRecordData::CreateBrushIndirect(WmfLogBrushObject {
-        brush_style: 0xFFFF,
-        color_ref: ColorRef {
-          red: 0,
-          green: 0,
-          blue: 0,
-          reserved: 0,
-        },
-        brush_hatch: 0,
-      })
-      .to_record()
-      .is_err()
-    );
+      ),
+    ] {
+      let parsed = invalid_brush.parse_data().unwrap();
+      assert_eq!(parsed.to_record().unwrap(), invalid_brush);
+      assert!(parsed.validate_strict().is_err());
+    }
     let create_pen = WmfRecord::new(
       WmfRecordFunction::CreatePenIndirect.raw(),
       [
@@ -7556,23 +7754,37 @@ mod tests {
     let WmfRecordData::CreatePenIndirect(value) = &parsed else {
       panic!("expected META_CREATEPENINDIRECT");
     };
-    assert!(value.pen_style_flags().contains(WmfPenStyleFlags::DASH));
+    assert!(value.pen.pen_style_flags().contains(WmfPenStyleFlags::DASH));
     assert!(
       value
+        .pen
         .pen_style_flags()
         .contains(WmfPenStyleFlags::END_CAP_SQUARE)
     );
     assert!(
       value
+        .pen
         .pen_style_flags()
         .contains(WmfPenStyleFlags::JOIN_MITER)
     );
-    assert_eq!(value.pen_line_style_kind(), Some(WmfPenLineStyle::Dash));
-    assert_eq!(value.pen_end_cap_kind(), Some(WmfPenEndCap::Square));
-    assert_eq!(value.pen_join_kind(), Some(WmfPenJoin::Miter));
-    assert_eq!(value.pen_type_kind(), Some(WmfPenType::Cosmetic));
-    assert_eq!(value.pen_reserved_bits(), 0);
+    assert_eq!(value.pen.pen_line_style_kind(), Some(WmfPenLineStyle::Dash));
+    assert_eq!(value.pen.pen_end_cap_kind(), Some(WmfPenEndCap::Square));
+    assert_eq!(value.pen.pen_join_kind(), Some(WmfPenJoin::Miter));
+    assert_eq!(value.pen.pen_type_kind(), Some(WmfPenType::Cosmetic));
+    assert_eq!(value.pen.pen_reserved_bits(), 0);
+    assert!(value.trailing_data.is_empty());
     assert_eq!(parsed.to_record().unwrap(), create_pen);
+    let mut create_pen_with_trailing_data = create_pen.clone();
+    create_pen_with_trailing_data
+      .data
+      .extend_from_slice(&[0xAA, 0xBB]);
+    let parsed = create_pen_with_trailing_data.parse_data().unwrap();
+    let WmfRecordData::CreatePenIndirect(value) = &parsed else {
+      panic!("expected META_CREATEPENINDIRECT");
+    };
+    assert_eq!(value.trailing_data, [0xAA, 0xBB]);
+    assert_eq!(parsed.to_record().unwrap(), create_pen_with_trailing_data);
+    assert!(parsed.validate_strict().is_err());
     let mut invalid_line_style = create_pen.clone();
     invalid_line_style.data[0..2].copy_from_slice(&0x000F_u16.to_le_bytes());
     assert!(invalid_line_style.parse_data().is_err());
@@ -7585,8 +7797,8 @@ mod tests {
     let mut invalid_reserved_bits = create_pen.clone();
     invalid_reserved_bits.data[0..2].copy_from_slice(&0x0010_u16.to_le_bytes());
     assert!(invalid_reserved_bits.parse_data().is_err());
-    let mut invalid_pen = *value;
-    invalid_pen.pen_style = 0x0010;
+    let mut invalid_pen = value.clone();
+    invalid_pen.pen.pen_style = 0x0010;
     assert!(
       WmfRecordData::CreatePenIndirect(invalid_pen)
         .to_record()
@@ -7722,6 +7934,15 @@ mod tests {
     assert_eq!(pitch_and_family.family_kind(), Some(WmfFamilyFont::Swiss));
     assert_eq!(pitch_and_family.reserved_bits(), 0);
     assert_eq!(parsed.to_record().unwrap(), create_font);
+    let mut short_face_name = create_font.clone();
+    short_face_name.data.truncate(30);
+    let parsed = short_face_name.parse_data().unwrap();
+    let WmfRecordData::CreateFontIndirect(font) = &parsed else {
+      unreachable!();
+    };
+    assert_eq!(font.face_name_bytes, 12);
+    assert!(parsed.validate_strict().is_err());
+    assert_eq!(parsed.to_record().unwrap(), short_face_name);
     let mut vendor_char_set = create_font.clone();
     vendor_char_set.data[13] = 0xFE;
     let WmfRecordData::CreateFontIndirect(vendor_font) = vendor_char_set.parse_data().unwrap()
@@ -7736,63 +7957,68 @@ mod tests {
         .unwrap(),
       vendor_char_set
     );
+    let assert_compatible_font = |record: &WmfRecord| {
+      let parsed = record.parse_data().unwrap();
+      assert!(parsed.validate_strict().is_err());
+      assert_eq!(parsed.to_record().unwrap(), *record);
+    };
     let mut invalid_weight = create_font.clone();
     invalid_weight.data[8..10].copy_from_slice(&1001_i16.to_le_bytes());
-    assert!(invalid_weight.parse_data().is_err());
+    assert_compatible_font(&invalid_weight);
     let mut invalid_italic = create_font.clone();
     invalid_italic.data[10] = 2;
-    assert!(invalid_italic.parse_data().is_err());
+    assert_compatible_font(&invalid_italic);
     let mut invalid_underline = create_font.clone();
     invalid_underline.data[11] = 2;
-    assert!(invalid_underline.parse_data().is_err());
+    assert_compatible_font(&invalid_underline);
     let mut invalid_strike_out = create_font.clone();
     invalid_strike_out.data[12] = 2;
-    assert!(invalid_strike_out.parse_data().is_err());
+    assert_compatible_font(&invalid_strike_out);
     let mut invalid_out_precision = create_font.clone();
     invalid_out_precision.data[14] = 0xFF;
-    assert!(invalid_out_precision.parse_data().is_err());
+    assert_compatible_font(&invalid_out_precision);
     let mut invalid_clip_precision = create_font.clone();
     invalid_clip_precision.data[15] = 0x08;
-    assert!(invalid_clip_precision.parse_data().is_err());
+    assert_compatible_font(&invalid_clip_precision);
     let mut invalid_quality = create_font.clone();
     invalid_quality.data[16] = 0xFF;
-    assert!(invalid_quality.parse_data().is_err());
+    assert_compatible_font(&invalid_quality);
     let mut invalid_pitch = create_font.clone();
     invalid_pitch.data[17] = (WmfFamilyFont::Swiss.raw() << 4) | 0x03;
-    assert!(invalid_pitch.parse_data().is_err());
+    assert_compatible_font(&invalid_pitch);
     let mut invalid_pitch_reserved = create_font.clone();
     invalid_pitch_reserved.data[17] =
       (WmfFamilyFont::Swiss.raw() << 4) | 0x04 | WmfPitchFont::Variable.raw();
-    assert!(invalid_pitch_reserved.parse_data().is_err());
+    assert_compatible_font(&invalid_pitch_reserved);
     let mut invalid_family = create_font.clone();
     invalid_family.data[17] = (0x0F << 4) | WmfPitchFont::Variable.raw();
-    assert!(invalid_family.parse_data().is_err());
+    assert_compatible_font(&invalid_family);
     let mut invalid_font = value.clone();
     invalid_font.quality = 0xFF;
     assert!(
       WmfRecordData::CreateFontIndirect(invalid_font)
-        .to_record()
+        .validate_strict()
         .is_err()
     );
     let mut invalid_font = value.clone();
     invalid_font.weight = -1;
     assert!(
       WmfRecordData::CreateFontIndirect(invalid_font)
-        .to_record()
+        .validate_strict()
         .is_err()
     );
     let mut invalid_font = value.clone();
     invalid_font.italic = 2;
     assert!(
       WmfRecordData::CreateFontIndirect(invalid_font)
-        .to_record()
+        .validate_strict()
         .is_err()
     );
     let mut invalid_font = value.clone();
     invalid_font.clip_precision = 0x08;
     assert!(
       WmfRecordData::CreateFontIndirect(invalid_font)
-        .to_record()
+        .validate_strict()
         .is_err()
     );
     let mut invalid_font = value.clone();
@@ -7800,7 +8026,7 @@ mod tests {
       (WmfFamilyFont::Swiss.raw() << 4) | 0x04 | WmfPitchFont::Variable.raw();
     assert!(
       WmfRecordData::CreateFontIndirect(invalid_font)
-        .to_record()
+        .validate_strict()
         .is_err()
     );
   }
@@ -8076,7 +8302,12 @@ mod tests {
       ]
       .concat(),
     );
-    assert!(source_dependent_no_source.parse_data().is_err());
+    let source_dependent_no_source_data = source_dependent_no_source.parse_data().unwrap();
+    assert_eq!(
+      source_dependent_no_source_data.to_record().unwrap(),
+      source_dependent_no_source
+    );
+    assert!(source_dependent_no_source_data.validate_strict().is_err());
     let invalid_bit_blt_rop = WmfRecord::new(
       WmfRecordFunction::BitBlt.raw(),
       [
@@ -8092,20 +8323,18 @@ mod tests {
       .concat(),
     );
     assert!(invalid_bit_blt_rop.parse_data().is_err());
-    assert!(
-      WmfRecordData::BitBlt(WmfBitBltRecord {
-        raster_operation: 0x00CC_0020,
-        y_src: 1,
-        x_src: 2,
-        height: 3,
-        width: 4,
-        y_dest: 5,
-        x_dest: 6,
-        target: WmfBitmap16Target::NoSource { reserved: 0xCAFE },
-      })
-      .to_record()
-      .is_err()
-    );
+    let bit_blt_without_source = WmfRecordData::BitBlt(WmfBitBltRecord {
+      raster_operation: 0x00CC_0020,
+      y_src: 1,
+      x_src: 2,
+      height: 3,
+      width: 4,
+      y_dest: 5,
+      x_dest: 6,
+      target: WmfBitmap16Target::NoSource { reserved: 0xCAFE },
+    });
+    assert!(bit_blt_without_source.to_record().is_ok());
+    assert!(bit_blt_without_source.validate_strict().is_err());
     assert_typed_roundtrip(WmfRecord::new(
       WmfRecordFunction::BitBlt.raw(),
       [
@@ -8230,22 +8459,24 @@ mod tests {
       ]
       .concat(),
     ));
-    assert!(
-      WmfRecordData::DibStretchBlt(WmfDibStretchBltRecord {
-        raster_operation: 0x00CC_0020,
-        src_height: 10,
-        src_width: 20,
-        y_src: 1,
-        x_src: 2,
-        dest_height: 30,
-        dest_width: 40,
-        y_dest: 5,
-        x_dest: 6,
-        target: WmfDibTarget::NoSource { reserved: 0xBEEF },
-      })
-      .to_record()
-      .is_err()
+    let source_dependent_without_source = WmfRecordData::DibStretchBlt(WmfDibStretchBltRecord {
+      raster_operation: 0x00CC_0020,
+      src_height: 10,
+      src_width: 20,
+      y_src: 1,
+      x_src: 2,
+      dest_height: 30,
+      dest_width: 40,
+      y_dest: 5,
+      x_dest: 6,
+      target: WmfDibTarget::NoSource { reserved: 0xBEEF },
+    });
+    let source_dependent_record = source_dependent_without_source.to_record().unwrap();
+    assert_eq!(
+      source_dependent_record.parse_data().unwrap(),
+      source_dependent_without_source
     );
+    assert!(source_dependent_without_source.validate_strict().is_err());
 
     let pat_blt = WmfRecord::new(
       WmfRecordFunction::PatBlt.raw(),
@@ -8420,7 +8651,12 @@ mod tests {
       ]
       .concat(),
     );
-    assert!(invalid_png_color_usage.parse_data().is_err());
+    let invalid_png_color_usage_data = invalid_png_color_usage.parse_data().unwrap();
+    assert_eq!(
+      invalid_png_color_usage_data.to_record().unwrap(),
+      invalid_png_color_usage
+    );
+    assert!(invalid_png_color_usage_data.validate_strict().is_err());
 
     let invalid_png_rop = WmfRecord::new(
       WmfRecordFunction::StretchDib.raw(),
@@ -8472,7 +8708,9 @@ mod tests {
       ]
       .concat(),
     );
-    assert!(invalid_png_size.parse_data().is_err());
+    let invalid_png_size_data = invalid_png_size.parse_data().unwrap();
+    assert_eq!(invalid_png_size_data.to_record().unwrap(), invalid_png_size);
+    assert!(invalid_png_size_data.validate_strict().is_err());
 
     let mut invalid_write = parsed.clone();
     let WmfRecordData::StretchDib(value) = &mut invalid_write else {

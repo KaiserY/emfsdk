@@ -131,6 +131,13 @@ impl SdkString {
     }
   }
 
+  pub fn raw_bytes(&self) -> Option<&[u8]> {
+    match self {
+      Self::Raw { bytes, .. } => Some(bytes),
+      Self::Text { .. } => None,
+    }
+  }
+
   pub fn as_str(&self) -> Result<Cow<'_, str>> {
     match self {
       Self::Raw { bytes, encoding } => Ok(Cow::Owned(encoding.decode(bytes)?)),

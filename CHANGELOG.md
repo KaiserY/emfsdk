@@ -2,6 +2,38 @@
 
 All notable changes to this project are documented in this file.
 
+## Unreleased
+
+### Changed
+
+- Made compatible parsing preserve complete producer-specific field values and
+  reserved bits while keeping Microsoft specification checks in explicit
+  `validate_strict` paths.
+- Added typed, byte-exact handling for short WMF font names, short EMF color
+  space names, EMF+ object deviations, and other common corpus variants.
+- Corrected the EMF+ continued-object wire layout and the record-relative
+  `offData` base used by `EMR_COMMENT_MULTIFORMATS`.
+- Added explicit compatibility fields for trailing EMF+ comment bytes and
+  producer-specific WMF EOF, pen, and flood-fill data; strict validation
+  rejects these extensions.
+- Preserved compatible DIB, raster-operation, and text producer variants while
+  keeping specification validation opt-in through strict mode.
+- Made strict metafile validation stop at the first failure instead of building
+  the complete diagnostics collection.
+- Reserved EMF record storage from the bounded header hint to reduce growth
+  allocations on large metafiles.
+
+### Testing
+
+- Reduced standalone raw compatibility fallbacks from 31,922 to 15 across
+  987,606 records, including two malformed nested EMF+ fallbacks and zero
+  unknown records (99.998% typed).
+- Reduced Office-embedded raw fallbacks from 3,955 to 138 across 107,584
+  records (99.872% typed) while preserving exact whole-file and typed record
+  bytes.
+- Added a corpus coverage profiler and tightened both standalone and embedded
+  Office coverage ratchets.
+
 ## 0.1.0
 
 ### Added

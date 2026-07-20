@@ -6,8 +6,8 @@ truth and sibling implementations as behavioral references.
 
 ## Project Stage
 
-This project is preparing its first public release. The goal remains full typed
-coverage of EMF/EMF+/WMF fields with read/write roundtrip support.
+Version 0.1.0 is published and 0.2.0 development is underway. The goal remains
+full typed coverage of EMF/EMF+/WMF fields with read/write roundtrip support.
 
 Prefer this order:
 
@@ -121,9 +121,9 @@ pre-1.0 development.
   suggest a commit message.
 - Keep commit subjects short, imperative, and based on repository state.
 
-Suggested release-preparation subject style:
+Suggested subject style:
 
-- `Prepare emfsdk 0.1.0`
+- `Improve compatible metafile round trips`
 
 ## Common Pitfalls
 

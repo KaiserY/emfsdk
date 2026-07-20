@@ -84,18 +84,20 @@ LibreOffice and Apache POI are used as behavioral references. Corpus and
 round-trip tests live in
 [`ooxmlsdk-test-suite`](https://github.com/KaiserY/ooxmlsdk-test-suite).
 
-The current standalone candidate corpus covers 950,508 EMF records, 22,824 WMF
-records, and 14,231 EMF+ records. Of those, 31,922 known records require
-compatibility preservation. The legacy Office lane covers 134 embedded EMF and
-156 embedded WMF images containing another 107,578 records; 3,955 require
-compatibility preservation. Tests ratchet these counts and require exact
-whole-file bytes plus exact typed parse/write bytes for conforming records.
+The standalone corpus covers 950,508 EMF records, 22,824 WMF records, and
+14,274 nested EMF+ records. Typed parse/write rebuilds 987,591 of 987,606
+records exactly (99.998%); the remaining 15 structurally malformed records are
+counted raw compatibility fallbacks, with no unknown record types. The legacy
+Office lane covers another 107,584 records, of which 107,446 rebuild through
+typed parse/write (99.872%) and 138 use counted raw fallback. Tests ratchet
+these counts and require exact whole-file bytes plus exact typed parse/write
+bytes for every typed record.
 
 ## Project Status
 
-Version 0.1 remains an early SDK. Byte-preserving parsing and typed record
-coverage are the primary focus, but compatibility fallbacks above still need
-to be reduced. The public API can change before 1.0.
+The 0.2 line remains a pre-1.0 SDK. Byte-preserving parsing, typed field
+coverage, and reducing the remaining structurally malformed fallbacks are the
+primary focus. The public API can change before 1.0.
 
 The optional renderer is suitable for compatibility and preview workflows, but
 does not promise pixel-identical output with Windows GDI, GDI+, or

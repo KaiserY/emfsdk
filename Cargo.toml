@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/emfsdk", "crates/emfsdk-derive"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
 authors = ["KaiserY"]
@@ -16,8 +16,8 @@ categories = ["parser-implementations"]
 readme = "README.md"
 
 [workspace.dependencies]
-emfsdk = { version = "0.1.0", path = "crates/emfsdk" }
-emfsdk-derive = { version = "0.1.0", path = "crates/emfsdk-derive" }
+emfsdk = { version = "0.2.0", path = "crates/emfsdk" }
+emfsdk-derive = { version = "0.2.0", path = "crates/emfsdk-derive" }
 bitflags = "2.9.1"
 encoding_rs = "0.8.35"
 image = { version = "0.25.10", default-features = false, features = ["png"] }
