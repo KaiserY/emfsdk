@@ -25,20 +25,21 @@ pub use crate::common::{
   Error, Format, Reader, Result, SdkEnumValue, SdkRead, SdkSize, SdkWrite, UnknownRecord, Writer,
 };
 pub use crate::emf::{
-  BitmapSourceBounds, EMR_EOF, EMR_HEADER, EmfHeader, EmfMetafile, EmfRecord, EmfRecordData,
-  EmfRecordType, EmrBitmapBuffer, EmrComment, EmrCreateBrushIndirect, EmrCreateDibPatternBrushPt,
-  EmrCreateMonoBrush, EmrCreatePen, EmrDeleteObject, EmrEllipse, EmrExcludeClipRect,
-  EmrExtCreateFontIndirectW, EmrExtCreatePen, EmrExtTextOut, EmrIntersectClipRect, EmrLineTo,
-  EmrModifyWorldTransform, EmrMoveToEx, EmrPolyPointsL, EmrPolyPointsS, EmrPolyPolygonL,
-  EmrPolyPolygonS, EmrRectangle, EmrSelectObject, EmrSetBkColor, EmrSetBrushOrgEx,
-  EmrSetDiBitsToDevice, EmrSetTextColor, EmrSetViewportExtEx, EmrSetViewportOrgEx,
-  EmrSetWindowExtEx, EmrSetWindowOrgEx, EmrSetWorldTransform, EmrStretchDiBits, EmrText,
-  ExtTextOutOptions, LogFontW,
+  BitmapSourceBounds, EMR_EOF, EMR_HEADER, EmfHeader, EmfMetafile, EmfMetafileRef, EmfRecord,
+  EmfRecordData, EmfRecordRef, EmfRecordType, EmfRecords, EmrBitmapBuffer, EmrComment,
+  EmrCreateBrushIndirect, EmrCreateDibPatternBrushPt, EmrCreateMonoBrush, EmrCreatePen,
+  EmrDeleteObject, EmrEllipse, EmrExcludeClipRect, EmrExtCreateFontIndirectW, EmrExtCreatePen,
+  EmrExtTextOut, EmrIntersectClipRect, EmrLineTo, EmrModifyWorldTransform, EmrMoveToEx,
+  EmrPolyPointsL, EmrPolyPointsS, EmrPolyPolygonL, EmrPolyPolygonS, EmrRectangle, EmrSelectObject,
+  EmrSetBkColor, EmrSetBrushOrgEx, EmrSetDiBitsToDevice, EmrSetTextColor, EmrSetViewportExtEx,
+  EmrSetViewportOrgEx, EmrSetWindowExtEx, EmrSetWindowOrgEx, EmrSetWorldTransform,
+  EmrStretchDiBits, EmrText, ExtTextOutOptions, LogFontW,
 };
 pub use crate::emfplus::{
   EmfPlusBrushRef, EmfPlusDrawRectsData, EmfPlusFillRectsData, EmfPlusGraphicsVersion,
   EmfPlusGraphicsVersionValue, EmfPlusHeaderData, EmfPlusRecord, EmfPlusRecordData,
-  EmfPlusRecordFlags, EmfPlusRecordType, EmfPlusRect, EmfPlusRectS, EmfPlusScaleWorldTransformData,
+  EmfPlusRecordFlags, EmfPlusRecordRef, EmfPlusRecordType, EmfPlusRecords, EmfPlusRect,
+  EmfPlusRectS, EmfPlusScaleWorldTransformData, EmfPlusStreamRef,
   EmfPlusTranslateWorldTransformData,
 };
 pub use crate::string::{SdkEncoding, SdkString};
@@ -47,8 +48,39 @@ pub use crate::types::{
   TriVertex, XForm,
 };
 pub use crate::wmf::{
-  META_EOF, WmfHeader, WmfMetafile, WmfPlaceableHeader, WmfRecord, WmfRecordData, WmfRecordFunction,
+  META_EOF, WmfHeader, WmfMetafile, WmfMetafileRef, WmfPlaceableHeader, WmfRecord, WmfRecordData,
+  WmfRecordFunction, WmfRecordRef, WmfRecords,
 };
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MetafileRef<'a> {
+  Emf(EmfMetafileRef<'a>),
+  Wmf(WmfMetafileRef<'a>),
+}
+
+impl<'a> MetafileRef<'a> {
+  pub fn from_bytes(bytes: &'a [u8]) -> Result<Self> {
+    match detect_format(bytes) {
+      Some(Format::Emf) => Ok(Self::Emf(EmfMetafileRef::from_bytes(bytes)?)),
+      Some(Format::Wmf) => Ok(Self::Wmf(WmfMetafileRef::from_bytes(bytes)?)),
+      None => Err(Error::UnsupportedFormat),
+    }
+  }
+
+  pub fn format(&self) -> Format {
+    match self {
+      Self::Emf(_) => Format::Emf,
+      Self::Wmf(_) => Format::Wmf,
+    }
+  }
+
+  pub fn to_owned(self) -> Metafile {
+    match self {
+      Self::Emf(value) => Metafile::Emf(value.to_owned()),
+      Self::Wmf(value) => Metafile::Wmf(value.to_owned()),
+    }
+  }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Metafile {
@@ -515,5 +547,14 @@ mod tests {
     assert!(metafile.validate_strict().is_err());
     assert!(Metafile::from_bytes_strict(&bytes).is_err());
     assert!(Metafile::from_bytes_strict(&minimal_wmf()).is_ok());
+  }
+
+  #[test]
+  fn metafile_ref_requires_explicit_owned_materialization() {
+    let bytes = minimal_wmf();
+    let view = MetafileRef::from_bytes(&bytes).unwrap();
+    assert_eq!(view.format(), Format::Wmf);
+    let owned = view.to_owned();
+    assert_eq!(owned.to_bytes().unwrap(), bytes);
   }
 }

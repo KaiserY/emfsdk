@@ -19,7 +19,7 @@ use crate::emfplus::{
   EmfPlusTranslateWorldTransformData,
 };
 use crate::wmf::{
-  WmfBrushStyle, WmfEscapeData, WmfMetafile, WmfPenLineStyle, WmfRecordData,
+  WmfBrushStyle, WmfEscapeData, WmfMetafileRef, WmfPenLineStyle, WmfRecordData,
   WmfTernaryRasterOperationCode,
 };
 
@@ -1998,7 +1998,7 @@ struct WmfRenderState {
 }
 
 impl WmfRenderState {
-  fn new(metafile: &WmfMetafile, options: RenderOptions) -> Result<Self, String> {
+  fn new(metafile: &WmfMetafileRef<'_>, options: RenderOptions) -> Result<Self, String> {
     let (window_org_x, window_org_y, window_ext_x, window_ext_y) = wmf_initial_window(metafile);
     let natural_width = window_ext_x.unsigned_abs().max(1) as usize;
     let natural_height = window_ext_y.unsigned_abs().max(1) as usize;
@@ -2121,10 +2121,10 @@ fn decode_wmf_as_raster(
     return Ok(None);
   }
 
-  let metafile = WmfMetafile::from_bytes(data).map_err(|err| err.to_string())?;
+  let metafile = WmfMetafileRef::from_bytes(data).map_err(|err| err.to_string())?;
   let mut state = WmfRenderState::new(&metafile, options)?;
 
-  for record in &metafile.records {
+  for record in metafile.records() {
     let parsed = record.parse_data().map_err(|err| err.to_string())?;
     match parsed {
       WmfRecordData::Eof(_) => break,
@@ -2447,7 +2447,7 @@ fn decode_wmf_as_raster(
   }))
 }
 
-fn wmf_initial_window(metafile: &WmfMetafile) -> (i32, i32, i32, i32) {
+fn wmf_initial_window(metafile: &WmfMetafileRef<'_>) -> (i32, i32, i32, i32) {
   if let Some(placeable) = &metafile.placeable_header {
     return (
       i32::from(placeable.left),
@@ -2461,7 +2461,7 @@ fn wmf_initial_window(metafile: &WmfMetafile) -> (i32, i32, i32, i32) {
   let mut org_y = 0;
   let mut ext_x = DEFAULT_RENDER_WIDTH as i32;
   let mut ext_y = DEFAULT_RENDER_HEIGHT as i32;
-  for record in &metafile.records {
+  for record in metafile.records() {
     match record.parse_data() {
       Ok(WmfRecordData::SetWindowOrg(value)) => {
         org_x = i32::from(value.x);

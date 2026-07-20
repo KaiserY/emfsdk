@@ -20,8 +20,13 @@ All notable changes to this project are documented in this file.
   keeping specification validation opt-in through strict mode.
 - Made strict metafile validation stop at the first failure instead of building
   the complete diagnostics collection.
-- Reserved EMF record storage from the bounded header hint to reduce growth
-  allocations on large metafiles.
+- Added fully framed and structurally validated borrowed EMF, EMF+, and WMF
+  record streams with allocation-free iteration and explicit owned
+  materialization.
+- Changed typed `Unknown` variants to carry borrowed record views, avoiding an
+  owned outer record requirement during typed inspection.
+- Switched WMF rendering to borrowed record framing so it no longer clones the
+  complete record payload set before typed replay.
 
 ### Testing
 

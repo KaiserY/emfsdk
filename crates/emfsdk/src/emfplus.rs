@@ -4448,7 +4448,7 @@ pub enum EmfPlusRecordData<'a> {
   SerializableObject(EmfPlusSerializableObjectData),
   SetTsGraphics(EmfPlusSetTsGraphicsData),
   SetTsClip(EmfPlusSetTsClipData),
-  Unknown(&'a EmfPlusRecord),
+  Unknown(EmfPlusRecordRef<'a>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -4460,6 +4460,235 @@ pub struct EmfPlusRecord {
   pub padding: Vec<u8>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EmfPlusRecordRef<'a> {
+  pub record_type: u16,
+  pub flags: u16,
+  pub total_object_size: Option<u32>,
+  pub data: &'a [u8],
+  pub padding: &'a [u8],
+}
+
+impl EmfPlusRecordRef<'_> {
+  pub fn flags(&self) -> EmfPlusRecordFlags {
+    EmfPlusRecordFlags::from_bits_retain(self.flags)
+  }
+
+  pub fn record_kind(&self) -> Option<EmfPlusRecordType> {
+    EmfPlusRecordType::from_raw(self.record_type)
+  }
+
+  pub fn to_owned(self) -> EmfPlusRecord {
+    EmfPlusRecord {
+      record_type: self.record_type,
+      flags: self.flags,
+      total_object_size: self.total_object_size,
+      data: self.data.to_vec(),
+      padding: self.padding.to_vec(),
+    }
+  }
+
+  pub fn object_fragment(&self) -> Result<EmfPlusObjectRecordData> {
+    if self.record_kind() != Some(EmfPlusRecordType::Object) {
+      return Err(Error::invalid(0, "EMF+ record is not an EmfPlusObject"));
+    }
+    let flags = self.flags();
+    let fragment = EmfPlusObjectRecordData {
+      object_id: flags.object_id(),
+      object_type_raw: flags.object_type_raw(),
+      continues: flags.object_continues(),
+      total_object_size: self.total_object_size,
+      object_data: self.data.to_vec(),
+    };
+    validate_emf_plus_object_fragment(&fragment)?;
+    Ok(fragment)
+  }
+}
+
+impl SdkSize for EmfPlusRecordRef<'_> {
+  fn sdk_size(&self) -> u64 {
+    12 + u64::from(self.total_object_size.is_some()) * 4
+      + self.data.len() as u64
+      + self.padding.len() as u64
+  }
+}
+
+#[derive(Clone, Debug)]
+pub struct EmfPlusRecords<'a> {
+  bytes: &'a [u8],
+  offset: usize,
+  remaining: usize,
+}
+
+impl<'a> Iterator for EmfPlusRecords<'a> {
+  type Item = EmfPlusRecordRef<'a>;
+
+  fn next(&mut self) -> Option<Self::Item> {
+    if self.remaining == 0 {
+      return None;
+    }
+    let layout = emf_plus_record_layout(self.bytes, self.offset)
+      .expect("validated EMF+ record stream must remain valid");
+    self.offset = layout.end;
+    self.remaining -= 1;
+    Some(EmfPlusRecordRef {
+      record_type: layout.record_type,
+      flags: layout.flags,
+      total_object_size: layout.total_object_size,
+      data: &self.bytes[layout.data_start..layout.data_end],
+      padding: &self.bytes[layout.data_end..layout.end],
+    })
+  }
+
+  fn size_hint(&self) -> (usize, Option<usize>) {
+    (self.remaining, Some(self.remaining))
+  }
+}
+
+impl ExactSizeIterator for EmfPlusRecords<'_> {}
+impl std::iter::FusedIterator for EmfPlusRecords<'_> {}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EmfPlusStreamRef<'a> {
+  records_bytes: &'a [u8],
+  trailing_data: &'a [u8],
+  record_count: usize,
+}
+
+impl<'a> EmfPlusStreamRef<'a> {
+  pub fn from_bytes(bytes: &'a [u8]) -> Result<Self> {
+    let value = Self::from_bytes_compatible(bytes)?;
+    if !value.trailing_data.is_empty() {
+      return Err(Error::invalid(
+        value.records_bytes.len() as u64,
+        "EMF+ stream has trailing data smaller than a record header",
+      ));
+    }
+    Ok(value)
+  }
+
+  pub fn from_bytes_compatible(bytes: &'a [u8]) -> Result<Self> {
+    let (records_end, record_count) = scan_emf_plus_records(bytes)?;
+    Ok(Self {
+      records_bytes: &bytes[..records_end],
+      trailing_data: &bytes[records_end..],
+      record_count,
+    })
+  }
+
+  pub fn records(&self) -> EmfPlusRecords<'a> {
+    EmfPlusRecords {
+      bytes: self.records_bytes,
+      offset: 0,
+      remaining: self.record_count,
+    }
+  }
+
+  pub const fn record_count(&self) -> usize {
+    self.record_count
+  }
+
+  pub const fn trailing_data(&self) -> &'a [u8] {
+    self.trailing_data
+  }
+
+  pub fn to_owned(self) -> Vec<EmfPlusRecord> {
+    self.records().map(EmfPlusRecordRef::to_owned).collect()
+  }
+}
+
+struct EmfPlusRecordLayout {
+  record_type: u16,
+  flags: u16,
+  total_object_size: Option<u32>,
+  data_start: usize,
+  data_end: usize,
+  end: usize,
+}
+
+fn emf_plus_record_layout(bytes: &[u8], offset: usize) -> Result<EmfPlusRecordLayout> {
+  let header = bytes
+    .get(offset..offset.saturating_add(12))
+    .ok_or_else(|| Error::invalid(offset as u64, "EMF+ record header is truncated"))?;
+  let record_type = u16::from_le_bytes(header[..2].try_into().expect("slice length checked"));
+  let flags = u16::from_le_bytes(header[2..4].try_into().expect("slice length checked"));
+  let size = u32::from_le_bytes(header[4..8].try_into().expect("slice length checked")) as usize;
+  let data_size =
+    u32::from_le_bytes(header[8..12].try_into().expect("slice length checked")) as usize;
+  if size < 12 {
+    return Err(Error::invalid(
+      offset as u64,
+      "EMF+ record size is smaller than its header",
+    ));
+  }
+  if !size.is_multiple_of(4) {
+    return Err(Error::invalid(
+      offset as u64,
+      "EMF+ record size is not 32-bit aligned",
+    ));
+  }
+  if data_size > size - 12 {
+    return Err(Error::invalid(
+      offset as u64,
+      "EMF+ record data size exceeds record size",
+    ));
+  }
+  let end = offset
+    .checked_add(size)
+    .ok_or_else(|| Error::invalid(offset as u64, "EMF+ record size overflows"))?;
+  if end > bytes.len() {
+    return Err(Error::invalid(
+      offset as u64,
+      "EMF+ record extends past end of stream",
+    ));
+  }
+
+  let continued_object = record_type == EmfPlusRecordType::Object.raw()
+    && EmfPlusRecordFlags::from_bits_retain(flags).object_continues();
+  if continued_object && data_size < 4 {
+    return Err(Error::invalid(
+      offset as u64,
+      "continued EmfPlusObject DataSize omits TotalObjectSize",
+    ));
+  }
+  let total_object_size = continued_object.then(|| {
+    u32::from_le_bytes(
+      bytes[offset + 12..offset + 16]
+        .try_into()
+        .expect("continued object header length checked"),
+    )
+  });
+  let data_start = offset + 12 + usize::from(continued_object) * 4;
+  let data_end = offset + 12 + data_size;
+  if let Some(total_object_size) = total_object_size
+    && total_object_size < (data_end - data_start) as u32
+  {
+    return Err(Error::invalid(
+      offset as u64,
+      "EmfPlusObject TotalObjectSize is smaller than ObjectData",
+    ));
+  }
+  validate_emf_plus_record_padding_len(end - data_end)?;
+  Ok(EmfPlusRecordLayout {
+    record_type,
+    flags,
+    total_object_size,
+    data_start,
+    data_end,
+    end,
+  })
+}
+
+fn scan_emf_plus_records(bytes: &[u8]) -> Result<(usize, usize)> {
+  let mut offset = 0usize;
+  let mut record_count = 0usize;
+  while bytes.len() - offset >= 12 {
+    offset = emf_plus_record_layout(bytes, offset)?.end;
+    record_count += 1;
+  }
+  Ok((offset, record_count))
+}
+
 impl EmfPlusRecord {
   pub fn flags(&self) -> EmfPlusRecordFlags {
     EmfPlusRecordFlags::from_bits_retain(self.flags)
@@ -4467,6 +4696,16 @@ impl EmfPlusRecord {
 
   pub fn record_kind(&self) -> Option<EmfPlusRecordType> {
     EmfPlusRecordType::from_raw(self.record_type)
+  }
+
+  pub fn as_ref(&self) -> EmfPlusRecordRef<'_> {
+    EmfPlusRecordRef {
+      record_type: self.record_type,
+      flags: self.flags,
+      total_object_size: self.total_object_size,
+      data: &self.data,
+      padding: &self.padding,
+    }
   }
 
   pub fn object_fragment(&self) -> Result<EmfPlusObjectRecordData> {
@@ -4549,6 +4788,12 @@ impl EmfPlusRecord {
   }
 
   pub fn parse_data(&self) -> Result<EmfPlusRecordData<'_>> {
+    self.as_ref().parse_data()
+  }
+}
+
+impl<'a> EmfPlusRecordRef<'a> {
+  pub fn parse_data(self) -> Result<EmfPlusRecordData<'a>> {
     if !self.data.len().is_multiple_of(4) || !self.padding.is_empty() {
       return Err(Error::invalid(
         0,
@@ -4556,40 +4801,40 @@ impl EmfPlusRecord {
       ));
     }
     validate_emf_plus_fixed_payload_shape(self.record_kind(), self.data.len(), self.padding.len())?;
-    let mut reader = Reader::new(std::io::Cursor::new(self.data.as_slice()));
+    let mut reader = Reader::new(std::io::Cursor::new(self.data));
     let flags = self.flags();
 
     let data = match self.record_kind() {
       Some(EmfPlusRecordType::Header) => {
-        EmfPlusRecordData::Header(read_exact_object(&self.data, "EmfPlusHeader")?)
+        EmfPlusRecordData::Header(read_exact_object(self.data, "EmfPlusHeader")?)
       }
       Some(EmfPlusRecordType::Eof) => {
-        ensure_empty_data(&self.data, "EmfPlusEndOfFile")?;
+        ensure_empty_data(self.data, "EmfPlusEndOfFile")?;
         EmfPlusRecordData::Eof
       }
-      Some(EmfPlusRecordType::Comment) => EmfPlusRecordData::Comment(self.data.clone()),
+      Some(EmfPlusRecordType::Comment) => EmfPlusRecordData::Comment(self.data.to_vec()),
       Some(EmfPlusRecordType::GetDc) => {
-        ensure_empty_data(&self.data, "EmfPlusGetDC")?;
+        ensure_empty_data(self.data, "EmfPlusGetDC")?;
         EmfPlusRecordData::GetDc
       }
       Some(EmfPlusRecordType::MultiFormatStart) => {
         EmfPlusRecordData::MultiFormatStart(EmfPlusRawRecordData {
-          data: self.data.clone(),
+          data: self.data.to_vec(),
         })
       }
       Some(EmfPlusRecordType::MultiFormatSection) => {
         EmfPlusRecordData::MultiFormatSection(EmfPlusRawRecordData {
-          data: self.data.clone(),
+          data: self.data.to_vec(),
         })
       }
       Some(EmfPlusRecordType::MultiFormatEnd) => {
         EmfPlusRecordData::MultiFormatEnd(EmfPlusRawRecordData {
-          data: self.data.clone(),
+          data: self.data.to_vec(),
         })
       }
       Some(EmfPlusRecordType::Object) => EmfPlusRecordData::Object(self.object_fragment()?),
       Some(EmfPlusRecordType::Clear) => {
-        EmfPlusRecordData::Clear(read_exact_object(&self.data, "EmfPlusClear")?)
+        EmfPlusRecordData::Clear(read_exact_object(self.data, "EmfPlusClear")?)
       }
       Some(EmfPlusRecordType::FillRects) if self.data.len() >= 8 => {
         let brush = if flags.contains(EmfPlusRecordFlags::SOLID_COLOR) {
@@ -4847,18 +5092,18 @@ impl EmfPlusRecord {
         })
       }
       Some(EmfPlusRecordType::ResetClip) => {
-        ensure_empty_data(&self.data, "EmfPlusResetClip")?;
+        ensure_empty_data(self.data, "EmfPlusResetClip")?;
         EmfPlusRecordData::ResetClip
       }
       Some(EmfPlusRecordType::SetClipRect) => {
         EmfPlusRecordData::SetClipRect(EmfPlusSetClipRectData {
           combine_mode: flags.combine_mode_raw(),
           reserved_flags: flags.bits() & !0x0F00,
-          clip_rect: read_exact_object(&self.data, "EmfPlusSetClipRect")?,
+          clip_rect: read_exact_object(self.data, "EmfPlusSetClipRect")?,
         })
       }
       Some(EmfPlusRecordType::SetClipPath) => {
-        ensure_empty_data(&self.data, "EmfPlusSetClipPath")?;
+        ensure_empty_data(self.data, "EmfPlusSetClipPath")?;
         EmfPlusRecordData::SetClipPath(EmfPlusClipObjectData {
           combine_mode: flags.combine_mode_raw(),
           object_id: flags.object_id(),
@@ -4866,7 +5111,7 @@ impl EmfPlusRecord {
         })
       }
       Some(EmfPlusRecordType::SetClipRegion) => {
-        ensure_empty_data(&self.data, "EmfPlusSetClipRegion")?;
+        ensure_empty_data(self.data, "EmfPlusSetClipRegion")?;
         EmfPlusRecordData::SetClipRegion(EmfPlusClipObjectData {
           combine_mode: flags.combine_mode_raw(),
           object_id: flags.object_id(),
@@ -4874,13 +5119,13 @@ impl EmfPlusRecord {
         })
       }
       Some(EmfPlusRecordType::OffsetClip) => {
-        EmfPlusRecordData::OffsetClip(read_exact_object(&self.data, "EmfPlusOffsetClip")?)
+        EmfPlusRecordData::OffsetClip(read_exact_object(self.data, "EmfPlusOffsetClip")?)
       }
       Some(EmfPlusRecordType::SetRenderingOrigin) => EmfPlusRecordData::SetRenderingOrigin(
-        read_exact_object(&self.data, "EmfPlusSetRenderingOrigin")?,
+        read_exact_object(self.data, "EmfPlusSetRenderingOrigin")?,
       ),
       Some(EmfPlusRecordType::SetAntiAliasMode) => {
-        ensure_empty_data(&self.data, "EmfPlusSetAntiAliasMode")?;
+        ensure_empty_data(self.data, "EmfPlusSetAntiAliasMode")?;
         EmfPlusRecordData::SetAntiAliasMode(EmfPlusSetAntiAliasModeData {
           smoothing_mode: flags.smoothing_mode_raw(),
           anti_alias: flags.anti_alias_enabled(),
@@ -4888,95 +5133,95 @@ impl EmfPlusRecord {
         })
       }
       Some(EmfPlusRecordType::SetTextRenderingHint) => {
-        ensure_empty_data(&self.data, "EmfPlusSetTextRenderingHint")?;
+        ensure_empty_data(self.data, "EmfPlusSetTextRenderingHint")?;
         EmfPlusRecordData::SetTextRenderingHint(EmfPlusU8PropertyData {
           value: flags.property_mode_raw(),
           reserved_flags: flags.bits() & !0x00FF,
         })
       }
       Some(EmfPlusRecordType::SetTextContrast) => {
-        ensure_empty_data(&self.data, "EmfPlusSetTextContrast")?;
+        ensure_empty_data(self.data, "EmfPlusSetTextContrast")?;
         EmfPlusRecordData::SetTextContrast(EmfPlusSetTextContrastData {
           text_contrast: flags.text_contrast(),
           reserved_flags: flags.bits() & !0x0FFF,
         })
       }
       Some(EmfPlusRecordType::SetInterpolationMode) => {
-        ensure_empty_data(&self.data, "EmfPlusSetInterpolationMode")?;
+        ensure_empty_data(self.data, "EmfPlusSetInterpolationMode")?;
         EmfPlusRecordData::SetInterpolationMode(EmfPlusU8PropertyData {
           value: flags.property_mode_raw(),
           reserved_flags: flags.bits() & !0x00FF,
         })
       }
       Some(EmfPlusRecordType::SetPixelOffsetMode) => {
-        ensure_empty_data(&self.data, "EmfPlusSetPixelOffsetMode")?;
+        ensure_empty_data(self.data, "EmfPlusSetPixelOffsetMode")?;
         EmfPlusRecordData::SetPixelOffsetMode(EmfPlusU8PropertyData {
           value: flags.property_mode_raw(),
           reserved_flags: flags.bits() & !0x00FF,
         })
       }
       Some(EmfPlusRecordType::SetCompositingMode) => {
-        ensure_empty_data(&self.data, "EmfPlusSetCompositingMode")?;
+        ensure_empty_data(self.data, "EmfPlusSetCompositingMode")?;
         EmfPlusRecordData::SetCompositingMode(EmfPlusU8PropertyData {
           value: flags.property_mode_raw(),
           reserved_flags: flags.bits() & !0x00FF,
         })
       }
       Some(EmfPlusRecordType::SetCompositingQuality) => {
-        ensure_empty_data(&self.data, "EmfPlusSetCompositingQuality")?;
+        ensure_empty_data(self.data, "EmfPlusSetCompositingQuality")?;
         EmfPlusRecordData::SetCompositingQuality(EmfPlusU8PropertyData {
           value: flags.property_mode_raw(),
           reserved_flags: flags.bits() & !0x00FF,
         })
       }
       Some(EmfPlusRecordType::Save) => {
-        EmfPlusRecordData::Save(read_exact_object(&self.data, "EmfPlusSave")?)
+        EmfPlusRecordData::Save(read_exact_object(self.data, "EmfPlusSave")?)
       }
       Some(EmfPlusRecordType::Restore) => {
-        EmfPlusRecordData::Restore(read_exact_object(&self.data, "EmfPlusRestore")?)
+        EmfPlusRecordData::Restore(read_exact_object(self.data, "EmfPlusRestore")?)
       }
       Some(EmfPlusRecordType::BeginContainer) => {
-        EmfPlusRecordData::BeginContainer(read_exact_object(&self.data, "EmfPlusBeginContainer")?)
+        EmfPlusRecordData::BeginContainer(read_exact_object(self.data, "EmfPlusBeginContainer")?)
       }
       Some(EmfPlusRecordType::BeginContainerNoParams) => EmfPlusRecordData::BeginContainerNoParams(
-        read_exact_object(&self.data, "EmfPlusBeginContainerNoParams")?,
+        read_exact_object(self.data, "EmfPlusBeginContainerNoParams")?,
       ),
       Some(EmfPlusRecordType::EndContainer) => {
-        EmfPlusRecordData::EndContainer(read_exact_object(&self.data, "EmfPlusEndContainer")?)
+        EmfPlusRecordData::EndContainer(read_exact_object(self.data, "EmfPlusEndContainer")?)
       }
       Some(EmfPlusRecordType::SetWorldTransform) => EmfPlusRecordData::SetWorldTransform(
-        read_exact_object(&self.data, "EmfPlusSetWorldTransform")?,
+        read_exact_object(self.data, "EmfPlusSetWorldTransform")?,
       ),
       Some(EmfPlusRecordType::ResetWorldTransform) => {
-        ensure_empty_data(&self.data, "EmfPlusResetWorldTransform")?;
+        ensure_empty_data(self.data, "EmfPlusResetWorldTransform")?;
         EmfPlusRecordData::ResetWorldTransform
       }
       Some(EmfPlusRecordType::MultiplyWorldTransform) => {
         EmfPlusRecordData::MultiplyWorldTransform(EmfPlusTransformOrderData::from_flags(
-          read_exact_object(&self.data, "EmfPlusMultiplyWorldTransform")?,
+          read_exact_object(self.data, "EmfPlusMultiplyWorldTransform")?,
           flags,
         ))
       }
       Some(EmfPlusRecordType::TranslateWorldTransform) => {
         EmfPlusRecordData::TranslateWorldTransform(EmfPlusTransformOrderData::from_flags(
-          read_exact_object(&self.data, "EmfPlusTranslateWorldTransform")?,
+          read_exact_object(self.data, "EmfPlusTranslateWorldTransform")?,
           flags,
         ))
       }
       Some(EmfPlusRecordType::ScaleWorldTransform) => {
         EmfPlusRecordData::ScaleWorldTransform(EmfPlusTransformOrderData::from_flags(
-          read_exact_object(&self.data, "EmfPlusScaleWorldTransform")?,
+          read_exact_object(self.data, "EmfPlusScaleWorldTransform")?,
           flags,
         ))
       }
       Some(EmfPlusRecordType::RotateWorldTransform) => {
         EmfPlusRecordData::RotateWorldTransform(EmfPlusTransformOrderData::from_flags(
-          read_exact_object(&self.data, "EmfPlusRotateWorldTransform")?,
+          read_exact_object(self.data, "EmfPlusRotateWorldTransform")?,
           flags,
         ))
       }
       Some(EmfPlusRecordType::SetPageTransform) => EmfPlusRecordData::SetPageTransform(
-        read_exact_object(&self.data, "EmfPlusSetPageTransform")?,
+        read_exact_object(self.data, "EmfPlusSetPageTransform")?,
       ),
       Some(EmfPlusRecordType::DrawDriverString) if self.data.len() >= 16 => {
         let brush = read_brush_ref(&mut reader, flags)?;
@@ -5053,7 +5298,7 @@ impl EmfPlusRecord {
         })
       }
       Some(EmfPlusRecordType::StrokeFillPath) => {
-        ensure_empty_data(&self.data, "EmfPlusStrokeFillPath")?;
+        ensure_empty_data(self.data, "EmfPlusStrokeFillPath")?;
         EmfPlusRecordData::StrokeFillPath
       }
       Some(EmfPlusRecordType::SerializableObject) if self.data.len() >= 20 => {
@@ -5120,7 +5365,7 @@ impl EmfPlusRecord {
         })
       }
       Some(EmfPlusRecordType::SetTsClip) => {
-        EmfPlusRecordData::SetTsClip(EmfPlusSetTsClipData::read_data(self.flags, &self.data)?)
+        EmfPlusRecordData::SetTsClip(EmfPlusSetTsClipData::read_data(self.flags, self.data)?)
       }
       Some(_) => {
         return Err(Error::invalid(
@@ -5134,7 +5379,9 @@ impl EmfPlusRecord {
     validate_emf_plus_record_data(&data, flags)?;
     Ok(data)
   }
+}
 
+impl EmfPlusRecord {
   pub fn from_data(data: &EmfPlusRecordData<'_>, flags: EmfPlusRecordFlags) -> Result<Self> {
     if let EmfPlusRecordData::Object(value) = data
       && value.continues != value.total_object_size.is_some()
@@ -5336,8 +5583,8 @@ impl EmfPlusRecord {
         }
         EmfPlusRecordData::SetTsClip(value) => value.write_to(&mut writer)?,
         EmfPlusRecordData::Unknown(record) => {
-          validate_unknown_emf_plus_record(record)?;
-          return Ok((*record).clone());
+          validate_unknown_emf_plus_record(record.record_type)?;
+          return Ok(EmfPlusRecordRef::to_owned(*record));
         }
       }
     }
@@ -5988,8 +6235,8 @@ fn validate_emf_plus_record_padding_len(padding_len: usize) -> Result<()> {
   Ok(())
 }
 
-fn validate_unknown_emf_plus_record(record: &EmfPlusRecord) -> Result<()> {
-  if record.record_kind().is_some() {
+fn validate_unknown_emf_plus_record(record_type: u16) -> Result<()> {
+  if EmfPlusRecordType::from_raw(record_type).is_some() {
     return Err(Error::invalid(
       0,
       "EMF+ Unknown record requires an unknown RecordType",
@@ -9334,27 +9581,13 @@ fn wrap_mode_from_i32(value: i32) -> Option<EmfPlusWrapMode> {
 }
 
 pub fn read_records(bytes: &[u8]) -> Result<Vec<EmfPlusRecord>> {
-  let (records, trailing_data) = read_records_with_trailing(bytes)?;
-  if !trailing_data.is_empty() {
-    return Err(Error::invalid(
-      bytes.len() as u64 - trailing_data.len() as u64,
-      "EMF+ stream has trailing data smaller than a record header",
-    ));
-  }
-  Ok(records)
+  Ok(EmfPlusStreamRef::from_bytes(bytes)?.to_owned())
 }
 
 pub(crate) fn read_records_with_trailing(bytes: &[u8]) -> Result<(Vec<EmfPlusRecord>, Vec<u8>)> {
-  let mut reader = Reader::new(std::io::Cursor::new(bytes));
-  let mut records = Vec::new();
-  while reader.position()? < bytes.len() as u64 {
-    let remaining = bytes.len() as u64 - reader.position()?;
-    if remaining < 12 {
-      return Ok((records, reader.read_vec(remaining as usize)?));
-    }
-    records.push(EmfPlusRecord::read_from(&mut reader, bytes.len() as u64)?);
-  }
-  Ok((records, Vec::new()))
+  let stream = EmfPlusStreamRef::from_bytes_compatible(bytes)?;
+  let trailing_data = stream.trailing_data().to_vec();
+  Ok((stream.to_owned(), trailing_data))
 }
 
 #[cfg(test)]
@@ -9411,6 +9644,50 @@ mod tests {
         .write_to(&mut Writer::new(std::io::Cursor::new(Vec::new())))
         .is_err()
     );
+  }
+
+  #[test]
+  fn emf_plus_borrowed_stream_uses_input_storage_and_materializes_explicitly() {
+    let bytes = [
+      0x03, 0x40, // Type: Comment
+      0x00, 0x00, // Flags
+      0x10, 0x00, 0x00, 0x00, // Size
+      0x02, 0x00, 0x00, 0x00, // DataSize
+      0xAA, 0xBB, // Data
+      0xCC, 0xDD, // Padding
+    ];
+    let stream = EmfPlusStreamRef::from_bytes(&bytes).unwrap();
+    assert_eq!(stream.record_count(), 1);
+    assert!(stream.trailing_data().is_empty());
+
+    let record = stream.records().next().unwrap();
+    assert_eq!(record.data.as_ptr(), bytes[12..].as_ptr());
+    assert_eq!(record.padding.as_ptr(), bytes[14..].as_ptr());
+    assert_eq!(record.sdk_size(), bytes.len() as u64);
+    assert!(record.parse_data().is_err());
+    assert_eq!(stream.to_owned(), read_records(&bytes).unwrap());
+
+    let eof_bytes = [
+      0x02, 0x40, // Type: EndOfFile
+      0x00, 0x00, // Flags
+      0x0C, 0x00, 0x00, 0x00, // Size
+      0x00, 0x00, 0x00, 0x00, // DataSize
+    ];
+    let eof = EmfPlusStreamRef::from_bytes(&eof_bytes)
+      .unwrap()
+      .records()
+      .next()
+      .unwrap();
+    assert!(matches!(eof.parse_data().unwrap(), EmfPlusRecordData::Eof));
+    let mut invalid_late_record = eof_bytes.repeat(2);
+    invalid_late_record[16..20].copy_from_slice(&8u32.to_le_bytes());
+    assert!(EmfPlusStreamRef::from_bytes(&invalid_late_record).is_err());
+
+    let mut compatible = bytes.to_vec();
+    compatible.extend_from_slice(&[0x11, 0x22]);
+    let stream = EmfPlusStreamRef::from_bytes_compatible(&compatible).unwrap();
+    assert_eq!(stream.trailing_data(), &[0x11, 0x22]);
+    assert!(EmfPlusStreamRef::from_bytes(&compatible).is_err());
   }
 
   #[test]
@@ -11827,8 +12104,9 @@ mod tests {
     assert_eq!(record.parse_data().unwrap(), continued_object);
     let mut writer = Writer::new(std::io::Cursor::new(Vec::new()));
     record.write_to(&mut writer).unwrap();
+    let continued_bytes = writer.into_inner().into_inner();
     assert_eq!(
-      writer.into_inner().into_inner(),
+      continued_bytes,
       vec![
         0x08, 0x40, // Type
         0x05, 0x83, // Flags: C + ObjectTypePath + ObjectID 5
@@ -11838,6 +12116,14 @@ mod tests {
         1, 2, 3, 4, // ObjectData
       ]
     );
+    let record_ref = EmfPlusStreamRef::from_bytes(&continued_bytes)
+      .unwrap()
+      .records()
+      .next()
+      .unwrap();
+    assert_eq!(record_ref.total_object_size, Some(16));
+    assert_eq!(record_ref.data.as_ptr(), continued_bytes[16..].as_ptr());
+    assert_eq!(record_ref.parse_data().unwrap(), continued_object);
 
     let brush_data = EmfPlusBrushData::Solid(EmfPlusSolidBrushData {
       solid_color: EmfPlusArgb {

@@ -905,6 +905,190 @@ pub enum WmfStretchMode {
   Halftone = 0x0004,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WmfRecordRef<'a> {
+  pub function: u16,
+  pub data: &'a [u8],
+}
+
+impl<'a> WmfRecordRef<'a> {
+  pub fn function_kind(&self) -> Option<WmfRecordFunction> {
+    WmfRecordFunction::from_raw(self.function)
+  }
+
+  pub fn normalized_function_kind(&self) -> Option<WmfRecordFunction> {
+    normalized_wmf_record_function(self.function)
+  }
+
+  pub fn size_words(&self) -> Result<u32> {
+    record_size_words_parts(self.data.len())
+  }
+
+  pub fn to_owned(self) -> WmfRecord {
+    WmfRecord::new(self.function, self.data.to_vec())
+  }
+
+  pub fn embedded_source_present(&self) -> Result<Option<bool>> {
+    match self.normalized_function_kind() {
+      Some(
+        WmfRecordFunction::BitBlt
+        | WmfRecordFunction::DibBitBlt
+        | WmfRecordFunction::DibStretchBlt
+        | WmfRecordFunction::StretchBlt,
+      ) => Ok(Some(has_bitmap_source_parts(
+        self.function,
+        self.data.len(),
+      )?)),
+      _ => Ok(None),
+    }
+  }
+
+  pub fn parse_data(self) -> Result<WmfRecordData<'a>> {
+    WmfRecordData::from_record_ref(self)
+  }
+}
+
+impl SdkSize for WmfRecordRef<'_> {
+  fn sdk_size(&self) -> u64 {
+    6 + self.data.len() as u64
+  }
+}
+
+#[derive(Clone, Debug)]
+pub struct WmfRecords<'a> {
+  bytes: &'a [u8],
+  offset: usize,
+  remaining: usize,
+}
+
+impl<'a> Iterator for WmfRecords<'a> {
+  type Item = WmfRecordRef<'a>;
+
+  fn next(&mut self) -> Option<Self::Item> {
+    if self.remaining == 0 {
+      return None;
+    }
+    let size_words = u32::from_le_bytes(
+      self.bytes[self.offset..self.offset + 4]
+        .try_into()
+        .expect("validated WMF record header"),
+    ) as usize;
+    let function = u16::from_le_bytes(
+      self.bytes[self.offset + 4..self.offset + 6]
+        .try_into()
+        .expect("validated WMF record header"),
+    );
+    let size = size_words * 2;
+    let data_start = self.offset + 6;
+    let end = self.offset + size;
+    self.offset = end;
+    self.remaining -= 1;
+    Some(WmfRecordRef {
+      function,
+      data: &self.bytes[data_start..end],
+    })
+  }
+
+  fn size_hint(&self) -> (usize, Option<usize>) {
+    (self.remaining, Some(self.remaining))
+  }
+}
+
+impl ExactSizeIterator for WmfRecords<'_> {}
+impl std::iter::FusedIterator for WmfRecords<'_> {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WmfMetafileRef<'a> {
+  pub placeable_header: Option<WmfPlaceableHeader>,
+  pub header: WmfHeader,
+  records_bytes: &'a [u8],
+  trailing_data: &'a [u8],
+  record_count: usize,
+}
+
+impl<'a> WmfMetafileRef<'a> {
+  pub fn from_bytes(bytes: &'a [u8]) -> Result<Self> {
+    let mut reader = Reader::new(Cursor::new(bytes));
+    let placeable_header = if has_placeable_header(bytes) {
+      Some(WmfPlaceableHeader::read_from(&mut reader)?)
+    } else {
+      None
+    };
+    let header = WmfHeader::read_from(&mut reader)?;
+    let records_start = reader.position()? as usize;
+    let (records_end, record_count) = scan_wmf_records(bytes, records_start)?;
+    Ok(Self {
+      placeable_header,
+      header,
+      records_bytes: &bytes[records_start..records_end],
+      trailing_data: &bytes[records_end..],
+      record_count,
+    })
+  }
+
+  pub fn records(&self) -> WmfRecords<'a> {
+    WmfRecords {
+      bytes: self.records_bytes,
+      offset: 0,
+      remaining: self.record_count,
+    }
+  }
+
+  pub const fn record_count(&self) -> usize {
+    self.record_count
+  }
+
+  pub const fn trailing_data(&self) -> &'a [u8] {
+    self.trailing_data
+  }
+
+  pub fn to_owned(self) -> WmfMetafile {
+    let records = self.records().map(WmfRecordRef::to_owned).collect();
+    let trailing_data = self.trailing_data.to_vec();
+    WmfMetafile {
+      placeable_header: self.placeable_header,
+      header: self.header,
+      records,
+      trailing_data,
+    }
+  }
+}
+
+fn scan_wmf_records(bytes: &[u8], mut offset: usize) -> Result<(usize, usize)> {
+  let mut record_count = 0usize;
+  loop {
+    let header = bytes
+      .get(offset..offset.saturating_add(6))
+      .ok_or_else(|| Error::invalid(offset as u64, "WMF record header is truncated"))?;
+    let size_words =
+      u32::from_le_bytes(header[..4].try_into().expect("slice length checked")) as usize;
+    let function = u16::from_le_bytes(header[4..].try_into().expect("slice length checked"));
+    let size = size_words
+      .checked_mul(2)
+      .ok_or_else(|| Error::invalid(offset as u64, "WMF record size overflows"))?;
+    if size < 6 {
+      return Err(Error::invalid(
+        offset as u64,
+        "WMF record size is smaller than its header",
+      ));
+    }
+    let end = offset
+      .checked_add(size)
+      .ok_or_else(|| Error::invalid(offset as u64, "WMF record size overflows"))?;
+    if end > bytes.len() {
+      return Err(Error::invalid(
+        offset as u64,
+        "WMF record extends past end of file",
+      ));
+    }
+    record_count += 1;
+    offset = end;
+    if function == META_EOF {
+      return Ok((offset, record_count));
+    }
+  }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WmfMetafile {
   pub placeable_header: Option<WmfPlaceableHeader>,
@@ -915,35 +1099,7 @@ pub struct WmfMetafile {
 
 impl WmfMetafile {
   pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-    let mut reader = Reader::new(Cursor::new(bytes));
-    let placeable_header = if has_placeable_header(bytes) {
-      Some(WmfPlaceableHeader::read_from(&mut reader)?)
-    } else {
-      None
-    };
-    let header = WmfHeader::read_from(&mut reader)?;
-    let mut records = Vec::new();
-
-    while reader.position()? < bytes.len() as u64 {
-      let record = WmfRecord::read_from(&mut reader, bytes.len() as u64)?;
-      let is_eof = record.function == META_EOF;
-      records.push(record);
-      if is_eof {
-        break;
-      }
-    }
-
-    if !matches!(records.last(), Some(record) if record.function == META_EOF) {
-      return Err(Error::invalid(0, "WMF metafile must end with META_EOF"));
-    }
-    let trailing_data = bytes[reader.position()? as usize..].to_vec();
-
-    Ok(Self {
-      placeable_header,
-      header,
-      records,
-      trailing_data,
-    })
+    Ok(WmfMetafileRef::from_bytes(bytes)?.to_owned())
   }
 
   pub fn to_bytes(&self) -> Result<Vec<u8>> {
@@ -1234,6 +1390,13 @@ impl WmfRecord {
     normalized_wmf_record_function(self.function)
   }
 
+  pub fn as_ref(&self) -> WmfRecordRef<'_> {
+    WmfRecordRef {
+      function: self.function,
+      data: &self.data,
+    }
+  }
+
   pub fn size_words(&self) -> Result<u32> {
     record_size_words(self)
   }
@@ -1390,7 +1553,7 @@ pub enum WmfRecordData<'a> {
   TextOut(WmfTextOutRecord),
   ExtTextOut(WmfExtTextOutRecord),
   Escape(WmfEscapeRecord),
-  Unknown(&'a WmfRecord),
+  Unknown(WmfRecordRef<'a>),
 }
 
 impl<'a> WmfRecordData<'a> {
@@ -1429,7 +1592,11 @@ impl<'a> WmfRecordData<'a> {
   }
 
   pub fn from_record(record: &'a WmfRecord) -> Result<Self> {
-    let data = &record.data;
+    Self::from_record_ref(record.as_ref())
+  }
+
+  pub fn from_record_ref(record: WmfRecordRef<'a>) -> Result<Self> {
+    let data = record.data;
     Ok(match record.normalized_function_kind() {
       Some(WmfRecordFunction::Eof) => Self::Eof(WmfEofRecord {
         trailing_data: data.to_vec(),
@@ -1545,16 +1712,19 @@ impl<'a> WmfRecordData<'a> {
       Some(WmfRecordFunction::Pie) => Self::Pie(read_object(data, "META_PIE")?),
       Some(WmfRecordFunction::BitBlt) => Self::BitBlt(WmfBitBltRecord::read_data(
         data,
-        has_bitmap_source(record)?,
+        has_bitmap_source_parts(record.function, data.len())?,
         "META_BITBLT",
       )?),
       Some(WmfRecordFunction::DibBitBlt) => Self::DibBitBlt(WmfDibBitBltRecord::read_data(
         data,
-        has_bitmap_source(record)?,
+        has_bitmap_source_parts(record.function, data.len())?,
       )?),
-      Some(WmfRecordFunction::DibStretchBlt) => Self::DibStretchBlt(
-        WmfDibStretchBltRecord::read_data(data, has_bitmap_source(record)?)?,
-      ),
+      Some(WmfRecordFunction::DibStretchBlt) => {
+        Self::DibStretchBlt(WmfDibStretchBltRecord::read_data(
+          data,
+          has_bitmap_source_parts(record.function, data.len())?,
+        )?)
+      }
       Some(WmfRecordFunction::FloodFill) => Self::FloodFill(WmfFloodFillRecord::read_data(data)?),
       Some(WmfRecordFunction::ExtFloodFill) => {
         let value = read_object(data, "META_EXTFLOODFILL")?;
@@ -1567,7 +1737,7 @@ impl<'a> WmfRecordData<'a> {
       Some(WmfRecordFunction::SetPixel) => Self::SetPixel(read_object(data, "META_SETPIXEL")?),
       Some(WmfRecordFunction::StretchBlt) => Self::StretchBlt(WmfStretchBltRecord::read_data(
         data,
-        has_bitmap_source(record)?,
+        has_bitmap_source_parts(record.function, data.len())?,
         "META_STRETCHBLT",
       )?),
       Some(WmfRecordFunction::StretchDib) => {
@@ -1805,8 +1975,8 @@ impl<'a> WmfRecordData<'a> {
       }
       Self::Escape(value) => WmfRecord::new(WmfRecordFunction::Escape.raw(), value.write_data()?),
       Self::Unknown(record) => {
-        validate_unknown_wmf_record(record)?;
-        (*record).clone()
+        validate_unknown_wmf_record(record.function)?;
+        WmfRecordRef::to_owned(*record)
       }
     })
   }
@@ -4498,8 +4668,8 @@ fn validate_wmf_header(value: &WmfHeader) -> Result<()> {
   Ok(())
 }
 
-fn validate_unknown_wmf_record(record: &WmfRecord) -> Result<()> {
-  if record.normalized_function_kind().is_some() {
+fn validate_unknown_wmf_record(function: u16) -> Result<()> {
+  if normalized_wmf_record_function(function).is_some() {
     return Err(Error::invalid(
       0,
       "WMF Unknown record requires an unknown RecordFunction",
@@ -5573,9 +5743,11 @@ fn no_data_record(function: WmfRecordFunction) -> WmfRecord {
 }
 
 fn record_size_words(record: &WmfRecord) -> Result<u32> {
-  let size_bytes = record
-    .data
-    .len()
+  record_size_words_parts(record.data.len())
+}
+
+fn record_size_words_parts(data_len: usize) -> Result<u32> {
+  let size_bytes = data_len
     .checked_add(6)
     .ok_or_else(|| Error::invalid(0, "WMF record size overflows"))?;
   if !size_bytes.is_multiple_of(2) {
@@ -5660,19 +5832,23 @@ fn max_wmf_referenced_object_index(records: &[WmfRecord]) -> Result<Option<u16>>
 }
 
 fn has_bitmap_source(record: &WmfRecord) -> Result<bool> {
-  let kind = record.normalized_function_kind().ok_or_else(|| {
+  has_bitmap_source_parts(record.function, record.data.len())
+}
+
+fn has_bitmap_source_parts(function: u16, data_len: usize) -> Result<bool> {
+  let kind = normalized_wmf_record_function(function).ok_or_else(|| {
     Error::invalid(
       0,
       "WMF bitmap transfer record function byte is not recognized",
     )
   })?;
   let canonical = kind.raw();
-  let size_words = record_size_words(record)?;
+  let size_words = record_size_words_parts(data_len)?;
   let fixed_words = u32::from(canonical >> 8);
   let expected_no_source_words = fixed_words
     .checked_add(3)
     .ok_or_else(|| Error::invalid(0, "WMF bitmap transfer size overflows"))?;
-  if record.function != canonical {
+  if function != canonical {
     return Err(Error::invalid(
       0,
       "WMF bitmap transfer RecordFunction high byte is invalid",
@@ -5903,6 +6079,30 @@ mod tests {
     );
     assert_eq!(metafile.records.len(), 1);
     assert_eq!(metafile.to_bytes().unwrap(), bytes);
+  }
+
+  #[test]
+  fn wmf_borrowed_view_uses_input_storage_and_materializes_explicitly() {
+    let bytes = minimal_wmf();
+    let view = WmfMetafileRef::from_bytes(&bytes).unwrap();
+    assert_eq!(view.record_count(), 1);
+    assert_eq!(view.trailing_data(), &bytes[24..]);
+
+    let mut records = view.records();
+    assert_eq!(records.len(), 1);
+    let eof = records.next().unwrap();
+    assert_eq!(eof.data.as_ptr(), bytes[24..24].as_ptr());
+    assert!(matches!(eof.parse_data().unwrap(), WmfRecordData::Eof(_)));
+    assert!(records.next().is_none());
+
+    let owned = view.to_owned();
+    assert_eq!(owned.to_bytes().unwrap(), bytes);
+
+    let mut invalid_late_record = minimal_wmf();
+    invalid_late_record[22..24].copy_from_slice(&WmfRecordFunction::SaveDc.raw().to_le_bytes());
+    invalid_late_record.extend_from_slice(&2u32.to_le_bytes());
+    invalid_late_record.extend_from_slice(&META_EOF.to_le_bytes());
+    assert!(WmfMetafileRef::from_bytes(&invalid_late_record).is_err());
   }
 
   #[test]

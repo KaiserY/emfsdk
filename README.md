@@ -35,6 +35,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 Use `EmfMetafile`, `WmfMetafile`, and each record's `parse_data` method when
 you need format-specific typed access.
 
+For read-only framing, `MetafileRef`, `EmfMetafileRef`, `WmfMetafileRef`, and
+`EmfPlusStreamRef` validate the complete record stream and borrow record data
+directly from the input buffer. Their exact-size iterators do not allocate.
+Record-level `parse_data` remains eager. Call `to_owned` explicitly before
+editing or writing; borrowed views do not provide a raw pass-through writer.
+
 ## Compatible and Strict Parsing
 
 `Metafile::from_bytes` is compatibility-first. It preserves bounded records

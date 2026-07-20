@@ -728,6 +728,163 @@ pub enum EmfRecordType {
   CreateColorSpaceW = 0x0000_007A,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EmfRecordRef<'a> {
+  pub record_type: u32,
+  pub data: &'a [u8],
+}
+
+impl<'a> EmfRecordRef<'a> {
+  pub fn record_kind(&self) -> Option<EmfRecordType> {
+    EmfRecordType::from_raw(self.record_type)
+  }
+
+  pub fn to_owned(self) -> EmfRecord {
+    EmfRecord::new(self.record_type, self.data.to_vec())
+  }
+
+  pub fn parse_data(self) -> Result<EmfRecordData<'a>> {
+    EmfRecordData::from_record_ref(self)
+  }
+
+  pub fn emf_plus_payload(self) -> Option<&'a [u8]> {
+    emf_plus_payload(self.record_type, self.data)
+  }
+}
+
+impl SdkSize for EmfRecordRef<'_> {
+  fn sdk_size(&self) -> u64 {
+    8 + self.data.len() as u64
+  }
+}
+
+#[derive(Clone, Debug)]
+pub struct EmfRecords<'a> {
+  bytes: &'a [u8],
+  offset: usize,
+  remaining: usize,
+}
+
+impl<'a> Iterator for EmfRecords<'a> {
+  type Item = EmfRecordRef<'a>;
+
+  fn next(&mut self) -> Option<Self::Item> {
+    if self.remaining == 0 {
+      return None;
+    }
+    let record_type = u32::from_le_bytes(
+      self.bytes[self.offset..self.offset + 4]
+        .try_into()
+        .expect("validated EMF record header"),
+    );
+    let size = u32::from_le_bytes(
+      self.bytes[self.offset + 4..self.offset + 8]
+        .try_into()
+        .expect("validated EMF record header"),
+    ) as usize;
+    let data_start = self.offset + 8;
+    let end = self.offset + size;
+    self.offset = end;
+    self.remaining -= 1;
+    Some(EmfRecordRef {
+      record_type,
+      data: &self.bytes[data_start..end],
+    })
+  }
+
+  fn size_hint(&self) -> (usize, Option<usize>) {
+    (self.remaining, Some(self.remaining))
+  }
+}
+
+impl ExactSizeIterator for EmfRecords<'_> {}
+impl std::iter::FusedIterator for EmfRecords<'_> {}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EmfMetafileRef<'a> {
+  records_bytes: &'a [u8],
+  trailing_data: &'a [u8],
+  record_count: usize,
+}
+
+impl<'a> EmfMetafileRef<'a> {
+  pub fn from_bytes(bytes: &'a [u8]) -> Result<Self> {
+    let (records_end, record_count) = scan_emf_records(bytes)?;
+    Ok(Self {
+      records_bytes: &bytes[..records_end],
+      trailing_data: &bytes[records_end..],
+      record_count,
+    })
+  }
+
+  pub fn records(&self) -> EmfRecords<'a> {
+    EmfRecords {
+      bytes: self.records_bytes,
+      offset: 0,
+      remaining: self.record_count,
+    }
+  }
+
+  pub const fn record_count(&self) -> usize {
+    self.record_count
+  }
+
+  pub const fn trailing_data(&self) -> &'a [u8] {
+    self.trailing_data
+  }
+
+  pub fn to_owned(self) -> EmfMetafile {
+    EmfMetafile {
+      records: self.records().map(EmfRecordRef::to_owned).collect(),
+      trailing_data: self.trailing_data.to_vec(),
+    }
+  }
+}
+
+fn scan_emf_records(bytes: &[u8]) -> Result<(usize, usize)> {
+  let mut offset = 0usize;
+  let mut record_count = 0usize;
+  let mut first_record_type = None;
+  loop {
+    let header = bytes
+      .get(offset..offset.saturating_add(8))
+      .ok_or_else(|| Error::invalid(offset as u64, "EMF record header is truncated"))?;
+    let record_type = u32::from_le_bytes(header[..4].try_into().expect("slice length checked"));
+    let size = u32::from_le_bytes(header[4..].try_into().expect("slice length checked")) as usize;
+    if size < 8 {
+      return Err(Error::invalid(
+        offset as u64,
+        "EMF record size is smaller than its header",
+      ));
+    }
+    if !size.is_multiple_of(4) {
+      return Err(Error::invalid(
+        offset as u64,
+        "EMF record size is not 32-bit aligned",
+      ));
+    }
+    let end = offset
+      .checked_add(size)
+      .ok_or_else(|| Error::invalid(offset as u64, "EMF record size overflows"))?;
+    if end > bytes.len() {
+      return Err(Error::invalid(
+        offset as u64,
+        "EMF record extends past end of file",
+      ));
+    }
+    first_record_type.get_or_insert(record_type);
+    record_count += 1;
+    offset = end;
+    if record_type == EMR_EOF {
+      break;
+    }
+  }
+  if first_record_type != Some(EMR_HEADER) {
+    return Err(Error::invalid(0, "EMF metafile must start with EMR_HEADER"));
+  }
+  Ok((offset, record_count))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EmfMetafile {
   pub records: Vec<EmfRecord>,
@@ -736,48 +893,7 @@ pub struct EmfMetafile {
 
 impl EmfMetafile {
   pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-    let mut reader = Reader::new(Cursor::new(bytes));
-    let mut records = Vec::new();
-
-    while reader.position()? < bytes.len() as u64 {
-      let record = EmfRecord::read_from(&mut reader, bytes.len() as u64)?;
-      let is_eof = record.record_type == EMR_EOF;
-      records.push(record);
-      if records.len() == 1 && records[0].record_type == EMR_HEADER {
-        // nRecords is at bytes 44..48 of the EMR_HEADER payload. Bound the
-        // untrusted hint so a corrupt header cannot force a large allocation.
-        let declared_records = records[0]
-          .data
-          .get(44..48)
-          .map(|bytes| u32::from_le_bytes(bytes.try_into().expect("slice length checked")))
-          .unwrap_or(0) as usize;
-        let maximum_records = bytes.len() / 8;
-        records.reserve(
-          declared_records
-            .saturating_sub(1)
-            .min(maximum_records.saturating_sub(1))
-            .min(16_384),
-        );
-      }
-      if is_eof {
-        break;
-      }
-    }
-
-    if !matches!(records.first(), Some(record) if record.record_type == EMR_HEADER) {
-      return Err(Error::invalid(0, "EMF metafile must start with EMR_HEADER"));
-    }
-
-    if !matches!(records.last(), Some(record) if record.record_type == EMR_EOF) {
-      return Err(Error::invalid(0, "EMF metafile must end with EMR_EOF"));
-    }
-
-    let trailing_data = bytes[reader.position()? as usize..].to_vec();
-
-    Ok(Self {
-      records,
-      trailing_data,
-    })
+    Ok(EmfMetafileRef::from_bytes(bytes)?.to_owned())
   }
 
   pub fn to_bytes(&self) -> Result<Vec<u8>> {
@@ -865,54 +981,19 @@ impl EmfRecord {
     EmfRecordType::from_raw(self.record_type)
   }
 
+  pub fn as_ref(&self) -> EmfRecordRef<'_> {
+    EmfRecordRef {
+      record_type: self.record_type,
+      data: &self.data,
+    }
+  }
+
   pub fn parse_data(&self) -> Result<EmfRecordData<'_>> {
     EmfRecordData::from_record(self)
   }
 
   pub fn emf_plus_payload(&self) -> Option<&[u8]> {
-    if self.record_type != EMR_COMMENT || self.data.len() < 8 {
-      return None;
-    }
-    let data_size = u32::from_le_bytes(self.data[0..4].try_into().ok()?) as usize;
-    let identifier = u32::from_le_bytes(self.data[4..8].try_into().ok()?);
-    if identifier != EMR_COMMENT_EMFPLUS || data_size < 4 {
-      return None;
-    }
-    let payload_len = data_size - 4;
-    let payload_end = 8usize.checked_add(payload_len)?;
-    self.data.get(8..payload_end)
-  }
-
-  fn read_from<R: std::io::Read + std::io::Seek>(
-    reader: &mut Reader<R>,
-    file_len: u64,
-  ) -> Result<Self> {
-    let offset = reader.position()?;
-    let record_type = reader.read_u32()?;
-    let size = reader.read_u32()?;
-    if size < 8 {
-      return Err(Error::invalid(
-        offset,
-        "EMF record size is smaller than its header",
-      ));
-    }
-    if size % 4 != 0 {
-      return Err(Error::invalid(
-        offset,
-        "EMF record size is not 32-bit aligned",
-      ));
-    }
-    let end = offset
-      .checked_add(size as u64)
-      .ok_or_else(|| Error::invalid(offset, "EMF record size overflows"))?;
-    if end > file_len {
-      return Err(Error::invalid(
-        offset,
-        "EMF record extends past end of file",
-      ));
-    }
-    let data = reader.read_vec(size as usize - 8)?;
-    Ok(Self { record_type, data })
+    emf_plus_payload(self.record_type, &self.data)
   }
 
   fn write_to<W: std::io::Write + std::io::Seek>(&self, writer: &mut Writer<W>) -> Result<()> {
@@ -937,6 +1018,20 @@ impl EmfRecord {
     writer.write_u32(size as u32)?;
     writer.write_all(&self.data)
   }
+}
+
+fn emf_plus_payload(record_type: u32, data: &[u8]) -> Option<&[u8]> {
+  if record_type != EMR_COMMENT || data.len() < 8 {
+    return None;
+  }
+  let data_size = u32::from_le_bytes(data[0..4].try_into().ok()?) as usize;
+  let identifier = u32::from_le_bytes(data[4..8].try_into().ok()?);
+  if identifier != EMR_COMMENT_EMFPLUS || data_size < 4 {
+    return None;
+  }
+  let payload_len = data_size - 4;
+  let payload_end = 8usize.checked_add(payload_len)?;
+  data.get(8..payload_end)
 }
 
 fn emf_record_size(record: &EmfRecord) -> Result<u32> {
@@ -1117,8 +1212,8 @@ fn validate_emf_path_brackets(records: &[EmfRecord]) -> Result<()> {
   }
 }
 
-fn validate_unknown_emf_record(record: &EmfRecord) -> Result<()> {
-  if record.record_kind().is_some() {
+fn validate_unknown_emf_record(record_type: u32) -> Result<()> {
+  if EmfRecordType::from_raw(record_type).is_some() {
     return Err(Error::invalid(
       0,
       "EMF Unknown record requires an unknown RecordType",
@@ -1248,12 +1343,16 @@ pub enum EmfRecordData<'a> {
   SetLayout(EmrSetLayout),
   SetTextJustification(EmrSetTextJustification),
   Comment(EmrComment),
-  Unknown(&'a EmfRecord),
+  Unknown(EmfRecordRef<'a>),
 }
 
 impl<'a> EmfRecordData<'a> {
   pub fn from_record(record: &'a EmfRecord) -> Result<Self> {
-    let data = record.data.as_slice();
+    Self::from_record_ref(record.as_ref())
+  }
+
+  pub fn from_record_ref(record: EmfRecordRef<'a>) -> Result<Self> {
+    let data = record.data;
     Ok(match record.record_kind() {
       Some(EmfRecordType::Header) => Self::Header(EmfHeader::from_record_data(data)?),
       Some(EmfRecordType::Eof) => {
@@ -2014,8 +2113,8 @@ impl<'a> EmfRecordData<'a> {
         value.to_data()?,
       )),
       Self::Unknown(record) => {
-        validate_unknown_emf_record(record)?;
-        Ok((*record).clone())
+        validate_unknown_emf_record(record.record_type)?;
+        Ok(EmfRecordRef::to_owned(*record))
       }
     }
   }
@@ -10144,6 +10243,31 @@ mod tests {
 
     let missing_eof = bytes[..88].to_vec();
     assert!(EmfMetafile::from_bytes(&missing_eof).is_err());
+  }
+
+  #[test]
+  fn emf_borrowed_view_uses_input_storage_and_materializes_explicitly() {
+    let bytes = minimal_emf();
+    let view = EmfMetafileRef::from_bytes(&bytes).unwrap();
+    assert_eq!(view.record_count(), 2);
+    assert!(view.trailing_data().is_empty());
+
+    let mut records = view.records();
+    assert_eq!(records.len(), 2);
+    let header = records.next().unwrap();
+    assert_eq!(header.data.as_ptr(), bytes[8..].as_ptr());
+    assert!(matches!(
+      header.parse_data().unwrap(),
+      EmfRecordData::Header(_)
+    ));
+    assert_eq!(records.len(), 1);
+
+    let owned = view.to_owned();
+    assert_eq!(owned.to_bytes().unwrap(), bytes);
+
+    let mut invalid_late_record = bytes;
+    invalid_late_record[92..96].copy_from_slice(&24u32.to_le_bytes());
+    assert!(EmfMetafileRef::from_bytes(&invalid_late_record).is_err());
   }
 
   #[test]
