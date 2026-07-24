@@ -11,11 +11,11 @@ use crate::emfplus::{
   EmfPlusBitmapPayload, EmfPlusBrushData, EmfPlusBrushRef, EmfPlusDrawArcData,
   EmfPlusDrawImageData, EmfPlusDrawImagePointsData, EmfPlusDrawPointsData,
   EmfPlusDrawRectShapeData, EmfPlusDrawStringData, EmfPlusFillPieData, EmfPlusFillRectShapeData,
-  EmfPlusFontObject, EmfPlusImageData, EmfPlusImageObject, EmfPlusObjectAssembler,
-  EmfPlusObjectData, EmfPlusObjectRecordData, EmfPlusPathObject, EmfPlusPathPointType,
-  EmfPlusPathPointTypeFlags, EmfPlusPathPointTypeValue, EmfPlusPathPointTypes, EmfPlusPenObject,
-  EmfPlusPointData, EmfPlusRecord, EmfPlusRecordData, EmfPlusRecordType,
-  EmfPlusRotateWorldTransformData, EmfPlusScaleWorldTransformData,
+  EmfPlusFontObject, EmfPlusHatchStyle, EmfPlusImageData, EmfPlusImageObject,
+  EmfPlusObjectAssembler, EmfPlusObjectData, EmfPlusObjectRecordData, EmfPlusPathObject,
+  EmfPlusPathPointType, EmfPlusPathPointTypeFlags, EmfPlusPathPointTypeValue,
+  EmfPlusPathPointTypes, EmfPlusPenObject, EmfPlusPointData, EmfPlusRecord, EmfPlusRecordData,
+  EmfPlusRecordType, EmfPlusRotateWorldTransformData, EmfPlusScaleWorldTransformData,
   EmfPlusTranslateWorldTransformData,
 };
 use crate::wmf::{
@@ -680,8 +680,7 @@ impl EmfPlusRenderBrush {
     match self {
       Self::Solid(color) => *color,
       Self::Hatch { fore, back, style } => {
-        let period = 4 + (style % 4) as i32;
-        if (x + y).rem_euclid(period) == 0 {
+        if EmfPlusHatchStyle::from_raw(*style).is_some_and(|style| style.is_foreground(x, y)) {
           *fore
         } else {
           *back
