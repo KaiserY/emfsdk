@@ -1,5 +1,7 @@
 use image::codecs::png::PngEncoder;
 use image::{ColorType, ImageEncoder};
+use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
 use thiserror::Error;
 use ttf_parser::{Face, OutlineBuilder};
 
@@ -16,11 +18,11 @@ use crate::emfplus::{
   EmfPlusPathPointType, EmfPlusPathPointTypeFlags, EmfPlusPathPointTypeValue,
   EmfPlusPathPointTypes, EmfPlusPenObject, EmfPlusPointData, EmfPlusRecord, EmfPlusRecordData,
   EmfPlusRecordType, EmfPlusRotateWorldTransformData, EmfPlusScaleWorldTransformData,
-  EmfPlusTranslateWorldTransformData,
+  EmfPlusTranslateWorldTransformData, EmfPlusUnitType,
 };
 use crate::wmf::{
-  WmfBrushStyle, WmfEscapeData, WmfMetafileRef, WmfPenLineStyle, WmfRecordData,
-  WmfTernaryRasterOperationCode,
+  WmfBrushStyle, WmfEscapeData, WmfExtTextOutOptions, WmfMetafileRef, WmfPenLineStyle,
+  WmfRecordData, WmfTernaryRasterOperationCode, WmfTextAlignmentModeFlags,
 };
 
 // record ids. The byte offsets below are the EMR_STRETCHDIBITS /
@@ -126,18 +128,28 @@ pub struct RenderOptions {
   pub target_width_px: Option<u32>,
   pub target_height_px: Option<u32>,
   pub max_pixels: Option<u32>,
+  /// Caller-specific realization palette for one-bit DIB pattern brushes.
+  ///
+  /// This is intentionally opt-in: color-output GDI playback otherwise
+  /// preserves the DIB's embedded color table.
+  pub monochrome_dib_palette_override: Option<[[u8; 3]; 2]>,
+  /// Box-filter one-pixel checkerboard pattern brushes before a fixed output
+  /// rescales the raster. This matches filtered GDI+/Cairo image playback and
+  /// prevents phase-biased moire in PDF consumers.
+  pub filter_high_frequency_pattern_brushes: bool,
 }
 
 impl RenderOptions {
   fn resolved_canvas_size(self, natural_width: usize, natural_height: usize) -> (usize, usize) {
-    let width = self
-      .target_width_px
-      .map(|value| value.max(1) as usize)
-      .unwrap_or(natural_width.max(1));
-    let height = self
-      .target_height_px
-      .map(|value| value.max(1) as usize)
-      .unwrap_or(natural_height.max(1));
+    let natural_width = natural_width.max(1);
+    let natural_height = natural_height.max(1);
+    // [MS-WMF] 3.1.3 assigns the window to the metafile and the viewport to
+    // the player. A requested output size is therefore the playback viewport,
+    // even when it is larger than the metafile's logical extent.
+    let resolve_axis =
+      |target: Option<u32>, natural: usize| target.map_or(natural, |value| value.max(1) as usize);
+    let width = resolve_axis(self.target_width_px, natural_width);
+    let height = resolve_axis(self.target_height_px, natural_height);
     clamp_canvas_size(width, height, self.max_pixels)
   }
 }
@@ -189,13 +201,26 @@ pub struct MetafileTextRun {
   pub x: f32,
   pub y: f32,
   pub font_size: Option<f32>,
+  pub font_family: Option<String>,
+  pub bold: bool,
+  pub italic: bool,
+  pub width: Option<f32>,
 }
 
 pub fn extract_metafile_text_runs(data: &[u8], content_type: Option<&str>) -> Vec<MetafileTextRun> {
-  if !looks_like_metafile(data, content_type) || !is_emf(data) || data.len() < EMF_HEADER_SIZE {
+  if !looks_like_metafile(data, content_type) {
     return Vec::new();
   }
+  if is_emf(data) && data.len() >= EMF_HEADER_SIZE {
+    return extract_emf_text_runs(data);
+  }
+  if crate::wmf::looks_like_wmf(data) {
+    return extract_wmf_text_runs(data);
+  }
+  Vec::new()
+}
 
+fn extract_emf_text_runs(data: &[u8]) -> Vec<MetafileTextRun> {
   let mut state = match EmfTextState::new(data) {
     Ok(state) => state,
     Err(_) => return Vec::new(),
@@ -299,6 +324,303 @@ pub fn extract_metafile_text_runs(data: &[u8], content_type: Option<&str>) -> Ve
   runs
 }
 
+#[derive(Clone)]
+struct WmfTextSnapshot {
+  window_org_x: i32,
+  window_org_y: i32,
+  window_ext_x: i32,
+  window_ext_y: i32,
+  viewport_org_x: i32,
+  viewport_org_y: i32,
+  viewport_ext_x: i32,
+  viewport_ext_y: i32,
+  current_font_height: i32,
+  current_font_family: Option<String>,
+  current_font_bold: bool,
+  current_font_italic: bool,
+  text_alignment: WmfTextAlignmentModeFlags,
+}
+
+#[derive(Clone, Debug)]
+struct WmfTextFont {
+  height: i32,
+  family: Option<String>,
+  weight: u16,
+  italic: bool,
+}
+
+struct WmfTextState {
+  natural_width: f32,
+  natural_height: f32,
+  window_org_x: i32,
+  window_org_y: i32,
+  window_ext_x: i32,
+  window_ext_y: i32,
+  viewport_org_x: i32,
+  viewport_org_y: i32,
+  viewport_ext_x: i32,
+  viewport_ext_y: i32,
+  objects: Vec<Option<WmfTextFont>>,
+  current_font_height: i32,
+  current_font_family: Option<String>,
+  current_font_bold: bool,
+  current_font_italic: bool,
+  text_alignment: WmfTextAlignmentModeFlags,
+  saved: Vec<WmfTextSnapshot>,
+}
+
+impl WmfTextState {
+  fn new(metafile: &WmfMetafileRef<'_>) -> Self {
+    let (window_org_x, window_org_y, window_ext_x, window_ext_y) = wmf_initial_window(metafile);
+    Self {
+      natural_width: window_ext_x.unsigned_abs().max(1) as f32,
+      natural_height: window_ext_y.unsigned_abs().max(1) as f32,
+      window_org_x,
+      window_org_y,
+      window_ext_x: window_ext_x.abs().max(1),
+      window_ext_y: window_ext_y.abs().max(1),
+      viewport_org_x: 0,
+      viewport_org_y: 0,
+      viewport_ext_x: window_ext_x.abs().max(1),
+      viewport_ext_y: window_ext_y.abs().max(1),
+      objects: vec![None; metafile.header.number_of_objects as usize],
+      current_font_height: 12,
+      current_font_family: None,
+      current_font_bold: false,
+      current_font_italic: false,
+      text_alignment: WmfTextAlignmentModeFlags::empty(),
+      saved: Vec::new(),
+    }
+  }
+
+  fn insert_object(&mut self, font: Option<WmfTextFont>) {
+    let object = font.unwrap_or(WmfTextFont {
+      height: 0,
+      family: None,
+      weight: 400,
+      italic: false,
+    });
+    if let Some(slot) = self.objects.iter_mut().find(|slot| slot.is_none()) {
+      *slot = Some(object);
+    } else {
+      self.objects.push(Some(object));
+    }
+  }
+
+  fn select_object(&mut self, index: u16) {
+    if let Some(Some(font)) = self.objects.get(index as usize)
+      && font.height != 0
+    {
+      self.current_font_height = font.height.abs().max(7);
+      self.current_font_family = font.family.clone();
+      self.current_font_bold = font.weight > 400;
+      self.current_font_italic = font.italic;
+    }
+  }
+
+  fn save(&mut self) {
+    self.saved.push(WmfTextSnapshot {
+      window_org_x: self.window_org_x,
+      window_org_y: self.window_org_y,
+      window_ext_x: self.window_ext_x,
+      window_ext_y: self.window_ext_y,
+      viewport_org_x: self.viewport_org_x,
+      viewport_org_y: self.viewport_org_y,
+      viewport_ext_x: self.viewport_ext_x,
+      viewport_ext_y: self.viewport_ext_y,
+      current_font_height: self.current_font_height,
+      current_font_family: self.current_font_family.clone(),
+      current_font_bold: self.current_font_bold,
+      current_font_italic: self.current_font_italic,
+      text_alignment: self.text_alignment,
+    });
+  }
+
+  fn restore(&mut self) {
+    let Some(snapshot) = self.saved.pop() else {
+      return;
+    };
+    self.window_org_x = snapshot.window_org_x;
+    self.window_org_y = snapshot.window_org_y;
+    self.window_ext_x = snapshot.window_ext_x;
+    self.window_ext_y = snapshot.window_ext_y;
+    self.viewport_org_x = snapshot.viewport_org_x;
+    self.viewport_org_y = snapshot.viewport_org_y;
+    self.viewport_ext_x = snapshot.viewport_ext_x;
+    self.viewport_ext_y = snapshot.viewport_ext_y;
+    self.current_font_height = snapshot.current_font_height;
+    self.current_font_family = snapshot.current_font_family;
+    self.current_font_bold = snapshot.current_font_bold;
+    self.current_font_italic = snapshot.current_font_italic;
+    self.text_alignment = snapshot.text_alignment;
+  }
+
+  fn scale_window(&mut self, value: crate::wmf::WmfScaleExtRecord) {
+    self.window_ext_x = scale_wmf_extent(self.window_ext_x, value.x_num, value.x_denom);
+    self.window_ext_y = scale_wmf_extent(self.window_ext_y, value.y_num, value.y_denom);
+  }
+
+  fn scale_viewport(&mut self, value: crate::wmf::WmfScaleExtRecord) {
+    self.viewport_ext_x = scale_wmf_extent(self.viewport_ext_x, value.x_num, value.x_denom);
+    self.viewport_ext_y = scale_wmf_extent(self.viewport_ext_y, value.y_num, value.y_denom);
+  }
+
+  fn text_run(
+    &self,
+    text: String,
+    x: i16,
+    y: i16,
+    logical_width: Option<f32>,
+  ) -> Option<MetafileTextRun> {
+    if text.is_empty() {
+      return None;
+    }
+    let scale_x = self.viewport_ext_x as f32 / self.window_ext_x as f32;
+    let scale_y = self.viewport_ext_y as f32 / self.window_ext_y as f32;
+    let mapped_x = self.viewport_org_x as f32 + (i32::from(x) - self.window_org_x) as f32 * scale_x;
+    let baseline_y = if self
+      .text_alignment
+      .contains(WmfTextAlignmentModeFlags::BASELINE)
+    {
+      f32::from(y)
+    } else if self
+      .text_alignment
+      .contains(WmfTextAlignmentModeFlags::BOTTOM)
+    {
+      f32::from(y)
+    } else {
+      // TA_TOP aligns the reference point to the top of the character
+      // cell. Without an installed-face dependency here, LOGFONT height is
+      // the bounded GDI-compatible baseline advance.
+      f32::from(y) + self.current_font_height.abs() as f32
+    };
+    let mapped_y = self.viewport_org_y as f32 + (baseline_y - self.window_org_y as f32) * scale_y;
+    Some(MetafileTextRun {
+      text,
+      x: mapped_x / self.natural_width,
+      y: mapped_y / self.natural_height,
+      font_size: Some(self.current_font_height.abs() as f32 * scale_y.abs() / self.natural_height),
+      font_family: self.current_font_family.clone(),
+      bold: self.current_font_bold,
+      italic: self.current_font_italic,
+      width: logical_width
+        .map(|width| width * scale_x.abs() / self.natural_width)
+        .filter(|width| width.is_finite() && *width > 0.0),
+    })
+  }
+}
+
+fn scale_wmf_extent(extent: i32, numerator: i16, denominator: i16) -> i32 {
+  if denominator == 0 {
+    return extent;
+  }
+  ((i64::from(extent) * i64::from(numerator)) / i64::from(denominator))
+    .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+}
+
+fn wmf_text_font(value: &crate::wmf::WmfFontObject) -> WmfTextFont {
+  let face_name = &value.face_name[..usize::from(value.face_name_bytes)];
+  let face_name = &face_name[..face_name
+    .iter()
+    .position(|byte| *byte == 0)
+    .unwrap_or(face_name.len())];
+  let family = crate::string::SdkEncoding::WmfCharset(value.char_set)
+    .decode(face_name)
+    .or_else(|_| crate::string::SdkEncoding::Windows1252.decode(face_name))
+    .ok()
+    .map(|family| family.trim().to_string())
+    .filter(|family| !family.is_empty());
+  WmfTextFont {
+    height: i32::from(value.height),
+    family,
+    weight: value.weight.max(0) as u16,
+    italic: value.italic != 0,
+  }
+}
+
+fn extract_wmf_text_runs(data: &[u8]) -> Vec<MetafileTextRun> {
+  let Ok(metafile) = WmfMetafileRef::from_bytes(data) else {
+    return Vec::new();
+  };
+  let mut state = WmfTextState::new(&metafile);
+  let mut runs = Vec::new();
+  for record in metafile.records() {
+    let Ok(record) = record.parse_data() else {
+      continue;
+    };
+    match record {
+      WmfRecordData::Eof(_) => break,
+      WmfRecordData::SaveDc => state.save(),
+      WmfRecordData::RestoreDc(_) => state.restore(),
+      WmfRecordData::SetWindowOrg(value) => {
+        state.window_org_x = i32::from(value.x);
+        state.window_org_y = i32::from(value.y);
+      }
+      WmfRecordData::SetWindowExt(value) => {
+        state.window_ext_x = i32::from(value.x).abs().max(1);
+        state.window_ext_y = i32::from(value.y).abs().max(1);
+      }
+      WmfRecordData::SetViewportOrg(value) => {
+        state.viewport_org_x = i32::from(value.x);
+        state.viewport_org_y = i32::from(value.y);
+      }
+      WmfRecordData::SetViewportExt(value) => {
+        state.viewport_ext_x = i32::from(value.x);
+        state.viewport_ext_y = i32::from(value.y);
+      }
+      WmfRecordData::OffsetWindowOrg(value) => {
+        state.window_org_x += i32::from(value.x);
+        state.window_org_y += i32::from(value.y);
+      }
+      WmfRecordData::OffsetViewportOrg(value) => {
+        state.viewport_org_x += i32::from(value.x);
+        state.viewport_org_y += i32::from(value.y);
+      }
+      WmfRecordData::ScaleWindowExt(value) => state.scale_window(value),
+      WmfRecordData::ScaleViewportExt(value) => state.scale_viewport(value),
+      WmfRecordData::SetTextAlign(value) => {
+        state.text_alignment = value.text_alignment_flags();
+      }
+      WmfRecordData::CreateFontIndirect(value) => {
+        state.insert_object(Some(wmf_text_font(&value)));
+      }
+      WmfRecordData::CreatePenIndirect(_)
+      | WmfRecordData::CreateBrushIndirect(_)
+      | WmfRecordData::CreatePalette(_)
+      | WmfRecordData::CreatePatternBrush(_)
+      | WmfRecordData::CreateRegion(_)
+      | WmfRecordData::DibCreatePatternBrush(_) => state.insert_object(None),
+      WmfRecordData::SelectObject(value) => state.select_object(value.index),
+      WmfRecordData::DeleteObject(value) => {
+        if let Some(slot) = state.objects.get_mut(value.index as usize) {
+          *slot = None;
+        }
+      }
+      WmfRecordData::TextOut(value) => {
+        if let Some(run) = state.text_run(
+          single_byte_text(&value.string),
+          value.x_start,
+          value.y_start,
+          None,
+        ) {
+          runs.push(run);
+        }
+      }
+      WmfRecordData::ExtTextOut(value) => {
+        let width = (!value.dx.is_empty())
+          .then(|| value.dx.iter().map(|advance| f32::from(*advance)).sum())
+          .filter(|width| *width > 0.0);
+        if let Some(run) = state.text_run(single_byte_text(&value.string), value.x, value.y, width)
+        {
+          runs.push(run);
+        }
+      }
+      _ => {}
+    }
+  }
+  runs
+}
+
 pub fn looks_like_metafile(data: &[u8], content_type: Option<&str>) -> bool {
   matches!(
     content_type,
@@ -391,7 +713,7 @@ fn emf_record_needs_vector_replay(record_type: u32) -> bool {
   )
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct EmfColor {
   r: u8,
   g: u8,
@@ -485,6 +807,7 @@ impl EmfTransform {
 struct EmfPen {
   color: EmfColor,
   width: usize,
+  transform_width: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -575,6 +898,10 @@ impl EmfTextState {
       x: x / self.width.max(1) as f32,
       y: y / self.height.max(1) as f32,
       font_size: font_size.map(|height| height / self.height.max(1) as f32),
+      font_family: None,
+      bold: false,
+      italic: false,
+      width: None,
     })
   }
 }
@@ -716,10 +1043,22 @@ impl EmfPlusRenderBrush {
   }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct RenderFontKey {
+  family: Option<String>,
+  weight: u16,
+  italic: bool,
+}
+
+#[derive(Clone, Debug)]
+struct RenderFontFace {
+  font_data: Arc<[u8]>,
+  face_index: u32,
+}
+
 #[derive(Clone, Debug, Default)]
 struct RenderFontCache {
-  font_data: Option<Vec<u8>>,
-  face_index: u32,
+  faces: HashMap<RenderFontKey, Option<RenderFontFace>>,
 }
 
 #[derive(Clone, Debug)]
@@ -727,33 +1066,72 @@ struct RenderedGlyph {
   contours: Vec<Vec<(f32, f32)>>,
 }
 
+fn render_font_database() -> &'static fontdb::Database {
+  static DATABASE: OnceLock<fontdb::Database> = OnceLock::new();
+  DATABASE.get_or_init(|| {
+    let mut database = fontdb::Database::new();
+    database.load_system_fonts();
+    database
+  })
+}
+
 impl RenderFontCache {
   fn load() -> Self {
-    let mut db = fontdb::Database::new();
-    db.load_system_fonts();
-    let query = fontdb::Query {
-      families: &[fontdb::Family::SansSerif],
-      ..fontdb::Query::default()
+    let _ = render_font_database();
+    Self::default()
+  }
+
+  fn resolve_face(&mut self, font: &WmfTextFont) -> Option<&RenderFontFace> {
+    let key = RenderFontKey {
+      family: font.family.clone(),
+      weight: font.weight,
+      italic: font.italic,
     };
-    let Some(id) = db.query(&query) else {
-      return Self::default();
-    };
-    db.with_face_data(id, |data, face_index| Self {
-      font_data: Some(data.to_vec()),
-      face_index,
-    })
-    .unwrap_or_default()
+    if !self.faces.contains_key(&key) {
+      let mut families = Vec::with_capacity(2);
+      if let Some(family) = key.family.as_deref() {
+        families.push(fontdb::Family::Name(family));
+      }
+      families.push(fontdb::Family::SansSerif);
+      let database = render_font_database();
+      let weight = if key.weight == 0 {
+        fontdb::Weight::NORMAL
+      } else {
+        fontdb::Weight(key.weight.min(1000))
+      };
+      let style = if key.italic {
+        fontdb::Style::Italic
+      } else {
+        fontdb::Style::Normal
+      };
+      let query = fontdb::Query {
+        families: &families,
+        weight,
+        style,
+        ..fontdb::Query::default()
+      };
+      let face = database.query(&query).and_then(|id| {
+        database.with_face_data(id, |data, face_index| RenderFontFace {
+          font_data: Arc::from(data),
+          face_index,
+        })
+      });
+      self.faces.insert(key.clone(), face);
+    }
+    self.faces.get(&key).and_then(Option::as_ref)
   }
 
   fn render_text(
-    &self,
+    &mut self,
+    font: &WmfTextFont,
     text: &str,
     x: f32,
     baseline_y: f32,
     height: f32,
   ) -> Option<Vec<RenderedGlyph>> {
-    let data = self.font_data.as_deref()?;
-    let face = Face::parse(data, self.face_index).ok()?;
+    let face_data = self.resolve_face(font)?;
+    let data = face_data.font_data.as_ref();
+    let face = Face::parse(data, face_data.face_index).ok()?;
     let units_per_em = face.units_per_em() as f32;
     if units_per_em <= 0.0 {
       return None;
@@ -883,6 +1261,7 @@ impl EmfVectorState {
       current_pen: Some(EmfPen {
         color: EmfColor { r: 0, g: 0, b: 0 },
         width: 1,
+        transform_width: false,
       }),
       current_font: None,
       current_pos: EmfPoint { x: 0, y: 0 },
@@ -905,6 +1284,31 @@ impl EmfVectorState {
       self.viewport_org_x as f32 + (x - self.window_org_x as f32) * scale_x,
       self.viewport_org_y as f32 + (y - self.window_org_y as f32) * scale_y,
     )
+  }
+
+  fn resolve_pen(&self, mut pen: EmfPen) -> EmfPen {
+    if !pen.transform_width {
+      return pen;
+    }
+    let width = pen.width as f32;
+    let scale_x = self.viewport_ext_x as f32 / self.window_ext_x.max(1) as f32;
+    let scale_y = self.viewport_ext_y as f32 / self.window_ext_y.max(1) as f32;
+    let x_axis = (
+      width * self.world_transform.m11 * scale_x,
+      width * self.world_transform.m12 * scale_y,
+    );
+    let y_axis = (
+      width * self.world_transform.m21 * scale_x,
+      width * self.world_transform.m22 * scale_y,
+    );
+    let width = x_axis.0.hypot(x_axis.1).max(y_axis.0.hypot(y_axis.1));
+    pen.width = if width.is_finite() {
+      width.round().max(1.0) as usize
+    } else {
+      1
+    };
+    pen.transform_width = false;
+    pen
   }
 
   fn set_pixel(&mut self, x: i32, y: i32, color: EmfColor) {
@@ -1054,12 +1458,22 @@ impl EmfVectorState {
     src: EmfColor,
     rop: WmfTernaryRasterOperationCode,
   ) -> Option<EmfColor> {
+    self.apply_raster_op_with_pattern(x, y, src, self.current_brush.unwrap_or(src), rop)
+  }
+
+  fn apply_raster_op_with_pattern(
+    &self,
+    x: i32,
+    y: i32,
+    src: EmfColor,
+    pattern: EmfColor,
+    rop: WmfTernaryRasterOperationCode,
+  ) -> Option<EmfColor> {
     let dest = self.pixel_color(x, y).unwrap_or(EmfColor {
       r: 255,
       g: 255,
       b: 255,
     });
-    let pattern = self.current_brush.unwrap_or(src);
     let color = match rop {
       WmfTernaryRasterOperationCode::BLACKNESS => EmfColor { r: 0, g: 0, b: 0 },
       WmfTernaryRasterOperationCode::WHITENESS => EmfColor {
@@ -1101,21 +1515,51 @@ impl EmfVectorState {
     })
   }
 
+  fn mapped_vertical_length(&self, logical_height: i32) -> f32 {
+    let height = logical_height.unsigned_abs().max(1) as f32;
+    let scale_x = self.viewport_ext_x as f32 / self.window_ext_x.max(1) as f32;
+    let scale_y = self.viewport_ext_y as f32 / self.window_ext_y.max(1) as f32;
+    let x = height * self.world_transform.m21 * scale_x;
+    let y = height * self.world_transform.m22 * scale_y;
+    x.hypot(y).max(1.0)
+  }
+
   fn draw_text(&mut self, x: i32, y: i32, text: &str, color: EmfColor, height: i32) {
-    let (mapped_x, mapped_y) = self.map_point(EmfPoint { x, y });
-    if let Some(glyphs) = self.font_cache.render_text(
+    self.draw_text_with_font(
+      x,
+      y,
       text,
-      mapped_x,
-      mapped_y,
-      height.unsigned_abs().max(7) as f32,
-    ) {
+      color,
+      &WmfTextFont {
+        height,
+        family: None,
+        weight: 400,
+        italic: false,
+      },
+    );
+  }
+
+  fn draw_text_with_font(
+    &mut self,
+    x: i32,
+    y: i32,
+    text: &str,
+    color: EmfColor,
+    font: &WmfTextFont,
+  ) {
+    let (mapped_x, mapped_y) = self.map_point(EmfPoint { x, y });
+    let height = self.mapped_vertical_length(if font.height == 0 { 12 } else { font.height });
+    if let Some(glyphs) = self
+      .font_cache
+      .render_text(font, text, mapped_x, mapped_y, height)
+    {
       for glyph in glyphs {
         self.fill_device_contours(&glyph.contours, color);
       }
       return;
     }
 
-    let scale = ((height.unsigned_abs() as usize).max(7) / 7).max(1);
+    let scale = ((height as usize).max(7) / 7).max(1);
     let mut cursor_x = mapped_x.round() as i32;
     let baseline_y = mapped_y.round() as i32;
     for ch in text.chars() {
@@ -1474,8 +1918,31 @@ impl EmfVectorState {
   }
 
   fn draw_line(&mut self, a: EmfPoint, b: EmfPoint, pen: EmfPen) {
+    if self.width == 0 || self.height == 0 {
+      return;
+    }
+    let radius = (pen.width.max(1) / 2) as f64;
+    let canvas = (0, 0, self.width as i32, self.height as i32);
+    let (left, top, right, bottom) = self
+      .clip_rect
+      .map_or(canvas, |clip_rect| intersect_rects(canvas, clip_rect));
+    if right <= left || bottom <= top {
+      return;
+    }
     let (x0, y0) = self.map_point(a);
     let (x1, y1) = self.map_point(b);
+    let Some(((x0, y0), (x1, y1))) = clip_line_to_rect(
+      (f64::from(x0), f64::from(y0)),
+      (f64::from(x1), f64::from(y1)),
+      (
+        f64::from(left) - radius,
+        f64::from(top) - radius,
+        f64::from(right - 1) + radius,
+        f64::from(bottom - 1) + radius,
+      ),
+    ) else {
+      return;
+    };
     let mut x0 = x0.round() as i32;
     let mut y0 = y0.round() as i32;
     let x1 = x1.round() as i32;
@@ -1523,6 +1990,23 @@ impl EmfVectorState {
     ];
     self.fill_polygon(&points);
     self.draw_polyline(&points, true);
+  }
+
+  fn fill_solid_rect(&mut self, left: i32, top: i32, right: i32, bottom: i32, color: EmfColor) {
+    let (mapped_left, mapped_top) = self.map_point(EmfPoint { x: left, y: top });
+    let (mapped_right, mapped_bottom) = self.map_point(EmfPoint {
+      x: right,
+      y: bottom,
+    });
+    let left = mapped_left.min(mapped_right).floor().max(0.0) as i32;
+    let top = mapped_top.min(mapped_bottom).floor().max(0.0) as i32;
+    let right = mapped_left.max(mapped_right).ceil().min(self.width as f32) as i32;
+    let bottom = mapped_top.max(mapped_bottom).ceil().min(self.height as f32) as i32;
+    for y in top..bottom {
+      for x in left..right {
+        self.set_pixel(x, y, color);
+      }
+    }
   }
 
   fn fill_ellipse(&mut self, left: i32, top: i32, right: i32, bottom: i32) {
@@ -1587,12 +2071,14 @@ impl EmfVectorState {
             b: 255,
           },
           width: 1,
+          transform_width: false,
         })
       }
       BLACK_PEN => {
         self.current_pen = Some(EmfPen {
           color: EmfColor { r: 0, g: 0, b: 0 },
           width: 1,
+          transform_width: false,
         })
       }
       NULL_PEN => self.current_pen = None,
@@ -1697,6 +2183,7 @@ fn decode_vector_emf_as_png(
             EmfPen {
               color: read_color_ref(data, pos + 24)?,
               width,
+              transform_width: false,
             },
           );
         }
@@ -1716,6 +2203,7 @@ fn decode_vector_emf_as_png(
             EmfPen {
               color: read_color_ref(data, pos + 40)?,
               width,
+              transform_width: false,
             },
           );
         }
@@ -1953,6 +2441,42 @@ struct RasterPixels {
   rgb: Vec<u8>,
 }
 
+fn checkerboard_average_color(image: &RasterPixels) -> Option<EmfColor> {
+  if image.width < 2 || image.height < 2 {
+    return None;
+  }
+  let color_at = |x: usize, y: usize| {
+    let offset = (y * image.width + x) * RGB_BYTES_PER_PIXEL;
+    EmfColor {
+      r: image.rgb[offset],
+      g: image.rgb[offset + 1],
+      b: image.rgb[offset + 2],
+    }
+  };
+  let first = color_at(0, 0);
+  let second = color_at(1, 0);
+  if first == second {
+    return None;
+  }
+  for y in 0..image.height {
+    for x in 0..image.width {
+      let expected = if (x + y).is_multiple_of(2) {
+        first
+      } else {
+        second
+      };
+      if color_at(x, y) != expected {
+        return None;
+      }
+    }
+  }
+  Some(EmfColor {
+    r: ((u16::from(first.r) + u16::from(second.r)) / 2) as u8,
+    g: ((u16::from(first.g) + u16::from(second.g)) / 2) as u8,
+    b: ((u16::from(first.b) + u16::from(second.b)) / 2) as u8,
+  })
+}
+
 #[derive(Clone, Copy, Debug)]
 struct EmfBitmapDrawTarget {
   dest_x: i32,
@@ -1962,7 +2486,7 @@ struct EmfBitmapDrawTarget {
   raster_operation: Option<WmfTernaryRasterOperationCode>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct WmfSavedState {
   window_org_x: i32,
   window_org_y: i32,
@@ -1976,14 +2500,25 @@ struct WmfSavedState {
   current_pen: Option<EmfPen>,
   current_pos: EmfPoint,
   text_color: EmfColor,
-  current_font_height: i32,
+  background_color: EmfColor,
+  current_pattern_brush: Option<WmfPatternBrush>,
+  current_font: WmfTextFont,
+  text_alignment: WmfTextAlignmentModeFlags,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
+struct WmfPatternBrush {
+  image: RasterPixels,
+  use_dc_colors: bool,
+  filtered_color: Option<EmfColor>,
+}
+
+#[derive(Clone, Debug)]
 enum WmfRenderObject {
   Pen(Option<EmfPen>),
   Brush(Option<EmfColor>),
-  Font(i32),
+  PatternBrush(WmfPatternBrush),
+  Font(WmfTextFont),
   Unsupported,
 }
 
@@ -1992,7 +2527,10 @@ struct WmfRenderState {
   objects: Vec<Option<WmfRenderObject>>,
   current_pos: EmfPoint,
   text_color: EmfColor,
-  current_font_height: i32,
+  background_color: EmfColor,
+  current_pattern_brush: Option<WmfPatternBrush>,
+  current_font: WmfTextFont,
+  text_alignment: WmfTextAlignmentModeFlags,
   saved: Vec<WmfSavedState>,
 }
 
@@ -2028,6 +2566,7 @@ impl WmfRenderState {
         current_pen: Some(EmfPen {
           color: EmfColor { r: 0, g: 0, b: 0 },
           width: 1,
+          transform_width: false,
         }),
         current_font: None,
         current_pos: EmfPoint { x: 0, y: 0 },
@@ -2043,7 +2582,19 @@ impl WmfRenderState {
       objects: vec![None; object_count],
       current_pos: EmfPoint { x: 0, y: 0 },
       text_color: EmfColor { r: 0, g: 0, b: 0 },
-      current_font_height: 12,
+      background_color: EmfColor {
+        r: 255,
+        g: 255,
+        b: 255,
+      },
+      current_pattern_brush: None,
+      current_font: WmfTextFont {
+        height: 12,
+        family: None,
+        weight: 400,
+        italic: false,
+      },
+      text_alignment: WmfTextAlignmentModeFlags::empty(),
       saved: Vec::new(),
     })
   }
@@ -2070,7 +2621,10 @@ impl WmfRenderState {
       current_pen: self.canvas.current_pen,
       current_pos: self.current_pos,
       text_color: self.text_color,
-      current_font_height: self.current_font_height,
+      background_color: self.background_color,
+      current_pattern_brush: self.current_pattern_brush.clone(),
+      current_font: self.current_font.clone(),
+      text_alignment: self.text_alignment,
     });
   }
 
@@ -2090,17 +2644,26 @@ impl WmfRenderState {
     self.canvas.current_pen = saved.current_pen;
     self.current_pos = saved.current_pos;
     self.text_color = saved.text_color;
-    self.current_font_height = saved.current_font_height;
+    self.background_color = saved.background_color;
+    self.current_pattern_brush = saved.current_pattern_brush;
+    self.current_font = saved.current_font;
+    self.text_alignment = saved.text_alignment;
   }
 
   fn select_object(&mut self, index: u16) {
-    let Some(Some(object)) = self.objects.get(index as usize).copied() else {
+    let Some(Some(object)) = self.objects.get(index as usize).cloned() else {
       return;
     };
     match object {
       WmfRenderObject::Pen(pen) => self.canvas.current_pen = pen,
-      WmfRenderObject::Brush(brush) => self.canvas.current_brush = brush,
-      WmfRenderObject::Font(height) => self.current_font_height = height.abs().max(7),
+      WmfRenderObject::Brush(brush) => {
+        self.canvas.current_brush = brush;
+        self.current_pattern_brush = None;
+      }
+      WmfRenderObject::PatternBrush(pattern) => {
+        self.current_pattern_brush = Some(pattern);
+      }
+      WmfRenderObject::Font(font) => self.current_font = font,
       WmfRenderObject::Unsupported => {}
     }
   }
@@ -2109,6 +2672,80 @@ impl WmfRenderState {
     if let Some(slot) = self.objects.get_mut(index as usize) {
       *slot = None;
     }
+  }
+
+  fn text_baseline_y(&self, reference_y: i16) -> i32 {
+    let reference_y = i32::from(reference_y);
+    if self
+      .text_alignment
+      .contains(WmfTextAlignmentModeFlags::BASELINE)
+      || self
+        .text_alignment
+        .contains(WmfTextAlignmentModeFlags::BOTTOM)
+    {
+      reference_y
+    } else {
+      // [MS-WMF] 2.1.2.3 defines the all-zero vertical mode as TA_TOP.
+      // Our outline painter takes a baseline, so advance by the logical
+      // character-cell height before applying the device mapping.
+      reference_y.saturating_add(self.current_font.height.unsigned_abs() as i32)
+    }
+  }
+
+  fn fill_pattern_rect(
+    &mut self,
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+    rop: WmfTernaryRasterOperationCode,
+  ) -> bool {
+    let Some(pattern) = self.current_pattern_brush.as_ref() else {
+      return false;
+    };
+    let (mapped_left, mapped_top) = self.canvas.map_point(EmfPoint { x: left, y: top });
+    let (mapped_right, mapped_bottom) = self.canvas.map_point(EmfPoint {
+      x: right,
+      y: bottom,
+    });
+    let left = mapped_left.min(mapped_right).round().max(0.0) as i32;
+    let top = mapped_top.min(mapped_bottom).round().max(0.0) as i32;
+    let right = mapped_left
+      .max(mapped_right)
+      .round()
+      .min(self.canvas.width as f32) as i32;
+    let bottom = mapped_top
+      .max(mapped_bottom)
+      .round()
+      .min(self.canvas.height as f32) as i32;
+    for y in top..bottom {
+      for x in left..right {
+        let pattern_x = x.rem_euclid(pattern.image.width as i32) as usize;
+        let pattern_y = y.rem_euclid(pattern.image.height as i32) as usize;
+        let offset = (pattern_y * pattern.image.width + pattern_x) * RGB_BYTES_PER_PIXEL;
+        let stored = pattern.filtered_color.unwrap_or(EmfColor {
+          r: pattern.image.rgb[offset],
+          g: pattern.image.rgb[offset + 1],
+          b: pattern.image.rgb[offset + 2],
+        });
+        let brush = if pattern.use_dc_colors {
+          if u16::from(stored.r) + u16::from(stored.g) + u16::from(stored.b) < 3 * 128 {
+            self.text_color
+          } else {
+            self.background_color
+          }
+        } else {
+          stored
+        };
+        if let Some(color) = self
+          .canvas
+          .apply_raster_op_with_pattern(x, y, brush, brush, rop)
+        {
+          self.canvas.set_pixel(x, y, color);
+        }
+      }
+    }
+    true
   }
 }
 
@@ -2124,7 +2761,13 @@ fn decode_wmf_as_raster(
   let mut state = WmfRenderState::new(&metafile, options)?;
 
   for record in metafile.records() {
-    let parsed = record.parse_data().map_err(|err| err.to_string())?;
+    // Compatibility-mode parsing preserves producer-specific and malformed
+    // records so later valid drawing commands remain usable. Rendering must
+    // follow the same recovery rule: one unsupported device escape must not
+    // discard the entire preview that was already replayed.
+    let Ok(parsed) = record.parse_data() else {
+      continue;
+    };
     match parsed {
       WmfRecordData::Eof(_) => break,
       WmfRecordData::SaveDc => state.save_dc(),
@@ -2157,6 +2800,12 @@ fn decode_wmf_as_raster(
       WmfRecordData::SetTextColor(value) => {
         state.text_color = color_ref_to_emf(value.color);
       }
+      WmfRecordData::SetTextAlign(value) => {
+        state.text_alignment = value.text_alignment_flags();
+      }
+      WmfRecordData::SetBkColor(value) => {
+        state.background_color = color_ref_to_emf(value.color);
+      }
       WmfRecordData::OffsetWindowOrg(value) => {
         state.canvas.window_org_x += i32::from(value.x);
         state.canvas.window_org_y += i32::from(value.y);
@@ -2173,6 +2822,7 @@ fn decode_wmf_as_raster(
           Some(EmfPen {
             color: color_ref_to_emf(value.pen.color_ref),
             width: i32::from(value.pen.width.x).unsigned_abs().max(1) as usize,
+            transform_width: false,
           })
         };
         state.insert_object(WmfRenderObject::Pen(pen));
@@ -2185,12 +2835,64 @@ fn decode_wmf_as_raster(
         state.insert_object(WmfRenderObject::Brush(brush));
       }
       WmfRecordData::CreateFontIndirect(value) => {
-        state.insert_object(WmfRenderObject::Font(i32::from(value.height)));
+        state.insert_object(WmfRenderObject::Font(wmf_text_font(&value)));
       }
-      WmfRecordData::CreatePalette(_)
-      | WmfRecordData::CreatePatternBrush(_)
-      | WmfRecordData::CreateRegion(_)
-      | WmfRecordData::DibCreatePatternBrush(_) => {
+      WmfRecordData::CreatePatternBrush(value) => {
+        let pattern = value
+          .bitmap16()
+          .ok()
+          .and_then(|bitmap| bitmap.to_bytes().ok())
+          .and_then(|bytes| bitmap16_to_rgb(&bytes).ok().flatten())
+          .map(|image| {
+            let filtered_color = options
+              .filter_high_frequency_pattern_brushes
+              .then(|| checkerboard_average_color(&image))
+              .flatten();
+            WmfPatternBrush {
+              image,
+              use_dc_colors: value.bitmap.bits_pixel == 1,
+              filtered_color,
+            }
+          });
+        state.insert_object(
+          pattern
+            .map(WmfRenderObject::PatternBrush)
+            .unwrap_or(WmfRenderObject::Unsupported),
+        );
+      }
+      WmfRecordData::DibCreatePatternBrush(value) => {
+        let pattern = value
+          .color_usage_kind()
+          .and_then(|usage| {
+            packed_dib_to_rgb_with_palette_override(
+              &value.target,
+              usage,
+              options.monochrome_dib_palette_override,
+            )
+            .ok()
+            .flatten()
+          })
+          .map(|image| {
+            let filtered_color = options
+              .filter_high_frequency_pattern_brushes
+              .then(|| checkerboard_average_color(&image))
+              .flatten();
+            WmfPatternBrush {
+              image,
+              // DIB pattern brushes retain their color table on a color
+              // playback surface. The DC text/background substitution applies
+              // only when GDI realizes the brush into a monochrome target.
+              use_dc_colors: false,
+              filtered_color,
+            }
+          });
+        state.insert_object(
+          pattern
+            .map(WmfRenderObject::PatternBrush)
+            .unwrap_or(WmfRenderObject::Unsupported),
+        );
+      }
+      WmfRecordData::CreatePalette(_) | WmfRecordData::CreateRegion(_) => {
         state.insert_object(WmfRenderObject::Unsupported);
       }
       WmfRecordData::SelectObject(value) => state.select_object(value.index),
@@ -2305,32 +3007,81 @@ fn decode_wmf_as_raster(
       ),
       WmfRecordData::TextOut(value) => {
         let text = single_byte_text(&value.string);
-        state.canvas.draw_text(
+        let baseline_y = state.text_baseline_y(value.y_start);
+        state.canvas.draw_text_with_font(
           i32::from(value.x_start),
-          i32::from(value.y_start),
+          baseline_y,
           &text,
           state.text_color,
-          state.current_font_height,
+          &state.current_font,
         );
       }
       WmfRecordData::ExtTextOut(value) => {
+        if let Some(rectangle) = value.rectangle
+          && value.options.contains(WmfExtTextOutOptions::OPAQUE)
+        {
+          // [MS-WMF] 2.1.2.2: ETO_OPAQUE fills the application-defined
+          // rectangle with the playback DC's current background color.
+          state.canvas.fill_solid_rect(
+            i32::from(rectangle.left),
+            i32::from(rectangle.top),
+            i32::from(rectangle.right),
+            i32::from(rectangle.bottom),
+            state.background_color,
+          );
+        }
+
         let text = single_byte_text(&value.string);
-        state.canvas.draw_text(
+        let baseline_y = state.text_baseline_y(value.y);
+        let saved_clip = value
+          .rectangle
+          .filter(|_| value.options.contains(WmfExtTextOutOptions::CLIPPED))
+          .map(|rectangle| {
+            let saved = (state.canvas.clip_rect, state.canvas.clip_mask.clone());
+            state.canvas.set_clip_rect_device(
+              {
+                let (left, top) = state.canvas.map_point(EmfPoint {
+                  x: i32::from(rectangle.left),
+                  y: i32::from(rectangle.top),
+                });
+                let (right, bottom) = state.canvas.map_point(EmfPoint {
+                  x: i32::from(rectangle.right),
+                  y: i32::from(rectangle.bottom),
+                });
+                (
+                  left.min(right).floor() as i32,
+                  top.min(bottom).floor() as i32,
+                  left.max(right).ceil() as i32,
+                  top.max(bottom).ceil() as i32,
+                )
+              },
+              1,
+            );
+            saved
+          });
+        state.canvas.draw_text_with_font(
           i32::from(value.x),
-          i32::from(value.y),
+          baseline_y,
           &text,
           state.text_color,
-          state.current_font_height,
+          &state.current_font,
         );
+        if let Some((clip_rect, clip_mask)) = saved_clip {
+          state.canvas.clip_rect = clip_rect;
+          state.canvas.clip_mask = clip_mask;
+        }
       }
       WmfRecordData::PatBlt(value) => {
-        state.canvas.fill_rect_with_rop(
-          i32::from(value.x_left),
-          i32::from(value.y_left),
-          i32::from(value.x_left) + i32::from(value.width),
-          i32::from(value.y_left) + i32::from(value.height),
-          value.raster_operation_code(),
-        );
+        let left = i32::from(value.x_left);
+        let top = i32::from(value.y_left);
+        let right = left + i32::from(value.width);
+        let bottom = top + i32::from(value.height);
+        let rop = value.raster_operation_code();
+        if !state.fill_pattern_rect(left, top, right, bottom, rop) {
+          state
+            .canvas
+            .fill_rect_with_rop(left, top, right, bottom, rop);
+        }
       }
       WmfRecordData::StretchDib(value) => {
         if let Some(color_usage) = value.color_usage_kind()
@@ -3012,6 +3763,7 @@ fn emf_plus_pen_object(pen: &EmfPlusPenObject) -> Option<EmfPen> {
   Some(EmfPen {
     color: emf_plus_brush_object(brush)?.representative_color(),
     width: payload.pen_data.pen_width.round().max(1.0) as usize,
+    transform_width: payload.pen_data.pen_unit_kind() == Some(EmfPlusUnitType::World),
   })
 }
 
@@ -3035,10 +3787,11 @@ fn emf_plus_brush_ref_to_color(brush: EmfPlusBrushRef, state: &EmfVectorState) -
 
 fn emf_plus_pen(id: u8, state: &EmfVectorState) -> Option<EmfPen> {
   match state.emf_plus_objects.get(id as usize)? {
-    Some(EmfPlusRenderObject::Pen(pen)) => *pen,
+    Some(EmfPlusRenderObject::Pen(pen)) => pen.map(|pen| state.resolve_pen(pen)),
     Some(EmfPlusRenderObject::Brush(Some(brush))) => Some(EmfPen {
       color: brush.representative_color(),
       width: 1,
+      transform_width: false,
     }),
     _ => None,
   }
@@ -3834,14 +4587,23 @@ fn packed_dib_to_rgb(
   data: &[u8],
   color_usage: DibColorUsage,
 ) -> Result<Option<RasterPixels>, String> {
+  packed_dib_to_rgb_with_palette_override(data, color_usage, None)
+}
+
+fn packed_dib_to_rgb_with_palette_override(
+  data: &[u8],
+  color_usage: DibColorUsage,
+  monochrome_palette_override: Option<[[u8; 3]; 2]>,
+) -> Result<Option<RasterPixels>, String> {
   let dib =
     DeviceIndependentBitmap::from_packed_slice(data, color_usage).map_err(|err| err.to_string())?;
-  device_independent_bitmap_to_rgb(&dib, color_usage)
+  device_independent_bitmap_to_rgb(&dib, color_usage, monochrome_palette_override)
 }
 
 fn device_independent_bitmap_to_rgb(
   dib: &DeviceIndependentBitmap,
   color_usage: DibColorUsage,
+  monochrome_palette_override: Option<[[u8; 3]; 2]>,
 ) -> Result<Option<RasterPixels>, String> {
   match dib.info.header.compression_kind() {
     Some(BitmapCompression::Png) => {
@@ -3856,9 +4618,14 @@ fn device_independent_bitmap_to_rgb(
       }))
     }
     Some(BitmapCompression::Jpeg) => Ok(None),
-    Some(BitmapCompression::Rgb) => {
-      dib_rgb_bits_to_rgb(&dib.info.header, &dib.bits, &dib.info, color_usage).map(Some)
-    }
+    Some(BitmapCompression::Rgb) => dib_rgb_bits_to_rgb(
+      &dib.info.header,
+      &dib.bits,
+      &dib.info,
+      color_usage,
+      monochrome_palette_override,
+    )
+    .map(Some),
     Some(BitmapCompression::Bitfields) => {
       dib_bitfields_to_rgb(&dib.info.header, &dib.bits, &dib.info).map(Some)
     }
@@ -3874,6 +4641,7 @@ fn dib_rgb_bits_to_rgb(
   bits: &[u8],
   info: &crate::DibBitmapInfo,
   color_usage: DibColorUsage,
+  monochrome_palette_override: Option<[[u8; 3]; 2]>,
 ) -> Result<RasterPixels, String> {
   let width = header.width();
   let height = header.height();
@@ -3895,7 +4663,7 @@ fn dib_rgb_bits_to_rgb(
       bits.len()
     ));
   }
-  let palette = match bit_count {
+  let mut palette = match bit_count {
     1 | 4 | 8 => match info
       .parse_color_table(color_usage)
       .map_err(|err| err.to_string())?
@@ -3905,6 +4673,18 @@ fn dib_rgb_bits_to_rgb(
     },
     _ => Vec::new(),
   };
+  if bit_count == 1
+    && let Some(colors) = monochrome_palette_override
+  {
+    palette = colors
+      .map(|[red, green, blue]| crate::RgbQuad {
+        blue,
+        green,
+        red,
+        reserved: 0,
+      })
+      .to_vec();
+  }
   let mut rgb = vec![0u8; width * height_abs * RGB_BYTES_PER_PIXEL];
   for row in 0..height_abs {
     let src_row = if header.is_top_down() {
@@ -4414,6 +5194,55 @@ fn intersect_rects(
   (x1, y1, x2, y2)
 }
 
+fn clip_line_to_rect(
+  start: (f64, f64),
+  end: (f64, f64),
+  rect: (f64, f64, f64, f64),
+) -> Option<((f64, f64), (f64, f64))> {
+  if ![
+    start.0, start.1, end.0, end.1, rect.0, rect.1, rect.2, rect.3,
+  ]
+  .iter()
+  .all(|value| value.is_finite())
+    || rect.2 < rect.0
+    || rect.3 < rect.1
+  {
+    return None;
+  }
+
+  let dx = end.0 - start.0;
+  let dy = end.1 - start.1;
+  let mut first: f64 = 0.0;
+  let mut last: f64 = 1.0;
+  for (direction, distance) in [
+    (-dx, start.0 - rect.0),
+    (dx, rect.2 - start.0),
+    (-dy, start.1 - rect.1),
+    (dy, rect.3 - start.1),
+  ] {
+    if direction == 0.0 {
+      if distance < 0.0 {
+        return None;
+      }
+      continue;
+    }
+    let ratio = distance / direction;
+    if direction < 0.0 {
+      first = first.max(ratio);
+    } else {
+      last = last.min(ratio);
+    }
+    if first > last {
+      return None;
+    }
+  }
+
+  Some((
+    (start.0 + first * dx, start.1 + first * dy),
+    (start.0 + last * dx, start.1 + last * dy),
+  ))
+}
+
 fn read_poly_polygons_i32(
   data: &[u8],
   record_offset: usize,
@@ -4669,9 +5498,15 @@ fn read_f32(data: &[u8], offset: usize) -> Result<f32, String> {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::wmf::{
+    WmfColorRecord, WmfDibCreatePatternBrushRecord, WmfExtTextOutRecord, WmfMetafileType,
+    WmfMetafileVersion, WmfObjectIndexRecord, WmfPatBltRecord, WmfPointRecord, WmfRectObject,
+    WmfSetPixelRecord,
+  };
   use crate::{
     BitmapSourceBounds, DibColorUsage, EMR_EOF, EMR_HEADER, EmfMetafile, EmfRecord, EmfRecordData,
-    EmrBitmapBuffer, EmrStretchDiBits, RectL, SdkEnumValue, SizeL,
+    EmrBitmapBuffer, EmrStretchDiBits, RectL, SdkEnumValue, SizeL, WmfHeader, WmfMetafile,
+    WmfRecord, WmfRecordData,
   };
 
   fn minimal_header_record() -> EmfRecord {
@@ -4700,6 +5535,348 @@ mod tests {
     bytes.extend_from_slice(&0u32.to_le_bytes());
     bytes.extend_from_slice(&0u32.to_le_bytes());
     bytes
+  }
+
+  #[test]
+  fn line_clip_limits_huge_off_canvas_segments() {
+    let clipped = clip_line_to_rect(
+      (-1_000_000_000.0, 5.0),
+      (1_000_000_000.0, 5.0),
+      (0.0, 0.0, 9.0, 9.0),
+    )
+    .expect("horizontal line crosses the canvas");
+    assert!((clipped.0.0 - 0.0).abs() < 0.001);
+    assert!((clipped.0.1 - 5.0).abs() < 0.001);
+    assert!((clipped.1.0 - 9.0).abs() < 0.001);
+    assert!((clipped.1.1 - 5.0).abs() < 0.001);
+
+    assert_eq!(
+      clip_line_to_rect(
+        (-1_000_000_000.0, -5.0),
+        (1_000_000_000.0, -5.0),
+        (0.0, 0.0, 9.0, 9.0),
+      ),
+      None
+    );
+  }
+
+  #[test]
+  fn render_target_defines_the_playback_viewport_in_both_directions() {
+    assert_eq!(
+      RenderOptions {
+        target_width_px: Some(200),
+        target_height_px: Some(100),
+        max_pixels: None,
+        monochrome_dib_palette_override: None,
+        filter_high_frequency_pattern_brushes: false,
+      }
+      .resolved_canvas_size(400, 300),
+      (200, 100)
+    );
+    assert_eq!(
+      RenderOptions {
+        target_width_px: Some(400),
+        target_height_px: Some(300),
+        max_pixels: None,
+        monochrome_dib_palette_override: None,
+        filter_high_frequency_pattern_brushes: false,
+      }
+      .resolved_canvas_size(76, 76),
+      (400, 300)
+    );
+  }
+
+  #[test]
+  fn wmf_ext_text_out_opaque_fills_background_and_restores_temporary_clip() {
+    let records = vec![
+      WmfRecordData::SetWindowExt(WmfPointRecord { x: 8, y: 8 })
+        .to_record()
+        .unwrap(),
+      WmfRecordData::SetBkColor(WmfColorRecord {
+        color: crate::ColorRef {
+          red: 0,
+          green: 192,
+          blue: 0,
+          reserved: 0,
+        },
+      })
+      .to_record()
+      .unwrap(),
+      WmfRecordData::ExtTextOut(WmfExtTextOutRecord {
+        y: 1,
+        x: 1,
+        string_length: 0,
+        options: WmfExtTextOutOptions::OPAQUE | WmfExtTextOutOptions::CLIPPED,
+        rectangle: Some(WmfRectObject {
+          left: 1,
+          top: 1,
+          right: 7,
+          bottom: 7,
+        }),
+        string: Vec::new(),
+        string_padding: Vec::new(),
+        dx: Vec::new(),
+        trailing_data: Vec::new(),
+      })
+      .to_record()
+      .unwrap(),
+      WmfRecordData::SetPixel(WmfSetPixelRecord {
+        color: crate::ColorRef {
+          red: 255,
+          green: 0,
+          blue: 0,
+          reserved: 0,
+        },
+        y: 0,
+        x: 0,
+      })
+      .to_record()
+      .unwrap(),
+      WmfRecordData::Eof(crate::wmf::WmfEofRecord::default())
+        .to_record()
+        .unwrap(),
+    ];
+    let metafile = WmfMetafile {
+      placeable_header: None,
+      header: WmfHeader {
+        metafile_type: WmfMetafileType::Memory.raw(),
+        header_size_words: 9,
+        version: WmfMetafileVersion::Version300.raw(),
+        file_size_words: 0,
+        number_of_objects: 0,
+        max_record_words: 0,
+        number_of_parameters: 0,
+      },
+      records,
+      trailing_data: Vec::new(),
+    };
+
+    let decoded = decode_metafile_as_raster(&metafile.to_bytes().unwrap(), Some("image/x-wmf"))
+      .unwrap()
+      .unwrap();
+    let image = image::load_from_memory_with_format(&decoded.data, image::ImageFormat::Png)
+      .unwrap()
+      .to_rgb8();
+
+    assert_eq!(image.get_pixel(4, 4).0, [0, 192, 0]);
+    assert_eq!(image.get_pixel(0, 0).0, [255, 0, 0]);
+    assert_eq!(image.get_pixel(7, 7).0, [255, 255, 255]);
+  }
+
+  #[test]
+  fn wmf_rendering_keeps_valid_output_around_an_unparseable_record() {
+    let records = vec![
+      WmfRecordData::SetWindowExt(WmfPointRecord { x: 2, y: 2 })
+        .to_record()
+        .unwrap(),
+      WmfRecordData::SetPixel(WmfSetPixelRecord {
+        color: crate::ColorRef {
+          red: 255,
+          green: 0,
+          blue: 0,
+          reserved: 0,
+        },
+        x: 0,
+        y: 0,
+      })
+      .to_record()
+      .unwrap(),
+      // META_ESCAPE with an unsupported EscapeFunction. This is a valid raw
+      // WMF record retained by compatibility parsing, but has no typed form.
+      WmfRecord::new(crate::wmf::WmfRecordFunction::Escape.raw(), vec![0; 4]),
+      WmfRecordData::Eof(crate::wmf::WmfEofRecord::default())
+        .to_record()
+        .unwrap(),
+    ];
+    let metafile = WmfMetafile {
+      placeable_header: None,
+      header: WmfHeader {
+        metafile_type: WmfMetafileType::Memory.raw(),
+        header_size_words: 9,
+        version: WmfMetafileVersion::Version300.raw(),
+        file_size_words: 29,
+        number_of_objects: 0,
+        max_record_words: 7,
+        number_of_parameters: 0,
+      },
+      records,
+      trailing_data: Vec::new(),
+    };
+
+    let bytes = metafile.to_bytes().unwrap();
+    let decoded = decode_metafile_as_raster(&bytes, Some("image/x-wmf"))
+      .unwrap()
+      .unwrap();
+    let image = image::load_from_memory_with_format(&decoded.data, image::ImageFormat::Png)
+      .unwrap()
+      .to_rgb8();
+
+    assert_eq!(image.get_pixel(0, 0).0, [255, 0, 0]);
+  }
+
+  #[test]
+  fn wmf_dib_pattern_brush_preserves_its_color_table_on_color_output() {
+    let mut pattern = bitmap_info(8, 8, 1, 0);
+    pattern.extend_from_slice(&[0, 0, 0, 0, 255, 255, 255, 0]);
+    for row in 0..8 {
+      pattern.extend_from_slice(&[if row % 2 == 0 { 0xAA } else { 0x55 }, 0, 0, 0]);
+    }
+    let records = vec![
+      WmfRecordData::SetWindowExt(WmfPointRecord { x: 8, y: 8 })
+        .to_record()
+        .unwrap(),
+      WmfRecordData::SetBkColor(WmfColorRecord {
+        color: crate::ColorRef {
+          red: 255,
+          green: 128,
+          blue: 255,
+          reserved: 0,
+        },
+      })
+      .to_record()
+      .unwrap(),
+      WmfRecordData::SetTextColor(WmfColorRecord {
+        color: crate::ColorRef {
+          red: 255,
+          green: 255,
+          blue: 255,
+          reserved: 0,
+        },
+      })
+      .to_record()
+      .unwrap(),
+      WmfRecordData::DibCreatePatternBrush(WmfDibCreatePatternBrushRecord {
+        style: WmfBrushStyle::Pattern.raw(),
+        color_usage: DibColorUsage::RgbColors.wmf_raw(),
+        target: pattern,
+      })
+      .to_record()
+      .unwrap(),
+      WmfRecordData::SelectObject(WmfObjectIndexRecord { index: 0 })
+        .to_record()
+        .unwrap(),
+      WmfRecordData::PatBlt(WmfPatBltRecord {
+        raster_operation: 0x00F0_0021,
+        height: 8,
+        width: 8,
+        y_left: 0,
+        x_left: 0,
+      })
+      .to_record()
+      .unwrap(),
+      WmfRecordData::Eof(crate::wmf::WmfEofRecord::default())
+        .to_record()
+        .unwrap(),
+    ];
+    let metafile = WmfMetafile {
+      placeable_header: None,
+      header: WmfHeader {
+        metafile_type: WmfMetafileType::Memory.raw(),
+        header_size_words: 9,
+        version: WmfMetafileVersion::Version300.raw(),
+        file_size_words: 0,
+        number_of_objects: 1,
+        max_record_words: 0,
+        number_of_parameters: 0,
+      },
+      records,
+      trailing_data: Vec::new(),
+    };
+
+    let bytes = metafile.to_bytes().unwrap();
+    let decoded = decode_metafile_as_raster(&bytes, Some("image/x-wmf"))
+      .unwrap()
+      .unwrap();
+    let image = image::load_from_memory_with_format(&decoded.data, image::ImageFormat::Png)
+      .unwrap()
+      .to_rgb8();
+
+    assert!(
+      image.pixels().any(|pixel| pixel.0 == [0, 0, 0]),
+      "the first DIB palette entry remains black"
+    );
+    assert!(
+      image.pixels().any(|pixel| pixel.0 == [255, 255, 255]),
+      "the second DIB palette entry remains white"
+    );
+    assert!(
+      !image.pixels().any(|pixel| pixel.0 == [255, 128, 255]),
+      "color output does not substitute the DC background color"
+    );
+
+    let decoded = decode_metafile_as_raster_with_options(
+      &bytes,
+      Some("image/x-wmf"),
+      RenderOptions {
+        monochrome_dib_palette_override: Some([[255, 128, 255], [255, 255, 255]]),
+        ..RenderOptions::default()
+      },
+    )
+    .unwrap()
+    .unwrap();
+    let image = image::load_from_memory_with_format(&decoded.data, image::ImageFormat::Png)
+      .unwrap()
+      .to_rgb8();
+    assert!(
+      image.pixels().any(|pixel| pixel.0 == [255, 128, 255]),
+      "the opt-in realization palette replaces entry zero"
+    );
+    assert!(
+      image.pixels().any(|pixel| pixel.0 == [255, 255, 255]),
+      "the opt-in realization palette preserves entry one"
+    );
+    assert!(
+      !image.pixels().any(|pixel| pixel.0 == [0, 0, 0]),
+      "the embedded black entry is replaced only for this caller"
+    );
+
+    let decoded = decode_metafile_as_raster_with_options(
+      &bytes,
+      Some("image/x-wmf"),
+      RenderOptions {
+        monochrome_dib_palette_override: Some([[255, 128, 255], [255, 255, 255]]),
+        filter_high_frequency_pattern_brushes: true,
+        ..RenderOptions::default()
+      },
+    )
+    .unwrap()
+    .unwrap();
+    let image = image::load_from_memory_with_format(&decoded.data, image::ImageFormat::Png)
+      .unwrap()
+      .to_rgb8();
+    assert!(
+      image.pixels().all(|pixel| pixel.0 == [255, 191, 255]),
+      "fixed output box-filters a one-pixel checkerboard before later rescaling"
+    );
+  }
+
+  #[test]
+  fn world_unit_pen_width_uses_the_active_device_transform() {
+    let mut data = vec![0; EMF_HEADER_SIZE];
+    data[16..20].copy_from_slice(&999i32.to_le_bytes());
+    data[20..24].copy_from_slice(&999i32.to_le_bytes());
+    let mut state = EmfVectorState::new_with_options(
+      &data,
+      RenderOptions {
+        target_width_px: Some(100),
+        target_height_px: Some(100),
+        max_pixels: None,
+        monochrome_dib_palette_override: None,
+        filter_high_frequency_pattern_brushes: false,
+      },
+    )
+    .expect("minimal EMF bounds");
+    state.world_transform.m11 = 0.5;
+    state.world_transform.m22 = 0.5;
+
+    let pen = state.resolve_pen(EmfPen {
+      color: EmfColor { r: 0, g: 0, b: 0 },
+      width: 100,
+      transform_width: true,
+    });
+
+    assert_eq!(pen.width, 5);
+    assert!(!pen.transform_width);
   }
 
   fn stretch_record(bitmap_info: Vec<u8>, bitmap_bits: Vec<u8>) -> EmfRecord {
