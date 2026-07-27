@@ -14,6 +14,7 @@ use crate::bitmap::{
   BitmapCompression, DeviceIndependentBitmap, DibColorTable, DibColorUsage, DibHeader,
 };
 use crate::common::{Reader, SdkEnumValue};
+use crate::emf::EmrPenLineStyle;
 use crate::emfplus::{
   EmfPlusBitmapPayload, EmfPlusBrushData, EmfPlusBrushRef, EmfPlusDrawArcData,
   EmfPlusDrawImageData, EmfPlusDrawImagePointsData, EmfPlusDrawPointsData,
@@ -26,8 +27,8 @@ use crate::emfplus::{
   EmfPlusTranslateWorldTransformData, EmfPlusUnitType,
 };
 use crate::wmf::{
-  WmfBrushStyle, WmfEscapeData, WmfExtTextOutOptions, WmfMetafileRef, WmfPenLineStyle,
-  WmfRecordData, WmfTernaryRasterOperationCode, WmfTextAlignmentModeFlags,
+  WmfBinaryRasterOperation, WmfBrushStyle, WmfEscapeData, WmfExtTextOutOptions, WmfMetafileRef,
+  WmfPenLineStyle, WmfRecordData, WmfTernaryRasterOperationCode, WmfTextAlignmentModeFlags,
 };
 
 // record ids. The byte offsets below are record-relative, including the
@@ -59,6 +60,7 @@ const EMR_SET_WINDOW_ORG_EX: u32 = 10;
 const EMR_SET_VIEWPORT_EXT_EX: u32 = 11;
 const EMR_SET_VIEWPORT_ORG_EX: u32 = 12;
 const EMR_SET_PIXEL_V: u32 = 15;
+const EMR_SET_ROP_2: u32 = 20;
 const EMR_SET_TEXT_ALIGN: u32 = 22;
 const EMR_SET_TEXT_COLOR: u32 = 24;
 const EMR_MOVE_TO_EX: u32 = 27;
@@ -343,6 +345,11 @@ fn extract_emf_text_runs(data: &[u8]) -> Vec<MetafileTextRun> {
       EMR_SET_VIEWPORT_EXT_EX if record_size >= 16 => {
         state.viewport_ext_x = read_i32(data, pos + 8).unwrap_or(state.viewport_ext_x);
         state.viewport_ext_y = read_i32(data, pos + 12).unwrap_or(state.viewport_ext_y);
+      }
+      EMR_SET_TEXT_ALIGN if record_size >= 12 => {
+        state.text_alignment = WmfTextAlignmentModeFlags::from_bits_retain(
+          read_u32(data, pos + 8).unwrap_or_default() as u16,
+        );
       }
       EMR_SET_WORLD_TRANSFORM if record_size >= 32 => {
         if let Ok(transform) = read_xform(data, pos + 8) {
@@ -898,6 +905,10 @@ struct EmfPen {
   transform_width: bool,
 }
 
+fn emf_pen_from_style(style: u32, pen: EmfPen) -> Option<EmfPen> {
+  (EmrPenLineStyle::from_raw(style & 0x0000_000F) != Some(EmrPenLineStyle::Null)).then_some(pen)
+}
+
 #[derive(Clone, Debug)]
 struct EmfFont {
   height: i32,
@@ -906,7 +917,6 @@ struct EmfFont {
   italic: bool,
 }
 
-#[derive(Clone, Debug)]
 struct EmfTextState {
   width: usize,
   height: usize,
@@ -921,6 +931,8 @@ struct EmfTextState {
   world_transform: EmfTransform,
   fonts: std::collections::HashMap<u32, EmfFont>,
   current_font: Option<u32>,
+  text_alignment: WmfTextAlignmentModeFlags,
+  font_cache: RenderFontCache,
 }
 
 impl EmfTextState {
@@ -941,6 +953,8 @@ impl EmfTextState {
       world_transform: EmfTransform::identity(),
       fonts: std::collections::HashMap::new(),
       current_font: None,
+      text_alignment: WmfTextAlignmentModeFlags::empty(),
+      font_cache: RenderFontCache::load(),
     })
   }
 
@@ -964,26 +978,71 @@ impl EmfTextState {
   }
 
   fn text_run(
-    &self,
+    &mut self,
     data: &[u8],
     record_offset: usize,
     record_size: usize,
     text: String,
   ) -> Option<MetafileTextRun> {
     let text_record = ext_text_record(data, record_offset, record_size)?;
-    let (x, y) = self.map_point(EmfPoint {
-      x: text_record.x,
+    let logical_width = ext_text_advances(data, record_offset, record_size, text_record)
+      .map(|values| values.iter().copied().sum::<i32>());
+    let aligned_x = if self
+      .text_alignment
+      .contains(WmfTextAlignmentModeFlags::CENTER)
+    {
+      text_record
+        .x
+        .saturating_sub(logical_width.unwrap_or_default() / 2)
+    } else if self
+      .text_alignment
+      .contains(WmfTextAlignmentModeFlags::RIGHT)
+    {
+      text_record
+        .x
+        .saturating_sub(logical_width.unwrap_or_default())
+    } else {
+      text_record.x
+    };
+    let (x, reference_y) = self.map_point(EmfPoint {
+      x: aligned_x,
       y: text_record.y,
     });
-    let font_size = self
+    let selected_font = self
       .current_font
       .and_then(|id| self.fonts.get(&id))
-      .map(|font| self.map_height(font.height));
+      .cloned();
+    let current_font = selected_font
+      .as_ref()
+      .map(|font| WmfTextFont {
+        height: font.height,
+        family: font.family.clone(),
+        weight: font.weight,
+        italic: font.italic,
+      })
+      .unwrap_or(WmfTextFont {
+        height: 12,
+        family: None,
+        weight: 400,
+        italic: false,
+      });
+    let font_size = self.map_height(current_font.height);
+    // [MS-EMF] 2.3.11.25 and 2.3.5 define these as reference coordinates.
+    // Their meaning comes from EMR_SETTEXTALIGN, so semantic text must use
+    // the same aligned origin and realized-font baseline as vector replay.
+    let y = self.font_cache.baseline_for_alignment(
+      &current_font,
+      font_size.round().max(1.0),
+      reference_y.round(),
+      self.text_alignment,
+    );
     Some(MetafileTextRun {
       text,
       x: x / self.width.max(1) as f32,
       y: y / self.height.max(1) as f32,
-      font_size: font_size.map(|height| height / self.height.max(1) as f32),
+      font_size: selected_font
+        .as_ref()
+        .map(|_| font_size / self.height.max(1) as f32),
       font_family: self
         .current_font
         .and_then(|id| self.fonts.get(&id))
@@ -1014,13 +1073,14 @@ struct EmfVectorState {
   viewport_ext_y: i32,
   world_transform: EmfTransform,
   brush_colors: std::collections::HashMap<u32, EmfColor>,
-  pens: std::collections::HashMap<u32, EmfPen>,
+  pens: std::collections::HashMap<u32, Option<EmfPen>>,
   fonts: std::collections::HashMap<u32, EmfFont>,
   current_brush: Option<EmfColor>,
   current_pen: Option<EmfPen>,
   current_font: Option<u32>,
   current_pos: EmfPoint,
   text_color: EmfColor,
+  binary_raster_operation: WmfBinaryRasterOperation,
   text_alignment: WmfTextAlignmentModeFlags,
   clip_rect: Option<(i32, i32, i32, i32)>,
   clip_mask: Option<Vec<bool>>,
@@ -1047,6 +1107,7 @@ struct EmfVectorSnapshot {
   current_font: Option<u32>,
   current_pos: EmfPoint,
   text_color: EmfColor,
+  binary_raster_operation: WmfBinaryRasterOperation,
   text_alignment: WmfTextAlignmentModeFlags,
   clip_rect: Option<(i32, i32, i32, i32)>,
   clip_mask: Option<Vec<bool>>,
@@ -1436,6 +1497,7 @@ impl EmfVectorState {
       current_font: None,
       current_pos: EmfPoint { x: 0, y: 0 },
       text_color: EmfColor { r: 0, g: 0, b: 0 },
+      binary_raster_operation: WmfBinaryRasterOperation::CopyPen,
       text_alignment: WmfTextAlignmentModeFlags::empty(),
       clip_rect: None,
       clip_mask: None,
@@ -1504,6 +1566,30 @@ impl EmfVectorState {
     self.rgb[offset] = color.r;
     self.rgb[offset + 1] = color.g;
     self.rgb[offset + 2] = color.b;
+  }
+
+  fn set_vector_pixel(&mut self, x: i32, y: i32, color: EmfColor) {
+    let Some(destination) = self.pixel(x, y) else {
+      return;
+    };
+    self.set_pixel(
+      x,
+      y,
+      apply_binary_raster_operation(color, destination, self.binary_raster_operation),
+    );
+  }
+
+  fn pixel(&self, x: i32, y: i32) -> Option<EmfColor> {
+    let (x, y) = (usize::try_from(x).ok()?, usize::try_from(y).ok()?);
+    if x >= self.width || y >= self.height {
+      return None;
+    }
+    let offset = (y * self.width + x) * RGB_BYTES_PER_PIXEL;
+    Some(EmfColor {
+      r: self.rgb[offset],
+      g: self.rgb[offset + 1],
+      b: self.rgb[offset + 2],
+    })
   }
 
   fn draw_rgb_image(
@@ -1939,7 +2025,7 @@ impl EmfVectorState {
       for x in 0..glyph.width {
         let coverage = glyph.coverage[y * glyph.width + x];
         if coverage != [0; 3] {
-          self.set_pixel(glyph.left + x as i32, glyph.top + y as i32, color);
+          self.set_vector_pixel(glyph.left + x as i32, glyph.top + y as i32, color);
         }
       }
     }
@@ -1978,6 +2064,7 @@ impl EmfVectorState {
       current_font: self.current_font,
       current_pos: self.current_pos,
       text_color: self.text_color,
+      binary_raster_operation: self.binary_raster_operation,
       text_alignment: self.text_alignment,
       clip_rect: self.clip_rect,
       clip_mask: self.clip_mask.clone(),
@@ -2002,6 +2089,7 @@ impl EmfVectorState {
     self.current_font = saved.current_font;
     self.current_pos = saved.current_pos;
     self.text_color = saved.text_color;
+    self.binary_raster_operation = saved.binary_raster_operation;
     self.text_alignment = saved.text_alignment;
     self.clip_rect = saved.clip_rect;
     self.clip_mask = saved.clip_mask;
@@ -2209,7 +2297,7 @@ impl EmfVectorState {
     let height = self.height;
     visit_polygon_scanline_spans(&mapped, width, height, |y, start, end| {
       for x in start..end {
-        self.set_pixel(x as i32, y as i32, color);
+        self.set_vector_pixel(x as i32, y as i32, color);
       }
     });
   }
@@ -2303,7 +2391,7 @@ impl EmfVectorState {
     let radius = (pen.width.max(1) / 2) as i32;
     for yy in y - radius..=y + radius {
       for xx in x - radius..=x + radius {
-        self.set_pixel(xx, yy, pen.color);
+        self.set_vector_pixel(xx, yy, pen.color);
       }
     }
   }
@@ -2334,7 +2422,7 @@ impl EmfVectorState {
     let bottom = mapped_top.max(mapped_bottom).ceil().min(self.height as f32) as i32;
     for y in top..bottom {
       for x in left..right {
-        self.set_pixel(x, y, color);
+        self.set_vector_pixel(x, y, color);
       }
     }
   }
@@ -2417,7 +2505,7 @@ impl EmfVectorState {
           self.current_brush = Some(brush);
         }
         if let Some(pen) = self.pens.get(&object_id).copied() {
-          self.current_pen = Some(pen);
+          self.current_pen = pen;
         }
         if self.fonts.contains_key(&object_id) {
           self.current_font = Some(object_id);
@@ -2472,6 +2560,14 @@ fn decode_vector_emf_as_png(
           read_color_ref(data, pos + 16)?,
         );
       }
+      EMR_SET_ROP_2 if record_size >= 12 => {
+        if let Some(operation) = u16::try_from(read_u32(data, pos + 8)?)
+          .ok()
+          .and_then(WmfBinaryRasterOperation::from_raw)
+        {
+          state.binary_raster_operation = operation;
+        }
+      }
       EMR_MOVE_TO_EX if record_size >= 16 => {
         state.current_pos = EmfPoint {
           x: read_i32(data, pos + 8)?,
@@ -2512,14 +2608,18 @@ fn decode_vector_emf_as_png(
       EMR_CREATE_PEN if record_size >= 28 => {
         let object_id = read_u32(data, pos + 8)?;
         if object_id & ENHMETA_STOCK_OBJECT == 0 {
+          let style = read_u32(data, pos + 12)?;
           let width = read_i32(data, pos + 16)?.unsigned_abs().max(1) as usize;
           state.pens.insert(
             object_id,
-            EmfPen {
-              color: read_color_ref(data, pos + 24)?,
-              width,
-              transform_width: false,
-            },
+            emf_pen_from_style(
+              style,
+              EmfPen {
+                color: read_color_ref(data, pos + 24)?,
+                width,
+                transform_width: false,
+              },
+            ),
           );
         }
       }
@@ -2532,14 +2632,18 @@ fn decode_vector_emf_as_png(
       EMR_EXT_CREATE_PEN if record_size >= 56 => {
         let object_id = read_u32(data, pos + 8)?;
         if object_id & ENHMETA_STOCK_OBJECT == 0 {
+          let style = read_u32(data, pos + 28)?;
           let width = read_u32(data, pos + 32)?.max(1) as usize;
           state.pens.insert(
             object_id,
-            EmfPen {
-              color: read_color_ref(data, pos + 40)?,
-              width,
-              transform_width: false,
-            },
+            emf_pen_from_style(
+              style,
+              EmfPen {
+                color: read_color_ref(data, pos + 40)?,
+                width,
+                transform_width: false,
+              },
+            ),
           );
         }
       }
@@ -3029,6 +3133,7 @@ struct WmfSavedState {
   current_pen: Option<EmfPen>,
   current_pos: EmfPoint,
   text_color: EmfColor,
+  binary_raster_operation: WmfBinaryRasterOperation,
   background_color: EmfColor,
   current_pattern_brush: Option<WmfPatternBrush>,
   current_font: WmfTextFont,
@@ -3105,6 +3210,7 @@ impl WmfRenderState {
         current_font: None,
         current_pos: EmfPoint { x: 0, y: 0 },
         text_color: EmfColor { r: 0, g: 0, b: 0 },
+        binary_raster_operation: WmfBinaryRasterOperation::CopyPen,
         text_alignment: WmfTextAlignmentModeFlags::empty(),
         clip_rect: None,
         clip_mask: None,
@@ -3156,6 +3262,7 @@ impl WmfRenderState {
       current_pen: self.canvas.current_pen,
       current_pos: self.current_pos,
       text_color: self.text_color,
+      binary_raster_operation: self.canvas.binary_raster_operation,
       background_color: self.background_color,
       current_pattern_brush: self.current_pattern_brush.clone(),
       current_font: self.current_font.clone(),
@@ -3179,6 +3286,7 @@ impl WmfRenderState {
     self.canvas.current_pen = saved.current_pen;
     self.current_pos = saved.current_pos;
     self.text_color = saved.text_color;
+    self.canvas.binary_raster_operation = saved.binary_raster_operation;
     self.background_color = saved.background_color;
     self.current_pattern_brush = saved.current_pattern_brush;
     self.current_font = saved.current_font;
@@ -3334,6 +3442,11 @@ fn decode_wmf_as_raster(
       WmfRecordData::ExcludeClipRect(_) => {}
       WmfRecordData::SetTextColor(value) => {
         state.text_color = color_ref_to_emf(value.color);
+      }
+      WmfRecordData::SetRop2(value) => {
+        if let Some(operation) = value.binary_raster_operation_kind() {
+          state.canvas.binary_raster_operation = operation;
+        }
       }
       WmfRecordData::SetTextAlign(value) => {
         state.text_alignment = value.text_alignment_flags();
@@ -5613,7 +5726,7 @@ fn draw_glyph_5x7(
       }
       for yy in 0..scale {
         for xx in 0..scale {
-          state.set_pixel(
+          state.set_vector_pixel(
             x + (col * scale + xx) as i32,
             y + (row * scale + yy) as i32,
             color,
@@ -5728,8 +5841,12 @@ fn visit_polygon_scanline_spans(
     }
     intersections.sort_by(|a, b| a.total_cmp(b));
     for pair in intersections.chunks_exact(2) {
-      let start_x = pair[0].floor().max(0.0).min(width as f32) as usize;
-      let end_x = pair[1].ceil().max(0.0).min(width as f32) as usize;
+      // Sample coverage at pixel centers and keep the trailing polygon edge
+      // half-open. Adjacent polygons emitted for GDI gradients share that
+      // edge; rounding both intersections outward paints it twice, which is
+      // visibly wrong under R2_XORPEN.
+      let start_x = (pair[0] - 0.5).ceil().max(0.0).min(width as f32) as usize;
+      let end_x = (pair[1] - 0.5).ceil().max(0.0).min(width as f32) as usize;
       if end_x > start_x {
         visit(y, start_x, end_x);
       }
@@ -6237,6 +6354,36 @@ fn read_f32(data: &[u8], offset: usize) -> Result<f32, String> {
   Ok(f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
 
+fn apply_binary_raster_operation(
+  pen: EmfColor,
+  destination: EmfColor,
+  operation: WmfBinaryRasterOperation,
+) -> EmfColor {
+  let apply = |pen: u8, destination: u8| match operation {
+    WmfBinaryRasterOperation::Black => 0,
+    WmfBinaryRasterOperation::NotMergePen => !(destination | pen),
+    WmfBinaryRasterOperation::MaskNotPen => destination & !pen,
+    WmfBinaryRasterOperation::NotCopyPen => !pen,
+    WmfBinaryRasterOperation::MaskPenNot => pen & !destination,
+    WmfBinaryRasterOperation::Not => !destination,
+    WmfBinaryRasterOperation::XorPen => destination ^ pen,
+    WmfBinaryRasterOperation::NotMaskPen => !(destination & pen),
+    WmfBinaryRasterOperation::MaskPen => destination & pen,
+    WmfBinaryRasterOperation::NotXorPen => !(destination ^ pen),
+    WmfBinaryRasterOperation::Nop => destination,
+    WmfBinaryRasterOperation::MergeNotPen => destination | !pen,
+    WmfBinaryRasterOperation::CopyPen => pen,
+    WmfBinaryRasterOperation::MergePenNot => pen | !destination,
+    WmfBinaryRasterOperation::MergePen => destination | pen,
+    WmfBinaryRasterOperation::White => u8::MAX,
+  };
+  EmfColor {
+    r: apply(pen.r, destination.r),
+    g: apply(pen.g, destination.g),
+    b: apply(pen.b, destination.b),
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -6262,6 +6409,37 @@ mod tests {
 
   fn eof_record() -> EmfRecord {
     EmfRecord::new(EMR_EOF, vec![0; 12])
+  }
+
+  fn set_text_align_record(alignment: WmfTextAlignmentModeFlags) -> EmfRecord {
+    EmfRecord::new(
+      super::EMR_SET_TEXT_ALIGN,
+      u32::from(alignment.bits()).to_le_bytes().to_vec(),
+    )
+  }
+
+  fn ext_text_out_w_record(x: i32, y: i32, text: &str) -> EmfRecord {
+    let units = text.encode_utf16().collect::<Vec<_>>();
+    let mut data = vec![0; 68];
+    data[16..20].copy_from_slice(&1u32.to_le_bytes());
+    data[20..24].copy_from_slice(&1.0f32.to_le_bytes());
+    data[24..28].copy_from_slice(&1.0f32.to_le_bytes());
+    data[28..32].copy_from_slice(&x.to_le_bytes());
+    data[32..36].copy_from_slice(&y.to_le_bytes());
+    data[36..40].copy_from_slice(&(units.len() as u32).to_le_bytes());
+    data[40..44].copy_from_slice(&76u32.to_le_bytes());
+    for unit in units {
+      data.extend_from_slice(&unit.to_le_bytes());
+    }
+    while !data.len().is_multiple_of(4) {
+      data.push(0);
+    }
+    let dx_offset = (data.len() + 8) as u32;
+    data[64..68].copy_from_slice(&dx_offset.to_le_bytes());
+    for _ in text.encode_utf16() {
+      data.extend_from_slice(&8i32.to_le_bytes());
+    }
+    EmfRecord::new(super::EMR_EXT_TEXTOUT_W, data)
   }
 
   fn bitmap_info(width: i32, height: i32, bit_count: u16, compression: u32) -> Vec<u8> {
@@ -6353,6 +6531,45 @@ mod tests {
       (logical as f32 * 214.0 / 103.0).round()
     });
     assert_eq!(mapped, [12.0, 7.0, 8.0]);
+  }
+
+  #[test]
+  fn emf_semantic_text_honors_text_alignment_reference_point() {
+    let top = metafile_with(ext_text_out_w_record(0, 0, "A"));
+    let baseline = metafile_with_records(vec![
+      set_text_align_record(WmfTextAlignmentModeFlags::BASELINE),
+      ext_text_out_w_record(0, 0, "A"),
+    ]);
+
+    let top_run = extract_metafile_text_runs(&top, Some("image/x-emf"))
+      .pop()
+      .expect("default TA_TOP text");
+    let baseline_run = extract_metafile_text_runs(&baseline, Some("image/x-emf"))
+      .pop()
+      .expect("TA_BASELINE text");
+
+    assert!(top_run.y > baseline_run.y);
+    assert_eq!(baseline_run.y, 0.0);
+  }
+
+  #[test]
+  fn emf_semantic_text_honors_horizontal_text_alignment() {
+    let left = metafile_with(ext_text_out_w_record(20, 0, "AB"));
+    let center = metafile_with_records(vec![
+      set_text_align_record(WmfTextAlignmentModeFlags::CENTER),
+      ext_text_out_w_record(20, 0, "AB"),
+    ]);
+    let right = metafile_with_records(vec![
+      set_text_align_record(WmfTextAlignmentModeFlags::RIGHT),
+      ext_text_out_w_record(20, 0, "AB"),
+    ]);
+
+    let left_x = extract_metafile_text_runs(&left, Some("image/x-emf"))[0].x;
+    let center_x = extract_metafile_text_runs(&center, Some("image/x-emf"))[0].x;
+    let right_x = extract_metafile_text_runs(&right, Some("image/x-emf"))[0].x;
+
+    assert!(right_x < center_x);
+    assert!(center_x < left_x);
   }
 
   #[test]
@@ -6703,6 +6920,73 @@ mod tests {
     assert!(!pen.transform_width);
   }
 
+  #[test]
+  fn emf_null_pen_disables_polygon_outlines() {
+    let pen = EmfPen {
+      color: EmfColor {
+        r: 255,
+        g: 255,
+        b: 255,
+      },
+      width: 1,
+      transform_width: false,
+    };
+    assert!(emf_pen_from_style(EmrPenLineStyle::Solid.raw(), pen).is_some());
+    assert!(emf_pen_from_style(EmrPenLineStyle::Null.raw(), pen).is_none());
+
+    let mut data = vec![0; EMF_HEADER_SIZE];
+    data[16..20].copy_from_slice(&9i32.to_le_bytes());
+    data[20..24].copy_from_slice(&9i32.to_le_bytes());
+    let mut state = EmfVectorState::new_with_options(&data, RenderOptions::default())
+      .expect("minimal EMF bounds");
+    state.pens.insert(7, None);
+    state.select_object(7);
+    assert!(state.current_pen.is_none());
+  }
+
+  #[test]
+  fn emf_binary_raster_operations_follow_rop2_boolean_semantics() {
+    let pen = EmfColor {
+      r: 0b1010_1010,
+      g: 0b1100_1100,
+      b: 0b1111_0000,
+    };
+    let destination = EmfColor {
+      r: 0b1111_0000,
+      g: 0b1010_1010,
+      b: 0b1100_1100,
+    };
+
+    assert_eq!(
+      apply_binary_raster_operation(pen, destination, WmfBinaryRasterOperation::XorPen),
+      EmfColor {
+        r: destination.r ^ pen.r,
+        g: destination.g ^ pen.g,
+        b: destination.b ^ pen.b,
+      }
+    );
+    assert_eq!(
+      apply_binary_raster_operation(pen, destination, WmfBinaryRasterOperation::CopyPen),
+      pen
+    );
+    assert_eq!(
+      apply_binary_raster_operation(pen, destination, WmfBinaryRasterOperation::Nop),
+      destination
+    );
+    assert_eq!(
+      apply_binary_raster_operation(pen, destination, WmfBinaryRasterOperation::Black),
+      EmfColor { r: 0, g: 0, b: 0 }
+    );
+    assert_eq!(
+      apply_binary_raster_operation(pen, destination, WmfBinaryRasterOperation::White),
+      EmfColor {
+        r: u8::MAX,
+        g: u8::MAX,
+        b: u8::MAX,
+      }
+    );
+  }
+
   fn stretch_record(bitmap_info: Vec<u8>, bitmap_bits: Vec<u8>) -> EmfRecord {
     EmfRecordData::StretchDiBits(EmrStretchDiBits {
       bounds: RectL::default(),
@@ -6799,6 +7083,24 @@ mod tests {
       spans.push((y, start, end));
     });
     assert!(spans.is_empty());
+  }
+
+  #[test]
+  fn adjacent_slanted_polygon_bands_use_a_half_open_shared_edge() {
+    let left = [(0.0, 0.0), (2.0, 0.0), (4.0, 2.0), (2.0, 2.0)];
+    let right = [(2.0, 0.0), (4.0, 0.0), (6.0, 2.0), (4.0, 2.0)];
+    let mut left_spans = Vec::new();
+    let mut right_spans = Vec::new();
+    visit_polygon_scanline_spans(&left, 8, 2, |y, start, end| {
+      left_spans.push((y, start, end));
+    });
+    visit_polygon_scanline_spans(&right, 8, 2, |y, start, end| {
+      right_spans.push((y, start, end));
+    });
+
+    assert_eq!(left_spans[0], (0, 0, 2));
+    assert_eq!(right_spans[0], (0, 2, 4));
+    assert_eq!(left_spans[0].2, right_spans[0].1);
   }
 
   #[test]
