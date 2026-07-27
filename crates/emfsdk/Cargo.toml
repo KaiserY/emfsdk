@@ -18,9 +18,10 @@ emfsdk-derive = { workspace = true }
 encoding_rs = { workspace = true }
 fontdb = { workspace = true, optional = true }
 image = { workspace = true, optional = true }
+skrifa = { workspace = true, optional = true }
+zeno = { workspace = true, optional = true }
 thiserror = { workspace = true }
-ttf-parser = { workspace = true, optional = true }
 
 [features]
 default = []
-render = ["dep:fontdb", "dep:image", "dep:ttf-parser"]
+render = ["dep:fontdb", "dep:image", "dep:skrifa", "dep:zeno"]
