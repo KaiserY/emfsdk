@@ -977,6 +977,15 @@ impl EmfTextState {
     (y1 - y0).abs()
   }
 
+  fn map_horizontal_distance(&self, logical_width: i64) -> f32 {
+    let width = logical_width as f32;
+    let scale_x = self.viewport_ext_x as f32 / self.window_ext_x.max(1) as f32;
+    let scale_y = self.viewport_ext_y as f32 / self.window_ext_y.max(1) as f32;
+    let x = width * self.world_transform.m11 * scale_x;
+    let y = width * self.world_transform.m12 * scale_y;
+    x.hypot(y)
+  }
+
   fn text_run(
     &mut self,
     data: &[u8],
@@ -1055,7 +1064,15 @@ impl EmfTextState {
         .current_font
         .and_then(|id| self.fonts.get(&id))
         .is_some_and(|font| font.italic),
-      width: None,
+      // [MS-EMF] §2.2.5 defines Dx as the logical spacing between
+      // consecutive character-cell origins. Map that logical distance
+      // through the current page/world transform, then normalize it against
+      // Header.Frame's playback surface. Header.Bounds encloses only marks;
+      // using it as the canvas makes identical text wider whenever a
+      // metafile happens to have tighter ink bounds.
+      width: logical_width
+        .map(|width| self.map_horizontal_distance(i64::from(width)) / self.width.max(1) as f32)
+        .filter(|width| width.is_finite() && *width > 0.0),
     })
   }
 }
@@ -6567,9 +6584,13 @@ mod tests {
     let left_x = extract_metafile_text_runs(&left, Some("image/x-emf"))[0].x;
     let center_x = extract_metafile_text_runs(&center, Some("image/x-emf"))[0].x;
     let right_x = extract_metafile_text_runs(&right, Some("image/x-emf"))[0].x;
+    let left_width = extract_metafile_text_runs(&left, Some("image/x-emf"))[0]
+      .width
+      .expect("Dx width");
 
     assert!(right_x < center_x);
     assert!(center_x < left_x);
+    assert_eq!(left_width, 8.0);
   }
 
   #[test]
