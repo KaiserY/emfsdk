@@ -60,7 +60,7 @@ typed data.
 ## Features
 
 - Default: parsing and writing only
-- `render`: raster rendering with `image`, `fontdb`, and `ttf-parser`
+- `render`: raster rendering with `fontique`, `image`, `skrifa`, and `zeno`
 
 ```bash
 cargo add emfsdk --features render

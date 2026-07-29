@@ -1,9 +1,15 @@
+use fontique::{
+  Attributes as FontAttributes, Collection as FontCollection,
+  CollectionOptions as FontCollectionOptions, FontStyle, FontWeight, FontWidth, GenericFamily,
+  QueryFamily, QueryStatus, SourceCache,
+};
 use image::codecs::png::PngEncoder;
 use image::{ColorType, ImageEncoder};
-use skrifa::outline::{DrawSettings, HintingInstance, HintingMode, LcdLayout, OutlinePen};
+use skrifa::outline::{
+  DrawSettings, HintingInstance, HintingOptions, OutlinePen, SmoothMode, Target,
+};
 use skrifa::prelude::{FontRef, LocationRef, MetadataProvider, Size as FontSize};
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
 use thiserror::Error;
 use zeno::{
   Command as ZenoCommand, Format as ZenoMaskFormat, Mask as ZenoMask, Origin as ZenoOrigin,
@@ -149,6 +155,14 @@ pub struct DecodedMetafile {
   pub content_type: &'static str,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MetafilePhysicalSize {
+  pub width_pt: f32,
+  pub height_pt: f32,
+  pub natural_width_px: u32,
+  pub natural_height_px: u32,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RenderOptions {
   pub target_width_px: Option<u32>,
@@ -229,6 +243,21 @@ pub fn decode_metafile_as_raster_with_options(
   }
 
   decode_opaque_metafile_as_raster(data, content_type, options, false).map_err(Into::into)
+}
+
+/// Returns the physical playback frame recorded by an EMF header.
+///
+/// `[MS-EMF]` defines `Frame` in 0.01 millimeter units. The natural pixel
+/// dimensions are recovered from the same frame plus the reference
+/// `Device`/`Millimeters` fields, matching raster playback.
+pub fn metafile_physical_size(
+  data: &[u8],
+  content_type: Option<&str>,
+) -> Option<MetafilePhysicalSize> {
+  if !looks_like_metafile(data, content_type) || !is_emf(data) {
+    return None;
+  }
+  emf_physical_size(data)
 }
 
 fn decode_opaque_metafile_as_raster(
@@ -569,12 +598,7 @@ impl WmfTextState {
     let mapped_x = self.viewport_org_x as f32 + (i32::from(x) - self.window_org_x) as f32 * scale_x;
     let baseline_y = if self
       .text_alignment
-      .contains(WmfTextAlignmentModeFlags::BASELINE)
-    {
-      f32::from(y)
-    } else if self
-      .text_alignment
-      .contains(WmfTextAlignmentModeFlags::BOTTOM)
+      .intersects(WmfTextAlignmentModeFlags::BASELINE | WmfTextAlignmentModeFlags::BOTTOM)
     {
       f32::from(y)
     } else {
@@ -1080,6 +1104,8 @@ impl EmfTextState {
 struct EmfVectorState {
   width: usize,
   height: usize,
+  output_scale_x: f32,
+  output_scale_y: f32,
   window_org_x: i32,
   window_org_y: i32,
   window_ext_x: i32,
@@ -1226,7 +1252,7 @@ struct RenderFontKey {
 
 #[derive(Clone, Debug)]
 struct RenderFontFace {
-  font_data: Arc<[u8]>,
+  font_data: fontique::Blob<u8>,
   face_index: u32,
 }
 
@@ -1236,8 +1262,9 @@ struct RenderHintingKey {
   pixel_height_bits: u32,
 }
 
-#[derive(Default)]
 struct RenderFontCache {
+  collection: FontCollection,
+  source_cache: SourceCache,
   faces: HashMap<RenderFontKey, Option<RenderFontFace>>,
   hinting_instances: HashMap<RenderHintingKey, HintingInstance>,
   raster_scratch: ZenoScratch,
@@ -1252,19 +1279,28 @@ struct RenderedSubpixelGlyph {
   coverage: Vec<[u8; 3]>,
 }
 
-fn render_font_database() -> &'static fontdb::Database {
-  static DATABASE: OnceLock<fontdb::Database> = OnceLock::new();
-  DATABASE.get_or_init(|| {
-    let mut database = fontdb::Database::new();
-    database.load_system_fonts();
-    database
-  })
+struct TextRenderRequest<'a> {
+  font: &'a WmfTextFont,
+  text: &'a str,
+  x: f32,
+  baseline_y: f32,
+  height: f32,
+  horizontal_scale: f32,
+  advances: Option<&'a [f32]>,
 }
 
 impl RenderFontCache {
   fn load() -> Self {
-    let _ = render_font_database();
-    Self::default()
+    Self {
+      collection: FontCollection::new(FontCollectionOptions {
+        shared: false,
+        system_fonts: true,
+      }),
+      source_cache: SourceCache::default(),
+      faces: HashMap::new(),
+      hinting_instances: HashMap::new(),
+      raster_scratch: ZenoScratch::default(),
+    }
   }
 
   fn resolve_face(&mut self, font: &WmfTextFont) -> Option<&RenderFontFace> {
@@ -1276,31 +1312,29 @@ impl RenderFontCache {
     if !self.faces.contains_key(&key) {
       let mut families = Vec::with_capacity(2);
       if let Some(family) = key.family.as_deref() {
-        families.push(fontdb::Family::Name(family));
+        families.push(QueryFamily::Named(family));
       }
-      families.push(fontdb::Family::SansSerif);
-      let database = render_font_database();
+      families.push(QueryFamily::Generic(GenericFamily::SansSerif));
       let weight = if key.weight == 0 {
-        fontdb::Weight::NORMAL
+        FontWeight::NORMAL
       } else {
-        fontdb::Weight(key.weight.min(1000))
+        FontWeight::new(f32::from(key.weight.min(1000)))
       };
       let style = if key.italic {
-        fontdb::Style::Italic
+        FontStyle::Italic
       } else {
-        fontdb::Style::Normal
+        FontStyle::Normal
       };
-      let query = fontdb::Query {
-        families: &families,
-        weight,
-        style,
-        ..fontdb::Query::default()
-      };
-      let face = database.query(&query).and_then(|id| {
-        database.with_face_data(id, |data, face_index| RenderFontFace {
-          font_data: Arc::from(data),
-          face_index,
-        })
+      let mut query = self.collection.query(&mut self.source_cache);
+      query.set_families(families);
+      query.set_attributes(FontAttributes::new(FontWidth::NORMAL, style, weight));
+      let mut face = None;
+      query.matches_with(|font| {
+        face = Some(RenderFontFace {
+          font_data: font.blob.clone(),
+          face_index: font.index,
+        });
+        QueryStatus::Stop
       });
       self.faces.insert(key.clone(), face);
     }
@@ -1333,31 +1367,22 @@ impl RenderFontCache {
     }
   }
 
-  fn render_text(
-    &mut self,
-    font: &WmfTextFont,
-    text: &str,
-    x: f32,
-    baseline_y: f32,
-    height: f32,
-    horizontal_scale: f32,
-    advances: Option<&[f32]>,
-  ) -> Option<Vec<RenderedSubpixelGlyph>> {
-    let face_data = self.resolve_face(font)?.clone();
+  fn render_text(&mut self, request: &TextRenderRequest<'_>) -> Option<Vec<RenderedSubpixelGlyph>> {
+    let face_data = self.resolve_face(request.font)?.clone();
     let data = face_data.font_data.as_ref();
     let face = FontRef::from_index(data, face_data.face_index).ok()?;
-    let size = FontSize::new(height.max(1.0));
+    let size = FontSize::new(request.height.max(1.0));
     let location = LocationRef::new(&[]);
     let outlines = face.outline_glyphs();
     let charmap = face.charmap();
     let metrics = face.glyph_metrics(size, location);
     let hinting_key = RenderHintingKey {
       font: RenderFontKey {
-        family: font.family.clone(),
-        weight: font.weight,
-        italic: font.italic,
+        family: request.font.family.clone(),
+        weight: request.font.weight,
+        italic: request.font.italic,
       },
-      pixel_height_bits: height.max(1.0).to_bits(),
+      pixel_height_bits: request.height.max(1.0).to_bits(),
     };
     if !self.hinting_instances.contains_key(&hinting_key) {
       // ExtTextOut's Dx array owns inter-glyph placement. Use the linear-metric
@@ -1367,9 +1392,13 @@ impl RenderFontCache {
         &outlines,
         size,
         location,
-        HintingMode::Smooth {
-          lcd_subpixel: Some(LcdLayout::Horizontal),
-          preserve_linear_metrics: true,
+        HintingOptions {
+          engine: Default::default(),
+          target: Target::Smooth {
+            mode: SmoothMode::Lcd,
+            symmetric_rendering: false,
+            preserve_linear_metrics: true,
+          },
         },
       )
       .ok()?;
@@ -1377,17 +1406,18 @@ impl RenderFontCache {
     }
     let (hinting_instances, raster_scratch) = (&self.hinting_instances, &mut self.raster_scratch);
     let hinting = hinting_instances.get(&hinting_key)?;
-    let mut cursor_x = x;
-    let mut glyphs = Vec::with_capacity(text.chars().count());
-    for (index, ch) in text.chars().enumerate() {
+    let mut cursor_x = request.x;
+    let mut glyphs = Vec::with_capacity(request.text.chars().count());
+    for (index, ch) in request.text.chars().enumerate() {
       if ch == '\n' || ch == '\r' {
         continue;
       }
       if ch.is_whitespace() {
-        cursor_x += advances
+        cursor_x += request
+          .advances
           .and_then(|values| values.get(index))
           .copied()
-          .unwrap_or(height * 0.35);
+          .unwrap_or(request.height * 0.35);
         continue;
       }
       let glyph_id = charmap.map(ch)?;
@@ -1400,15 +1430,25 @@ impl RenderFontCache {
         .draw(DrawSettings::hinted(hinting, false), &mut collector)
         .ok()?;
       let mut mask = ZenoMask::with_scratch(&commands, raster_scratch);
-      let fractional_offset = ZenoVector::new(cursor_x.fract(), baseline_y.fract());
+      // Microsoft ClearType consumes a bitmap oversampled by at least six in
+      // the horizontal direction, then applies one-pixel-wide displaced box
+      // filters at the RGB stripe locations. Rasterize that producer input
+      // directly instead of treating three shifted whole-pixel masks as its
+      // final coverage.
+      const CLEARTYPE_X_SCALE: f32 = 6.0;
+      let fractional_offset = ZenoVector::new(
+        cursor_x.fract() * CLEARTYPE_X_SCALE,
+        request.baseline_y.fract(),
+      );
       mask
-        .format(ZenoMaskFormat::Subpixel)
+        .format(ZenoMaskFormat::Alpha)
         .origin(ZenoOrigin::BottomLeft)
         .offset(fractional_offset)
         .render_offset(fractional_offset);
-      if (horizontal_scale - 1.0).abs() > f32::EPSILON {
-        mask.transform(Some(ZenoTransform::scale(horizontal_scale, 1.0)));
-      }
+      mask.transform(Some(ZenoTransform::scale(
+        request.horizontal_scale * CLEARTYPE_X_SCALE,
+        1.0,
+      )));
       // Zeno's BottomLeft placement includes the computed mask height. Match
       // Swash's render path by materializing that size before render_into;
       // calling Mask::render directly leaves placement.top without it.
@@ -1417,30 +1457,80 @@ impl RenderFontCache {
         data.resize(format.buffer_size(width, height), 0);
       });
       let placement = mask.render_into(&mut data, None);
-      if data.len() != placement.width as usize * placement.height as usize * 4 {
+      if data.len() != placement.width as usize * placement.height as usize {
         return None;
       }
+      let high_resolution_left = (cursor_x.floor() as i32)
+        .saturating_mul(CLEARTYPE_X_SCALE as i32)
+        .saturating_add(placement.left);
+      let (left, width, coverage) = cleartype_box_decimate(
+        &data,
+        placement.width as usize,
+        placement.height as usize,
+        high_resolution_left,
+      );
       glyphs.push(RenderedSubpixelGlyph {
-        left: cursor_x.floor() as i32 + placement.left,
-        top: baseline_y.floor() as i32 - placement.top,
-        width: placement.width as usize,
+        left,
+        top: request.baseline_y.floor() as i32 - placement.top,
+        width,
         height: placement.height as usize,
-        coverage: data
-          .chunks_exact(4)
-          .map(|sample| [sample[0], sample[1], sample[2]])
-          .collect(),
+        coverage,
       });
       let advance = adjusted_metrics
         .advance_width
         .or_else(|| metrics.advance_width(glyph_id))
-        .unwrap_or(height * 0.5);
-      cursor_x += advances
+        .unwrap_or(request.height * 0.5);
+      cursor_x += request
+        .advances
         .and_then(|values| values.get(index))
         .copied()
         .unwrap_or(advance);
     }
     Some(glyphs)
   }
+}
+
+/// Applies the one-pixel-wide displaced box filters described by Microsoft's
+/// ClearType RGB-decimation paper to a six-times-horizontal alpha raster.
+fn cleartype_box_decimate(
+  high_resolution: &[u8],
+  high_resolution_width: usize,
+  height: usize,
+  high_resolution_left: i32,
+) -> (i32, usize, Vec<[u8; 3]>) {
+  const SAMPLES_PER_PIXEL: i32 = 6;
+  if high_resolution_width == 0 || height == 0 {
+    return (0, 0, Vec::new());
+  }
+  let high_resolution_right = high_resolution_left.saturating_add(high_resolution_width as i32);
+  let left = high_resolution_left.div_euclid(SAMPLES_PER_PIXEL) - 1;
+  let right = (high_resolution_right - 1).div_euclid(SAMPLES_PER_PIXEL) + 2;
+  let width = (right - left).max(0) as usize;
+  let mut output = vec![[0; 3]; width * height];
+
+  for y in 0..height {
+    let row = &high_resolution[y * high_resolution_width..(y + 1) * high_resolution_width];
+    for output_x in left..right {
+      let mut channels = [0_u8; 3];
+      for (channel, window_offset) in [-2_i32, 0, 2].into_iter().enumerate() {
+        let window_start = output_x
+          .saturating_mul(SAMPLES_PER_PIXEL)
+          .saturating_add(window_offset);
+        let mut sum = 0_u16;
+        for sample_x in window_start..window_start + SAMPLES_PER_PIXEL {
+          let source_x = sample_x - high_resolution_left;
+          if let Ok(source_x) = usize::try_from(source_x)
+            && let Some(sample) = row.get(source_x)
+          {
+            sum += u16::from(*sample);
+          }
+        }
+        channels[channel] = ((sum + 3) / SAMPLES_PER_PIXEL as u16) as u8;
+      }
+      output[y * width + (output_x - left) as usize] = channels;
+    }
+  }
+  (left, width, output)
 }
 
 struct ZenoGlyphPathCollector<'a> {
@@ -1484,6 +1574,8 @@ impl EmfVectorState {
   fn new_with_options(data: &[u8], options: RenderOptions) -> Result<Self, String> {
     let (natural_width, natural_height) = emf_natural_canvas_size(data)?;
     let (width, height) = options.resolved_canvas_size(natural_width, natural_height);
+    let output_scale_x = width as f32 / natural_width.max(1) as f32;
+    let output_scale_y = height as f32 / natural_height.max(1) as f32;
     let background_color = options.background_color.unwrap_or([255; 3]);
     let mut rgb = vec![0; width * height * RGB_BYTES_PER_PIXEL];
     for pixel in rgb.chunks_exact_mut(RGB_BYTES_PER_PIXEL) {
@@ -1493,14 +1585,16 @@ impl EmfVectorState {
     Ok(Self {
       width,
       height,
+      output_scale_x,
+      output_scale_y,
       window_org_x: 0,
       window_org_y: 0,
       window_ext_x: natural_width as i32,
       window_ext_y: natural_height as i32,
       viewport_org_x: 0,
       viewport_org_y: 0,
-      viewport_ext_x: width as i32,
-      viewport_ext_y: height as i32,
+      viewport_ext_x: natural_width as i32,
+      viewport_ext_y: natural_height as i32,
       world_transform: EmfTransform::identity(),
       brush_colors: std::collections::HashMap::new(),
       pens: std::collections::HashMap::new(),
@@ -1531,8 +1625,8 @@ impl EmfVectorState {
     let scale_x = self.viewport_ext_x as f32 / self.window_ext_x.max(1) as f32;
     let scale_y = self.viewport_ext_y as f32 / self.window_ext_y.max(1) as f32;
     (
-      self.viewport_org_x as f32 + (x - self.window_org_x as f32) * scale_x,
-      self.viewport_org_y as f32 + (y - self.window_org_y as f32) * scale_y,
+      (self.viewport_org_x as f32 + (x - self.window_org_x as f32) * scale_x) * self.output_scale_x,
+      (self.viewport_org_y as f32 + (y - self.window_org_y as f32) * scale_y) * self.output_scale_y,
     )
   }
 
@@ -1541,8 +1635,10 @@ impl EmfVectorState {
       return pen;
     }
     let width = pen.width as f32;
-    let scale_x = self.viewport_ext_x as f32 / self.window_ext_x.max(1) as f32;
-    let scale_y = self.viewport_ext_y as f32 / self.window_ext_y.max(1) as f32;
+    let scale_x =
+      self.viewport_ext_x as f32 / self.window_ext_x.max(1) as f32 * self.output_scale_x;
+    let scale_y =
+      self.viewport_ext_y as f32 / self.window_ext_y.max(1) as f32 * self.output_scale_y;
     let x_axis = (
       width * self.world_transform.m11 * scale_x,
       width * self.world_transform.m12 * scale_y,
@@ -1738,17 +1834,23 @@ impl EmfVectorState {
       for x in 0..width {
         let mask_x = nearest_raster_index(x, width, mask.width);
         let mask_color = raster_color(mask, mask_x, mask_y);
-        // The canonical SRCAND mask uses black for covered source pixels and
-        // white for the transparent destination. Preserve its one-bit edge
-        // while filtering only the color bitmap.
-        if u16::from(mask_color.r) + u16::from(mask_color.g) + u16::from(mask_color.b) >= 3 * 128 {
-          continue;
-        }
         let color = if interpolate {
-          bilinear_raster_color(image, x, y, width, height)
+          gdi_plus_bilinear_raster_color(image, x, y, width, height)
         } else {
           raster_color(image, x, y)
         };
+        // The canonical SRCAND mask uses black for covered source pixels and
+        // white for the transparent destination. GDI+ filters the paired
+        // SRCINVERT color bitmap independently, and a nonblack filtered
+        // sample is consequently part of the pair's opaque output even when
+        // its nearest one-bit mask sample is white. Keeping that color fringe
+        // is required before black/white destination reconstruction; masking
+        // first contracts icon edges.
+        if u16::from(mask_color.r) + u16::from(mask_color.g) + u16::from(mask_color.b) >= 3 * 128
+          && color == (EmfColor { r: 0, g: 0, b: 0 })
+        {
+          continue;
+        }
         self.set_pixel(left + x as i32, top + y as i32, color);
       }
     }
@@ -1852,8 +1954,10 @@ impl EmfVectorState {
 
   fn mapped_vertical_length(&self, logical_height: i32) -> f32 {
     let height = logical_height.unsigned_abs().max(1) as f32;
-    let scale_x = self.viewport_ext_x as f32 / self.window_ext_x.max(1) as f32;
-    let scale_y = self.viewport_ext_y as f32 / self.window_ext_y.max(1) as f32;
+    let scale_x =
+      self.viewport_ext_x as f32 / self.window_ext_x.max(1) as f32 * self.output_scale_x;
+    let scale_y =
+      self.viewport_ext_y as f32 / self.window_ext_y.max(1) as f32 * self.output_scale_y;
     let x = height * self.world_transform.m21 * scale_x;
     let y = height * self.world_transform.m22 * scale_y;
     x.hypot(y).max(1.0)
@@ -1861,8 +1965,10 @@ impl EmfVectorState {
 
   fn mapped_horizontal_distance(&self, logical_width: i64) -> f32 {
     let width = logical_width as f32;
-    let scale_x = self.viewport_ext_x as f32 / self.window_ext_x.max(1) as f32;
-    let scale_y = self.viewport_ext_y as f32 / self.window_ext_y.max(1) as f32;
+    let scale_x =
+      self.viewport_ext_x as f32 / self.window_ext_x.max(1) as f32 * self.output_scale_x;
+    let scale_y =
+      self.viewport_ext_y as f32 / self.window_ext_y.max(1) as f32 * self.output_scale_y;
     let x = (width * self.world_transform.m11 * scale_x).round();
     let y = (width * self.world_transform.m12 * scale_y).round();
     x.hypot(y).copysign(width)
@@ -1897,14 +2003,16 @@ impl EmfVectorState {
       .round()
       .max(1.0);
     self.draw_text_at_device(
-      mapped_x.round(),
-      mapped_y.round(),
-      text,
       color,
-      font,
-      height,
-      1.0,
-      None,
+      TextRenderRequest {
+        font,
+        text,
+        x: mapped_x.round(),
+        baseline_y: mapped_y.round(),
+        height,
+        horizontal_scale: 1.0,
+        advances: None,
+      },
     );
   }
 
@@ -1943,7 +2051,11 @@ impl EmfVectorState {
     // to device units before selecting and rasterizing the realized font.
     let mapped_x = mapped_x.round();
     let reference_y = reference_y.round();
-    let height = self.mapped_vertical_length(font_height).round().max(1.0);
+    // GDI realizes a transformed LOGFONT height in whole device pixels by
+    // truncating the positive magnitude. For example, the -11 logical Segoe
+    // UI font in tdf135653 maps to 22.83 pixels and Windows uses a 22-pixel
+    // realization; rounding to 23 grows every glyph one row above TA_TOP.
+    let height = self.mapped_vertical_length(font_height).floor().max(1.0);
     let mapped_y =
       self
         .font_cache
@@ -1956,6 +2068,8 @@ impl EmfVectorState {
     // [MS-EMF] 2.3.5.8 defines exScale/eyScale for GM_COMPATIBLE
     // text. LibreOffice's EMF reader applies their absolute ratio to the
     // realized font width while mapping the supplied Dx positions separately.
+    // A controlled Windows GDI+ replay with exScale changed to equal eyScale
+    // also widens the glyphs without changing their supplied origins.
     let horizontal_scale = if text_record.graphics_mode == 1
       && text_record.x_scale.is_finite()
       && text_record.y_scale.is_finite()
@@ -1966,54 +2080,40 @@ impl EmfVectorState {
       1.0
     };
     self.draw_text_at_device(
-      mapped_x,
-      mapped_y,
-      text,
       color,
-      font,
-      height,
-      horizontal_scale,
-      advances.as_deref(),
+      TextRenderRequest {
+        font,
+        text,
+        x: mapped_x,
+        baseline_y: mapped_y,
+        height,
+        horizontal_scale,
+        advances: advances.as_deref(),
+      },
     );
   }
 
-  fn draw_text_at_device(
-    &mut self,
-    mapped_x: f32,
-    mapped_y: f32,
-    text: &str,
-    color: EmfColor,
-    font: &WmfTextFont,
-    height: f32,
-    horizontal_scale: f32,
-    advances: Option<&[f32]>,
-  ) {
-    if let Some(glyphs) = self.font_cache.render_text(
-      font,
-      text,
-      mapped_x,
-      mapped_y,
-      height,
-      horizontal_scale,
-      advances,
-    ) {
+  fn draw_text_at_device(&mut self, color: EmfColor, request: TextRenderRequest<'_>) {
+    if let Some(glyphs) = self.font_cache.render_text(&request) {
       for glyph in &glyphs {
         self.draw_subpixel_glyph(glyph, color);
       }
       return;
     }
 
-    let scale = ((height as usize).max(7) / 7).max(1);
-    let mut cursor_x = mapped_x.round() as i32;
-    let baseline_y = mapped_y.round() as i32;
-    for (index, ch) in text.chars().enumerate() {
-      let advance = advances
+    let scale = ((request.height as usize).max(7) / 7).max(1);
+    let mut cursor_x = request.x.round() as i32;
+    let baseline_y = request.baseline_y.round() as i32;
+    for (index, ch) in request.text.chars().enumerate() {
+      let advance = request
+        .advances
         .and_then(|values| values.get(index))
         .copied()
         .unwrap_or((6 * scale) as f32)
         .round() as i32;
       if ch.is_whitespace() {
-        cursor_x += advances
+        cursor_x += request
+          .advances
           .and_then(|values| values.get(index))
           .copied()
           .unwrap_or((4 * scale) as f32)
@@ -3083,6 +3183,53 @@ fn bilinear_raster_color(
   }
 }
 
+/// Samples the independently filtered color branch of a GDI+ metafile blit.
+///
+/// `Graphics::DrawImage(Metafile, destination)` maps the first destination
+/// sample to the first source sample and advances by `(source - 1) / target`.
+/// This differs from the half-pixel convention used by ordinary decoded
+/// images. A 32-sample 0,8,..,248 ramp stretched to 66 samples therefore
+/// begins `0,4,8,11,15` and ends at 244 in Windows GDI+ playback.
+fn gdi_plus_bilinear_raster_color(
+  image: &RasterPixels,
+  x: usize,
+  y: usize,
+  target_width: usize,
+  target_height: usize,
+) -> EmfColor {
+  if image.width == 0 || image.height == 0 || target_width == 0 || target_height == 0 {
+    return EmfColor { r: 0, g: 0, b: 0 };
+  }
+  let source_coordinate = |target: usize, source_extent: usize, target_extent: usize| {
+    target as f32 * source_extent.saturating_sub(1) as f32 / target_extent as f32
+  };
+  let source_x = source_coordinate(x, image.width, target_width);
+  let source_y = source_coordinate(y, image.height, target_height);
+  let x0 = source_x.floor() as usize;
+  let y0 = source_y.floor() as usize;
+  let x1 = (x0 + 1).min(image.width - 1);
+  let y1 = (y0 + 1).min(image.height - 1);
+  let fraction_x = source_x - x0 as f32;
+  let fraction_y = source_y - y0 as f32;
+  let top_left = raster_color(image, x0, y0);
+  let top_right = raster_color(image, x1, y0);
+  let bottom_left = raster_color(image, x0, y1);
+  let bottom_right = raster_color(image, x1, y1);
+  let channel = |top_left: u8, top_right: u8, bottom_left: u8, bottom_right: u8| {
+    let top = f32::from(top_left) + (f32::from(top_right) - f32::from(top_left)) * fraction_x;
+    let bottom =
+      f32::from(bottom_left) + (f32::from(bottom_right) - f32::from(bottom_left)) * fraction_x;
+    (top + (bottom - top) * fraction_y)
+      .round()
+      .clamp(0.0, f32::from(u8::MAX)) as u8
+  };
+  EmfColor {
+    r: channel(top_left.r, top_right.r, bottom_left.r, bottom_right.r),
+    g: channel(top_left.g, top_right.g, bottom_left.g, bottom_right.g),
+    b: channel(top_left.b, top_right.b, bottom_left.b, bottom_right.b),
+  }
+}
+
 fn checkerboard_average_color(image: &RasterPixels) -> Option<EmfColor> {
   if image.width < 2 || image.height < 2 {
     return None;
@@ -3191,6 +3338,8 @@ impl WmfRenderState {
     let natural_width = window_ext_x.unsigned_abs().max(1) as usize;
     let natural_height = window_ext_y.unsigned_abs().max(1) as usize;
     let (width, height) = options.resolved_canvas_size(natural_width, natural_height);
+    let output_scale_x = width as f32 / natural_width as f32;
+    let output_scale_y = height as f32 / natural_height as f32;
     let object_count = metafile.header.number_of_objects as usize;
     let background_color = options.background_color.unwrap_or([255; 3]);
     let mut rgb = vec![0; width * height * RGB_BYTES_PER_PIXEL];
@@ -3202,14 +3351,16 @@ impl WmfRenderState {
       canvas: EmfVectorState {
         width,
         height,
+        output_scale_x,
+        output_scale_y,
         window_org_x,
         window_org_y,
         window_ext_x: window_ext_x.abs().max(1),
         window_ext_y: window_ext_y.abs().max(1),
         viewport_org_x: 0,
         viewport_org_y: 0,
-        viewport_ext_x: width as i32,
-        viewport_ext_y: height as i32,
+        viewport_ext_x: natural_width as i32,
+        viewport_ext_y: natural_height as i32,
         world_transform: EmfTransform::identity(),
         brush_colors: std::collections::HashMap::new(),
         pens: std::collections::HashMap::new(),
@@ -6160,6 +6311,26 @@ fn emf_natural_canvas_size(data: &[u8]) -> Result<(usize, usize), String> {
   ))
 }
 
+fn emf_physical_size(data: &[u8]) -> Option<MetafilePhysicalSize> {
+  const HUNDREDTHS_OF_MILLIMETER_PER_INCH: f32 = 2_540.0;
+  let frame_width = (i64::from(read_i32(data, EMF_FRAME_RIGHT_OFFSET).ok()?)
+    - i64::from(read_i32(data, EMF_FRAME_LEFT_OFFSET).ok()?))
+  .unsigned_abs();
+  let frame_height = (i64::from(read_i32(data, EMF_FRAME_BOTTOM_OFFSET).ok()?)
+    - i64::from(read_i32(data, EMF_FRAME_TOP_OFFSET).ok()?))
+  .unsigned_abs();
+  if frame_width == 0 || frame_height == 0 {
+    return None;
+  }
+  let (natural_width_px, natural_height_px) = emf_natural_canvas_size(data).ok()?;
+  Some(MetafilePhysicalSize {
+    width_pt: frame_width as f32 * 72.0 / HUNDREDTHS_OF_MILLIMETER_PER_INCH,
+    height_pt: frame_height as f32 * 72.0 / HUNDREDTHS_OF_MILLIMETER_PER_INCH,
+    natural_width_px: u32::try_from(natural_width_px).ok()?,
+    natural_height_px: u32::try_from(natural_height_px).ok()?,
+  })
+}
+
 fn is_emf(data: &[u8]) -> bool {
   data.len() >= EMF_HEADER_SIZE
     && matches!(read_u32(data, 0), Ok(1))
@@ -6498,6 +6669,11 @@ mod tests {
       .copy_from_slice(&260i32.to_le_bytes());
 
     assert_eq!(emf_natural_canvas_size(&data).unwrap(), (103, 66));
+    let physical = emf_physical_size(&data).unwrap();
+    assert!((physical.width_pt - 73.133_86).abs() < 0.000_1);
+    assert!((physical.height_pt - 45.269_29).abs() < 0.000_1);
+    assert_eq!(physical.natural_width_px, 103);
+    assert_eq!(physical.natural_height_px, 66);
   }
 
   #[test]
@@ -6643,6 +6819,32 @@ mod tests {
       }
       .resolved_canvas_size(76, 76),
       (400, 300)
+    );
+
+    let mut state = EmfVectorState::new_with_options(
+      &metafile_with_records(Vec::new()),
+      RenderOptions {
+        target_width_px: Some(4),
+        target_height_px: Some(3),
+        ..RenderOptions::default()
+      },
+    )
+    .expect("minimal EMF playback state");
+    // EMR_SET{WINDOW,VIEWPORT}EXT records describe the metafile's logical to
+    // natural-device mapping. They must not discard the player's outer
+    // target-viewport transform.
+    let (natural_width, natural_height) =
+      emf_natural_canvas_size(&metafile_with_records(Vec::new())).unwrap();
+    state.window_ext_x = natural_width as i32;
+    state.window_ext_y = natural_height as i32;
+    state.viewport_ext_x = natural_width as i32;
+    state.viewport_ext_y = natural_height as i32;
+    assert_eq!(
+      state.map_point(EmfPoint {
+        x: natural_width as i32,
+        y: natural_height as i32,
+      }),
+      (4.0, 3.0)
     );
   }
 
@@ -7286,6 +7488,79 @@ mod tests {
     let image = image::load_from_memory(&decoded.data).unwrap().to_rgba8();
     assert_eq!(image.get_pixel(0, 0).0, [0, 0, 255, 255]);
     assert_eq!(image.get_pixel(1, 0).0, [0, 0, 0, 0]);
+  }
+
+  #[test]
+  fn gdi_plus_metafile_bilinear_sampling_uses_endpoint_over_target_extent() {
+    let image = RasterPixels {
+      width: 32,
+      height: 1,
+      rgb: (0..32)
+        .flat_map(|index| {
+          let value = index * 8;
+          [value, value, value]
+        })
+        .collect(),
+    };
+    let samples = (0..66)
+      .map(|x| gdi_plus_bilinear_raster_color(&image, x, 0, 66, 1).r)
+      .collect::<Vec<_>>();
+
+    assert_eq!(&samples[..5], &[0, 4, 8, 11, 15]);
+    assert_eq!(samples[65], 244);
+  }
+
+  #[test]
+  fn resized_masked_blt_keeps_filtered_source_color_fringe() {
+    let mut mask_info = bitmap_info(2, 2, 1, BI_RGB);
+    mask_info.extend_from_slice(&[
+      0, 0, 0, 0, // black
+      255, 255, 255, 0, // white
+    ]);
+    let mask_bits = vec![
+      0x40, 0, 0, 0, // bottom row: black, white, padding
+      0x40, 0, 0, 0, // top row: black, white, padding
+    ];
+    let source_bits = vec![
+      255, 0, 0, 0, 0, 0, 0, 0, // bottom row: blue, black
+      255, 0, 0, 0, 0, 0, 0, 0, // top row: blue, black
+    ];
+    let emf = metafile_with_records(vec![
+      stretch_blt_record(mask_info, mask_bits, 0x0088_00C6),
+      stretch_blt_record(bitmap_info(2, 2, 32, BI_RGB), source_bits, 0x0066_0046),
+    ]);
+
+    let decoded = decode_metafile_as_raster_with_options(
+      &emf,
+      Some("image/x-emf"),
+      RenderOptions {
+        target_width_px: Some(4),
+        target_height_px: Some(2),
+        transparent_background: true,
+        ..RenderOptions::default()
+      },
+    )
+    .unwrap()
+    .unwrap();
+    let image = image::load_from_memory(&decoded.data).unwrap().to_rgba8();
+
+    assert_eq!(image.get_pixel(0, 0).0, [0, 0, 255, 255]);
+    assert_eq!(image.get_pixel(1, 0).0, [0, 0, 191, 255]);
+    assert_eq!(image.get_pixel(2, 0).0, [0, 0, 128, 255]);
+    assert_eq!(image.get_pixel(3, 0).0, [0, 0, 64, 255]);
+  }
+
+  #[test]
+  fn cleartype_box_decimation_displaces_rgb_windows_over_six_samples() {
+    let (left, width, coverage) = cleartype_box_decimate(&[255; 6], 6, 1, 0);
+
+    assert_eq!(left, -1);
+    assert_eq!(width, 3);
+    assert_eq!(
+      coverage,
+      [[0, 0, 85], [170, 255, 170], [85, 0, 0]],
+      "the one-pixel box is centered independently on the R, G, and B stripes"
+    );
   }
 
   #[test]
