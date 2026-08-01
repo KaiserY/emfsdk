@@ -495,12 +495,12 @@ impl WmfTextState {
       natural_height: window_ext_y.unsigned_abs().max(1) as f32,
       window_org_x,
       window_org_y,
-      window_ext_x: window_ext_x.abs().max(1),
-      window_ext_y: window_ext_y.abs().max(1),
+      window_ext_x: nonzero_mapping_extent(window_ext_x),
+      window_ext_y: nonzero_mapping_extent(window_ext_y),
       viewport_org_x: 0,
       viewport_org_y: 0,
-      viewport_ext_x: window_ext_x.abs().max(1),
-      viewport_ext_y: window_ext_y.abs().max(1),
+      viewport_ext_x: mapping_extent_magnitude(window_ext_x),
+      viewport_ext_y: mapping_extent_magnitude(window_ext_y),
       objects: vec![None; metafile.header.number_of_objects as usize],
       current_font_height: 12,
       current_font_family: None,
@@ -631,6 +631,17 @@ fn scale_wmf_extent(extent: i32, numerator: i16, denominator: i16) -> i32 {
     .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
 }
 
+fn nonzero_mapping_extent(extent: i32) -> i32 {
+  // [MS-WMF] §§2.3.5.28/30 store viewport and window extents as signed
+  // integers. Their sign participates in VExt/WExt and can reverse an axis;
+  // it is not a canvas-size magnitude.
+  if extent == 0 { 1 } else { extent }
+}
+
+fn mapping_extent_magnitude(extent: i32) -> i32 {
+  extent.saturating_abs().max(1)
+}
+
 fn wmf_text_font(value: &crate::wmf::WmfFontObject) -> WmfTextFont {
   let face_name = &value.face_name[..usize::from(value.face_name_bytes)];
   let face_name = &face_name[..face_name
@@ -670,16 +681,16 @@ fn extract_wmf_text_runs(data: &[u8]) -> Vec<MetafileTextRun> {
         state.window_org_y = i32::from(value.y);
       }
       WmfRecordData::SetWindowExt(value) => {
-        state.window_ext_x = i32::from(value.x).abs().max(1);
-        state.window_ext_y = i32::from(value.y).abs().max(1);
+        state.window_ext_x = nonzero_mapping_extent(i32::from(value.x));
+        state.window_ext_y = nonzero_mapping_extent(i32::from(value.y));
       }
       WmfRecordData::SetViewportOrg(value) => {
         state.viewport_org_x = i32::from(value.x);
         state.viewport_org_y = i32::from(value.y);
       }
       WmfRecordData::SetViewportExt(value) => {
-        state.viewport_ext_x = i32::from(value.x);
-        state.viewport_ext_y = i32::from(value.y);
+        state.viewport_ext_x = nonzero_mapping_extent(i32::from(value.x));
+        state.viewport_ext_y = nonzero_mapping_extent(i32::from(value.y));
       }
       WmfRecordData::OffsetWindowOrg(value) => {
         state.window_org_x += i32::from(value.x);
@@ -984,8 +995,8 @@ impl EmfTextState {
 
   fn map_point(&self, point: EmfPoint) -> (f32, f32) {
     let (x, y) = self.world_transform.apply(point);
-    let scale_x = self.viewport_ext_x as f32 / self.window_ext_x.max(1) as f32;
-    let scale_y = self.viewport_ext_y as f32 / self.window_ext_y.max(1) as f32;
+    let scale_x = self.viewport_ext_x as f32 / nonzero_mapping_extent(self.window_ext_x) as f32;
+    let scale_y = self.viewport_ext_y as f32 / nonzero_mapping_extent(self.window_ext_y) as f32;
     (
       self.viewport_org_x as f32 + (x - self.window_org_x as f32) * scale_x,
       self.viewport_org_y as f32 + (y - self.window_org_y as f32) * scale_y,
@@ -1003,8 +1014,8 @@ impl EmfTextState {
 
   fn map_horizontal_distance(&self, logical_width: i64) -> f32 {
     let width = logical_width as f32;
-    let scale_x = self.viewport_ext_x as f32 / self.window_ext_x.max(1) as f32;
-    let scale_y = self.viewport_ext_y as f32 / self.window_ext_y.max(1) as f32;
+    let scale_x = self.viewport_ext_x as f32 / nonzero_mapping_extent(self.window_ext_x) as f32;
+    let scale_y = self.viewport_ext_y as f32 / nonzero_mapping_extent(self.window_ext_y) as f32;
     let x = width * self.world_transform.m11 * scale_x;
     let y = width * self.world_transform.m12 * scale_y;
     x.hypot(y)
@@ -1622,8 +1633,8 @@ impl EmfVectorState {
 
   fn map_point(&self, point: EmfPoint) -> (f32, f32) {
     let (x, y) = self.world_transform.apply(point);
-    let scale_x = self.viewport_ext_x as f32 / self.window_ext_x.max(1) as f32;
-    let scale_y = self.viewport_ext_y as f32 / self.window_ext_y.max(1) as f32;
+    let scale_x = self.viewport_ext_x as f32 / nonzero_mapping_extent(self.window_ext_x) as f32;
+    let scale_y = self.viewport_ext_y as f32 / nonzero_mapping_extent(self.window_ext_y) as f32;
     (
       (self.viewport_org_x as f32 + (x - self.window_org_x as f32) * scale_x) * self.output_scale_x,
       (self.viewport_org_y as f32 + (y - self.window_org_y as f32) * scale_y) * self.output_scale_y,
@@ -1635,10 +1646,10 @@ impl EmfVectorState {
       return pen;
     }
     let width = pen.width as f32;
-    let scale_x =
-      self.viewport_ext_x as f32 / self.window_ext_x.max(1) as f32 * self.output_scale_x;
-    let scale_y =
-      self.viewport_ext_y as f32 / self.window_ext_y.max(1) as f32 * self.output_scale_y;
+    let scale_x = self.viewport_ext_x as f32 / nonzero_mapping_extent(self.window_ext_x) as f32
+      * self.output_scale_x;
+    let scale_y = self.viewport_ext_y as f32 / nonzero_mapping_extent(self.window_ext_y) as f32
+      * self.output_scale_y;
     let x_axis = (
       width * self.world_transform.m11 * scale_x,
       width * self.world_transform.m12 * scale_y,
@@ -1954,10 +1965,10 @@ impl EmfVectorState {
 
   fn mapped_vertical_length(&self, logical_height: i32) -> f32 {
     let height = logical_height.unsigned_abs().max(1) as f32;
-    let scale_x =
-      self.viewport_ext_x as f32 / self.window_ext_x.max(1) as f32 * self.output_scale_x;
-    let scale_y =
-      self.viewport_ext_y as f32 / self.window_ext_y.max(1) as f32 * self.output_scale_y;
+    let scale_x = self.viewport_ext_x as f32 / nonzero_mapping_extent(self.window_ext_x) as f32
+      * self.output_scale_x;
+    let scale_y = self.viewport_ext_y as f32 / nonzero_mapping_extent(self.window_ext_y) as f32
+      * self.output_scale_y;
     let x = height * self.world_transform.m21 * scale_x;
     let y = height * self.world_transform.m22 * scale_y;
     x.hypot(y).max(1.0)
@@ -1965,10 +1976,10 @@ impl EmfVectorState {
 
   fn mapped_horizontal_distance(&self, logical_width: i64) -> f32 {
     let width = logical_width as f32;
-    let scale_x =
-      self.viewport_ext_x as f32 / self.window_ext_x.max(1) as f32 * self.output_scale_x;
-    let scale_y =
-      self.viewport_ext_y as f32 / self.window_ext_y.max(1) as f32 * self.output_scale_y;
+    let scale_x = self.viewport_ext_x as f32 / nonzero_mapping_extent(self.window_ext_x) as f32
+      * self.output_scale_x;
+    let scale_y = self.viewport_ext_y as f32 / nonzero_mapping_extent(self.window_ext_y) as f32
+      * self.output_scale_y;
     let x = (width * self.world_transform.m11 * scale_x).round();
     let y = (width * self.world_transform.m12 * scale_y).round();
     x.hypot(y).copysign(width)
@@ -3355,8 +3366,8 @@ impl WmfRenderState {
         output_scale_y,
         window_org_x,
         window_org_y,
-        window_ext_x: window_ext_x.abs().max(1),
-        window_ext_y: window_ext_y.abs().max(1),
+        window_ext_x: nonzero_mapping_extent(window_ext_x),
+        window_ext_y: nonzero_mapping_extent(window_ext_y),
         viewport_org_x: 0,
         viewport_org_y: 0,
         viewport_ext_x: natural_width as i32,
@@ -3588,16 +3599,16 @@ fn decode_wmf_as_raster(
         state.canvas.window_org_y = i32::from(value.y);
       }
       WmfRecordData::SetWindowExt(value) => {
-        state.canvas.window_ext_x = i32::from(value.x).abs().max(1);
-        state.canvas.window_ext_y = i32::from(value.y).abs().max(1);
+        state.canvas.window_ext_x = nonzero_mapping_extent(i32::from(value.x));
+        state.canvas.window_ext_y = nonzero_mapping_extent(i32::from(value.y));
       }
       WmfRecordData::SetViewportOrg(value) => {
         state.canvas.viewport_org_x = i32::from(value.x);
         state.canvas.viewport_org_y = i32::from(value.y);
       }
       WmfRecordData::SetViewportExt(value) => {
-        state.canvas.viewport_ext_x = i32::from(value.x).abs().max(1);
-        state.canvas.viewport_ext_y = i32::from(value.y).abs().max(1);
+        state.canvas.viewport_ext_x = nonzero_mapping_extent(i32::from(value.x));
+        state.canvas.viewport_ext_y = nonzero_mapping_extent(i32::from(value.y));
       }
       WmfRecordData::IntersectClipRect(value) => {
         state.canvas.set_clip_rect_logical(
@@ -4034,8 +4045,8 @@ fn wmf_initial_window(metafile: &WmfMetafileRef<'_>) -> (i32, i32, i32, i32) {
         org_y = i32::from(value.y);
       }
       Ok(WmfRecordData::SetWindowExt(value)) => {
-        ext_x = i32::from(value.x).abs().max(1);
-        ext_y = i32::from(value.y).abs().max(1);
+        ext_x = nonzero_mapping_extent(i32::from(value.x));
+        ext_y = nonzero_mapping_extent(i32::from(value.y));
         break;
       }
       Ok(WmfRecordData::Eof(_)) => break,
