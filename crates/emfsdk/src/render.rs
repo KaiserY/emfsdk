@@ -87,6 +87,7 @@ const EMR_PIE: u32 = 47;
 const EMR_LINE_TO: u32 = 54;
 const EMR_BIT_BLT: u32 = 76;
 const EMR_STRETCH_BLT: u32 = 77;
+const EMR_MASK_BLT: u32 = 78;
 const EMR_SET_DIBITS_TO_DEVICE: u32 = 80;
 const EMR_STRETCH_DIBITS: u32 = 81;
 const EMR_EXT_CREATE_FONT_INDIRECT_W: u32 = 82;
@@ -191,6 +192,26 @@ pub struct RenderOptions {
   /// rescales the raster. This matches filtered GDI+/Cairo image playback and
   /// prevents phase-biased moire in PDF consumers.
   pub filter_high_frequency_pattern_brushes: bool,
+  /// Replay text state without painting glyphs into the raster destination.
+  ///
+  /// This is useful when a fixed-output host lifts metafile text into its own
+  /// native text layer. Text alignment and `TA_UPDATECP` state still advance,
+  /// and `ETO_OPAQUE` background rectangles remain part of the raster replay.
+  pub suppress_text: bool,
+  /// Skip solid-brush `PATCOPY` rectangles that a caller lifts into a vector
+  /// layer with [`extract_metafile_solid_rects`].
+  ///
+  /// Other pattern fills and raster operations stay in the replay because
+  /// they cannot be separated from the destination surface in general.
+  pub suppress_solid_pattern_rects: bool,
+  /// Skip standalone `SRCCOPY` DIBs and adjacent masked-bitmap ROP pairs
+  /// lifted with [`extract_metafile_bitmap_layers`].
+  ///
+  /// Only source-copy records and the source-backed transparent-bitmap
+  /// combinations recognized by LibreOffice's WMF reader are separable.
+  /// Unmatched, non-binary, and destination-dependent bitmap records remain
+  /// in the raster replay.
+  pub suppress_bitmap_layers: bool,
 }
 
 impl RenderOptions {
@@ -318,6 +339,45 @@ pub struct MetafileTextRun {
   pub bold: bool,
   pub italic: bool,
   pub width: Option<f32>,
+  /// Normalized distances between consecutive character-cell origins.
+  ///
+  /// GDI `ExtTextOut` owns glyph placement through its `Dx` array. Keeping
+  /// only the summed width loses authored gaps such as MathType's layered
+  /// replacement text, where every run starts at the same reference point
+  /// and `Dx` carries all horizontal geometry.
+  pub advances: Option<Vec<f32>>,
+  /// A destination-dependent ternary raster operation occurred earlier in
+  /// this record stream.
+  ///
+  /// Such an operation reads the accumulated playback surface, so a fixed
+  /// output backend cannot lift this run into an independent text layer
+  /// without changing the preceding bitmap composition. Raw semantic clients
+  /// may still consume the run; vector/PDF overlays should keep it in the
+  /// raster fallback.
+  pub requires_raster_backdrop: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MetafileSolidRect {
+  pub x: f32,
+  pub y: f32,
+  pub width: f32,
+  pub height: f32,
+  pub color: [u8; 3],
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MetafileBitmapLayer {
+  /// A self-contained image for the lifted bitmap layer.
+  pub data: Vec<u8>,
+  pub content_type: &'static str,
+  /// Destination rectangle normalized to the metafile playback viewport.
+  pub x: f32,
+  pub y: f32,
+  pub width: f32,
+  pub height: f32,
+  pub flip_horizontal: bool,
+  pub flip_vertical: bool,
 }
 
 pub fn extract_metafile_text_runs(data: &[u8], content_type: Option<&str>) -> Vec<MetafileTextRun> {
@@ -333,12 +393,46 @@ pub fn extract_metafile_text_runs(data: &[u8], content_type: Option<&str>) -> Ve
   Vec::new()
 }
 
+/// Returns separable, normalized solid-brush `PATCOPY` rectangles.
+///
+/// The coordinates use the same normalized playback viewport as
+/// [`extract_metafile_text_runs`]. Unsupported brushes and destination-
+/// dependent operations are deliberately left in the raster replay.
+pub fn extract_metafile_solid_rects(
+  data: &[u8],
+  content_type: Option<&str>,
+) -> Vec<MetafileSolidRect> {
+  if !looks_like_metafile(data, content_type) || !crate::wmf::looks_like_wmf(data) {
+    return Vec::new();
+  }
+  extract_wmf_solid_rects(data)
+}
+
+/// Returns separable bitmap layers from WMF DIB records.
+///
+/// Standalone `SRCCOPY` records are independent opaque layers. LibreOffice's
+/// WMF reader additionally recognizes `SRCPAINT` + `SRCAND`, `SRCAND` +
+/// `SRCPAINT`, and `SRCAND` + `SRCINVERT` records with the same destination as
+/// one transparent bitmap. This extractor requires a binary monochrome mask
+/// and matching source geometry for those pairs so unrelated destination-
+/// dependent ROPs cannot be lifted accidentally.
+pub fn extract_metafile_bitmap_layers(
+  data: &[u8],
+  content_type: Option<&str>,
+) -> Vec<MetafileBitmapLayer> {
+  if !looks_like_metafile(data, content_type) || !crate::wmf::looks_like_wmf(data) {
+    return Vec::new();
+  }
+  extract_wmf_bitmap_layers(data)
+}
+
 fn extract_emf_text_runs(data: &[u8]) -> Vec<MetafileTextRun> {
   let mut state = match EmfTextState::new(data) {
     Ok(state) => state,
     Err(_) => return Vec::new(),
   };
   let mut runs = Vec::new();
+  let mut requires_raster_backdrop = false;
   let mut pos = EMF_HEADER_SIZE;
   while pos + EMF_RECORD_HEADER_SIZE <= data.len() {
     let Ok(record_type) = read_u32(data, pos) else {
@@ -351,6 +445,9 @@ fn extract_emf_text_runs(data: &[u8]) -> Vec<MetafileTextRun> {
     if record_size < EMF_RECORD_HEADER_SIZE || pos + record_size > data.len() {
       break;
     }
+
+    requires_raster_backdrop |=
+      emf_record_uses_destination_raster(data, pos, record_type, record_size);
 
     match record_type {
       EMR_SET_WINDOW_ORG_EX if record_size >= 16 => {
@@ -380,6 +477,14 @@ fn extract_emf_text_runs(data: &[u8]) -> Vec<MetafileTextRun> {
           read_u32(data, pos + 8).unwrap_or_default() as u16,
         );
       }
+      EMR_MOVE_TO_EX if record_size >= 16 => {
+        state.current_pos = EmfPoint {
+          x: read_i32(data, pos + 8).unwrap_or(state.current_pos.x),
+          y: read_i32(data, pos + 12).unwrap_or(state.current_pos.y),
+        };
+      }
+      EMR_SAVE_DC => state.save(),
+      EMR_RESTORE_DC => state.restore(),
       EMR_SET_WORLD_TRANSFORM if record_size >= 32 => {
         if let Ok(transform) = read_xform(data, pos + 8) {
           state.world_transform = transform;
@@ -421,6 +526,8 @@ fn extract_emf_text_runs(data: &[u8]) -> Vec<MetafileTextRun> {
           && !text.trim().is_empty()
           && let Some(run) = state.text_run(data, pos, record_size, text)
         {
+          let mut run = run;
+          run.requires_raster_backdrop = requires_raster_backdrop;
           runs.push(run);
         }
       }
@@ -429,6 +536,8 @@ fn extract_emf_text_runs(data: &[u8]) -> Vec<MetafileTextRun> {
           && !text.trim().is_empty()
           && let Some(run) = state.text_run(data, pos, record_size, text)
         {
+          let mut run = run;
+          run.requires_raster_backdrop = requires_raster_backdrop;
           runs.push(run);
         }
       }
@@ -442,6 +551,33 @@ fn extract_emf_text_runs(data: &[u8]) -> Vec<MetafileTextRun> {
   runs
 }
 
+fn emf_record_uses_destination_raster(
+  data: &[u8],
+  record_offset: usize,
+  record_type: u32,
+  record_size: usize,
+) -> bool {
+  let operation_uses_destination = |offset| {
+    record_size >= offset + 4
+      && read_u32(data, record_offset + offset)
+        .ok()
+        .is_some_and(|raw| emf_ternary_raster_operation(raw).uses_destination())
+  };
+  match record_type {
+    EMR_BIT_BLT | EMR_STRETCH_BLT => operation_uses_destination(EMR_BLT_ROP_OFFSET),
+    EMR_STRETCH_DIBITS => operation_uses_destination(EMR_STRETCH_DIBITS_ROP_OFFSET),
+    EMR_MASK_BLT if record_size >= EMR_BLT_ROP_OFFSET + 4 => {
+      let Ok(rop4) = read_u32(data, record_offset + EMR_BLT_ROP_OFFSET) else {
+        return false;
+      };
+      let background = WmfTernaryRasterOperationCode::from_raw(((rop4 >> 16) & 0xFF) as u8);
+      let foreground = WmfTernaryRasterOperationCode::from_raw(((rop4 >> 24) & 0xFF) as u8);
+      background.uses_destination() || foreground.uses_destination()
+    }
+    _ => false,
+  }
+}
+
 #[derive(Clone)]
 struct WmfTextSnapshot {
   window_org_x: i32,
@@ -452,8 +588,12 @@ struct WmfTextSnapshot {
   viewport_org_y: i32,
   viewport_ext_x: i32,
   viewport_ext_y: i32,
+  current_pos_x: i32,
+  current_pos_y: i32,
   current_font_height: i32,
   current_font_family: Option<String>,
+  current_font_char_set: u8,
+  current_font_weight: u16,
   current_font_bold: bool,
   current_font_italic: bool,
   text_alignment: WmfTextAlignmentModeFlags,
@@ -463,6 +603,7 @@ struct WmfTextSnapshot {
 struct WmfTextFont {
   height: i32,
   family: Option<String>,
+  char_set: u8,
   weight: u16,
   italic: bool,
 }
@@ -478,13 +619,18 @@ struct WmfTextState {
   viewport_org_y: i32,
   viewport_ext_x: i32,
   viewport_ext_y: i32,
+  current_pos_x: i32,
+  current_pos_y: i32,
   objects: Vec<Option<WmfTextFont>>,
   current_font_height: i32,
   current_font_family: Option<String>,
+  current_font_char_set: u8,
+  current_font_weight: u16,
   current_font_bold: bool,
   current_font_italic: bool,
   text_alignment: WmfTextAlignmentModeFlags,
   saved: Vec<WmfTextSnapshot>,
+  font_cache: RenderFontCache,
 }
 
 impl WmfTextState {
@@ -501,13 +647,18 @@ impl WmfTextState {
       viewport_org_y: 0,
       viewport_ext_x: mapping_extent_magnitude(window_ext_x),
       viewport_ext_y: mapping_extent_magnitude(window_ext_y),
+      current_pos_x: 0,
+      current_pos_y: 0,
       objects: vec![None; metafile.header.number_of_objects as usize],
       current_font_height: 12,
       current_font_family: None,
+      current_font_char_set: crate::wmf::WmfCharacterSet::Ansi.raw(),
+      current_font_weight: 400,
       current_font_bold: false,
       current_font_italic: false,
       text_alignment: WmfTextAlignmentModeFlags::empty(),
       saved: Vec::new(),
+      font_cache: RenderFontCache::load(),
     }
   }
 
@@ -515,6 +666,7 @@ impl WmfTextState {
     let object = font.unwrap_or(WmfTextFont {
       height: 0,
       family: None,
+      char_set: crate::wmf::WmfCharacterSet::Ansi.raw(),
       weight: 400,
       italic: false,
     });
@@ -531,6 +683,8 @@ impl WmfTextState {
     {
       self.current_font_height = font.height.abs().max(7);
       self.current_font_family = font.family.clone();
+      self.current_font_char_set = font.char_set;
+      self.current_font_weight = font.weight;
       self.current_font_bold = font.weight > 400;
       self.current_font_italic = font.italic;
     }
@@ -546,8 +700,12 @@ impl WmfTextState {
       viewport_org_y: self.viewport_org_y,
       viewport_ext_x: self.viewport_ext_x,
       viewport_ext_y: self.viewport_ext_y,
+      current_pos_x: self.current_pos_x,
+      current_pos_y: self.current_pos_y,
       current_font_height: self.current_font_height,
       current_font_family: self.current_font_family.clone(),
+      current_font_char_set: self.current_font_char_set,
+      current_font_weight: self.current_font_weight,
       current_font_bold: self.current_font_bold,
       current_font_italic: self.current_font_italic,
       text_alignment: self.text_alignment,
@@ -566,8 +724,12 @@ impl WmfTextState {
     self.viewport_org_y = snapshot.viewport_org_y;
     self.viewport_ext_x = snapshot.viewport_ext_x;
     self.viewport_ext_y = snapshot.viewport_ext_y;
+    self.current_pos_x = snapshot.current_pos_x;
+    self.current_pos_y = snapshot.current_pos_y;
     self.current_font_height = snapshot.current_font_height;
     self.current_font_family = snapshot.current_font_family;
+    self.current_font_char_set = snapshot.current_font_char_set;
+    self.current_font_weight = snapshot.current_font_weight;
     self.current_font_bold = snapshot.current_font_bold;
     self.current_font_italic = snapshot.current_font_italic;
     self.text_alignment = snapshot.text_alignment;
@@ -584,31 +746,82 @@ impl WmfTextState {
   }
 
   fn text_run(
-    &self,
+    &mut self,
     text: String,
     x: i16,
     y: i16,
-    logical_width: Option<f32>,
+    logical_advances: Option<&[i16]>,
   ) -> Option<MetafileTextRun> {
     if text.is_empty() {
       return None;
     }
     let scale_x = self.viewport_ext_x as f32 / self.window_ext_x as f32;
     let scale_y = self.viewport_ext_y as f32 / self.window_ext_y as f32;
-    let mapped_x = self.viewport_org_x as f32 + (i32::from(x) - self.window_org_x) as f32 * scale_x;
-    let baseline_y = if self
+    let logical_width = logical_advances.map(|values| {
+      values.iter().fold(0i32, |total, advance| {
+        total.saturating_add(i32::from(*advance))
+      })
+    });
+    let update_current_position = self
       .text_alignment
-      .intersects(WmfTextAlignmentModeFlags::BASELINE | WmfTextAlignmentModeFlags::BOTTOM)
-    {
-      f32::from(y)
+      .contains(WmfTextAlignmentModeFlags::UPDATE_CP);
+    let (reference_x, reference_y) = if update_current_position {
+      (self.current_pos_x, self.current_pos_y)
     } else {
-      // TA_TOP aligns the reference point to the top of the character
-      // cell. Without an installed-face dependency here, LOGFONT height is
-      // the bounded GDI-compatible baseline advance.
-      f32::from(y) + self.current_font_height.abs() as f32
+      (i32::from(x), i32::from(y))
     };
-    let mapped_y = self.viewport_org_y as f32 + (baseline_y - self.window_org_y as f32) * scale_y;
-    Some(MetafileTextRun {
+    let aligned_x = if self
+      .text_alignment
+      .contains(WmfTextAlignmentModeFlags::CENTER)
+    {
+      reference_x.saturating_sub(logical_width.unwrap_or_default() / 2)
+    } else if self
+      .text_alignment
+      .contains(WmfTextAlignmentModeFlags::RIGHT)
+    {
+      reference_x.saturating_sub(logical_width.unwrap_or_default())
+    } else {
+      reference_x
+    };
+    let mapped_x = self.viewport_org_x as f32 + (aligned_x - self.window_org_x) as f32 * scale_x;
+    let mapped_reference_y =
+      self.viewport_org_y as f32 + (reference_y - self.window_org_y) as f32 * scale_y;
+    let font = WmfTextFont {
+      height: self.current_font_height,
+      family: self.current_font_family.clone(),
+      char_set: self.current_font_char_set,
+      weight: self.current_font_weight,
+      italic: self.current_font_italic,
+    };
+    // [MS-WMF] §2.1.2.3 defines TA_TOP against the realized font's
+    // alignment box. GDI therefore advances by TEXTMETRIC.tmAscent, not by
+    // the requested LOGFONT character height. Use the same realized-face
+    // metrics as EMF extraction and raster playback; retain lfHeight only as
+    // the no-font fallback inside `baseline_for_alignment`.
+    let mapped_font_height = self.current_font_height.abs() as f32 * scale_y.abs();
+    let continuous_baseline = self.font_cache.baseline_for_alignment(
+      &font,
+      mapped_font_height.max(1.0),
+      mapped_reference_y,
+      self.text_alignment,
+    );
+    // Windows exposes TEXTMETRIC ascent/descent in integer device pixels.
+    // Keep the mapped reference coordinate intact, but realize the alignment
+    // advance on that integer grid before normalizing it for a vector host.
+    let alignment_advance = continuous_baseline - mapped_reference_y;
+    let realized_advance = if alignment_advance.is_sign_negative() {
+      alignment_advance.floor()
+    } else {
+      alignment_advance.ceil()
+    };
+    let mapped_y = mapped_reference_y + realized_advance;
+    let advances = logical_advances.map(|values| {
+      values
+        .iter()
+        .map(|advance| f32::from(*advance) * scale_x / self.natural_width)
+        .collect::<Vec<_>>()
+    });
+    let run = MetafileTextRun {
       text,
       x: mapped_x / self.natural_width,
       y: mapped_y / self.natural_height,
@@ -616,11 +829,461 @@ impl WmfTextState {
       font_family: self.current_font_family.clone(),
       bold: self.current_font_bold,
       italic: self.current_font_italic,
-      width: logical_width
-        .map(|width| width * scale_x.abs() / self.natural_width)
+      width: advances
+        .as_ref()
+        .map(|values| values.iter().copied().sum::<f32>().abs())
         .filter(|width| width.is_finite() && *width > 0.0),
+      advances,
+      requires_raster_backdrop: false,
+    };
+    if update_current_position && let Some(logical_width) = logical_width {
+      self.current_pos_x = aligned_x.saturating_add(logical_width);
+      self.current_pos_y = reference_y;
+    }
+    Some(run)
+  }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum WmfSolidRectObject {
+  Brush(Option<EmfColor>),
+  Other,
+}
+
+#[derive(Clone, Debug)]
+struct WmfSolidRectSnapshot {
+  window_org_x: i32,
+  window_org_y: i32,
+  window_ext_x: i32,
+  window_ext_y: i32,
+  viewport_org_x: i32,
+  viewport_org_y: i32,
+  viewport_ext_x: i32,
+  viewport_ext_y: i32,
+  current_solid_brush: Option<EmfColor>,
+}
+
+struct WmfSolidRectState {
+  natural_width: f32,
+  natural_height: f32,
+  window_org_x: i32,
+  window_org_y: i32,
+  window_ext_x: i32,
+  window_ext_y: i32,
+  viewport_org_x: i32,
+  viewport_org_y: i32,
+  viewport_ext_x: i32,
+  viewport_ext_y: i32,
+  objects: Vec<Option<WmfSolidRectObject>>,
+  current_solid_brush: Option<EmfColor>,
+  saved: Vec<WmfSolidRectSnapshot>,
+}
+
+impl WmfSolidRectState {
+  fn new(metafile: &WmfMetafileRef<'_>) -> Self {
+    let (window_org_x, window_org_y, window_ext_x, window_ext_y) = wmf_initial_window(metafile);
+    let natural_width = mapping_extent_magnitude(window_ext_x) as f32;
+    let natural_height = mapping_extent_magnitude(window_ext_y) as f32;
+    Self {
+      natural_width,
+      natural_height,
+      window_org_x,
+      window_org_y,
+      window_ext_x: nonzero_mapping_extent(window_ext_x),
+      window_ext_y: nonzero_mapping_extent(window_ext_y),
+      viewport_org_x: 0,
+      viewport_org_y: 0,
+      viewport_ext_x: natural_width as i32,
+      viewport_ext_y: natural_height as i32,
+      objects: vec![None; metafile.header.number_of_objects as usize],
+      current_solid_brush: None,
+      saved: Vec::new(),
+    }
+  }
+
+  fn insert_object(&mut self, object: WmfSolidRectObject) {
+    if let Some(slot) = self.objects.iter_mut().find(|slot| slot.is_none()) {
+      *slot = Some(object);
+    } else {
+      self.objects.push(Some(object));
+    }
+  }
+
+  fn select_object(&mut self, index: u16) {
+    if let Some(Some(WmfSolidRectObject::Brush(color))) = self.objects.get(index as usize).copied()
+    {
+      self.current_solid_brush = color;
+    }
+  }
+
+  fn save(&mut self) {
+    self.saved.push(WmfSolidRectSnapshot {
+      window_org_x: self.window_org_x,
+      window_org_y: self.window_org_y,
+      window_ext_x: self.window_ext_x,
+      window_ext_y: self.window_ext_y,
+      viewport_org_x: self.viewport_org_x,
+      viewport_org_y: self.viewport_org_y,
+      viewport_ext_x: self.viewport_ext_x,
+      viewport_ext_y: self.viewport_ext_y,
+      current_solid_brush: self.current_solid_brush,
+    });
+  }
+
+  fn restore(&mut self) {
+    let Some(saved) = self.saved.pop() else {
+      return;
+    };
+    self.window_org_x = saved.window_org_x;
+    self.window_org_y = saved.window_org_y;
+    self.window_ext_x = saved.window_ext_x;
+    self.window_ext_y = saved.window_ext_y;
+    self.viewport_org_x = saved.viewport_org_x;
+    self.viewport_org_y = saved.viewport_org_y;
+    self.viewport_ext_x = saved.viewport_ext_x;
+    self.viewport_ext_y = saved.viewport_ext_y;
+    self.current_solid_brush = saved.current_solid_brush;
+  }
+
+  fn scale_window(&mut self, value: crate::wmf::WmfScaleExtRecord) {
+    self.window_ext_x = scale_wmf_extent(self.window_ext_x, value.x_num, value.x_denom);
+    self.window_ext_y = scale_wmf_extent(self.window_ext_y, value.y_num, value.y_denom);
+  }
+
+  fn scale_viewport(&mut self, value: crate::wmf::WmfScaleExtRecord) {
+    self.viewport_ext_x = scale_wmf_extent(self.viewport_ext_x, value.x_num, value.x_denom);
+    self.viewport_ext_y = scale_wmf_extent(self.viewport_ext_y, value.y_num, value.y_denom);
+  }
+
+  fn normalized_rect(
+    &self,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+  ) -> Option<(f32, f32, f32, f32, bool, bool)> {
+    let scale_x = self.viewport_ext_x as f32 / self.window_ext_x as f32;
+    let scale_y = self.viewport_ext_y as f32 / self.window_ext_y as f32;
+    let map_x =
+      |value: i32| self.viewport_org_x as f32 + (value - self.window_org_x) as f32 * scale_x;
+    let map_y =
+      |value: i32| self.viewport_org_y as f32 + (value - self.window_org_y) as f32 * scale_y;
+    let first_x = map_x(x);
+    let second_x = map_x(x.saturating_add(width));
+    let first_y = map_y(y);
+    let second_y = map_y(y.saturating_add(height));
+    let left = first_x.min(second_x) / self.natural_width;
+    let top = first_y.min(second_y) / self.natural_height;
+    let width = (first_x - second_x).abs() / self.natural_width;
+    let height = (first_y - second_y).abs() / self.natural_height;
+    (left.is_finite()
+      && top.is_finite()
+      && width.is_finite()
+      && height.is_finite()
+      && width > 0.0
+      && height > 0.0)
+      .then_some((
+        left,
+        top,
+        width,
+        height,
+        second_x < first_x,
+        second_y < first_y,
+      ))
+  }
+
+  fn solid_rect(&self, value: crate::wmf::WmfPatBltRecord) -> Option<MetafileSolidRect> {
+    if value.raster_operation_code() != WmfTernaryRasterOperationCode::PATCOPY {
+      return None;
+    }
+    let color = self.current_solid_brush?;
+    let (x, y, width, height, _, _) = self.normalized_rect(
+      i32::from(value.x_left),
+      i32::from(value.y_left),
+      i32::from(value.width),
+      i32::from(value.height),
+    )?;
+    Some(MetafileSolidRect {
+      x,
+      y,
+      width,
+      height,
+      color: [color.r, color.g, color.b],
     })
   }
+}
+
+fn extract_wmf_solid_rects(data: &[u8]) -> Vec<MetafileSolidRect> {
+  let Ok(metafile) = WmfMetafileRef::from_bytes(data) else {
+    return Vec::new();
+  };
+  let mut state = WmfSolidRectState::new(&metafile);
+  let mut rects = Vec::new();
+  let mut records = metafile.records().peekable();
+  while let Some(record) = records.next() {
+    let Ok(record) = record.parse_data() else {
+      continue;
+    };
+    match record {
+      WmfRecordData::Eof(_) => break,
+      WmfRecordData::SaveDc => state.save(),
+      WmfRecordData::RestoreDc(_) => state.restore(),
+      WmfRecordData::SetWindowOrg(value) => {
+        state.window_org_x = i32::from(value.x);
+        state.window_org_y = i32::from(value.y);
+      }
+      WmfRecordData::SetWindowExt(value) => {
+        state.window_ext_x = nonzero_mapping_extent(i32::from(value.x));
+        state.window_ext_y = nonzero_mapping_extent(i32::from(value.y));
+      }
+      WmfRecordData::SetViewportOrg(value) => {
+        state.viewport_org_x = i32::from(value.x);
+        state.viewport_org_y = i32::from(value.y);
+      }
+      WmfRecordData::SetViewportExt(value) => {
+        state.viewport_ext_x = nonzero_mapping_extent(i32::from(value.x));
+        state.viewport_ext_y = nonzero_mapping_extent(i32::from(value.y));
+      }
+      WmfRecordData::OffsetWindowOrg(value) => {
+        state.window_org_x += i32::from(value.x);
+        state.window_org_y += i32::from(value.y);
+      }
+      WmfRecordData::OffsetViewportOrg(value) => {
+        state.viewport_org_x += i32::from(value.x);
+        state.viewport_org_y += i32::from(value.y);
+      }
+      WmfRecordData::ScaleWindowExt(value) => state.scale_window(value),
+      WmfRecordData::ScaleViewportExt(value) => state.scale_viewport(value),
+      WmfRecordData::CreateBrushIndirect(value) => {
+        let color = (value.brush_style_kind() == Some(WmfBrushStyle::Solid))
+          .then(|| color_ref_to_emf(value.color_ref));
+        let object = WmfSolidRectObject::Brush(color);
+        state.insert_object(object);
+      }
+      WmfRecordData::CreatePenIndirect(_)
+      | WmfRecordData::CreateFontIndirect(_)
+      | WmfRecordData::CreatePalette(_)
+      | WmfRecordData::CreateRegion(_) => {
+        state.insert_object(WmfSolidRectObject::Other);
+      }
+      WmfRecordData::CreatePatternBrush(_) | WmfRecordData::DibCreatePatternBrush(_) => {
+        state.insert_object(WmfSolidRectObject::Brush(None));
+      }
+      WmfRecordData::SelectObject(value) => state.select_object(value.index),
+      WmfRecordData::DeleteObject(value) => {
+        if let Some(slot) = state.objects.get_mut(value.index as usize) {
+          *slot = None;
+        }
+      }
+      WmfRecordData::PatBlt(value) => {
+        if let Some(rect) = state.solid_rect(value) {
+          rects.push(rect);
+        }
+      }
+      _ => {}
+    }
+  }
+  rects
+}
+
+struct WmfMaskedBitmapPair {
+  source: RasterPixels,
+  mask: RasterPixels,
+  alpha_is_mask_value: bool,
+}
+
+fn same_wmf_dib_geometry(
+  first: &crate::wmf::WmfDibStretchBltRecord,
+  second: &crate::wmf::WmfDibStretchBltRecord,
+) -> bool {
+  first.x_dest == second.x_dest
+    && first.y_dest == second.y_dest
+    && first.dest_width == second.dest_width
+    && first.dest_height == second.dest_height
+    && first.x_src == second.x_src
+    && first.y_src == second.y_src
+    && first.src_width == second.src_width
+    && first.src_height == second.src_height
+}
+
+fn full_wmf_dib_source(value: &crate::wmf::WmfDibStretchBltRecord) -> Option<RasterPixels> {
+  let bytes = value.target.source_bytes()?;
+  let image = packed_dib_to_rgb(bytes, DibColorUsage::RgbColors)
+    .ok()
+    .flatten()?;
+  // Keep partial source rectangles in the ordinary raster replay until their
+  // bottom-up DIB coordinate and mirroring semantics can be represented by a
+  // standalone layer without ambiguity. The transparent previews emitted by
+  // Office use the complete DIB here.
+  let source_width = i32::from(value.src_width).unsigned_abs() as usize;
+  let source_height = i32::from(value.src_height).unsigned_abs() as usize;
+  (value.x_src == 0
+    && value.y_src == 0
+    && source_width == image.width
+    && source_height == image.height)
+    .then_some(image)
+}
+
+fn wmf_masked_bitmap_pair(
+  first: &crate::wmf::WmfDibStretchBltRecord,
+  second: &crate::wmf::WmfDibStretchBltRecord,
+) -> Option<WmfMaskedBitmapPair> {
+  if !same_wmf_dib_geometry(first, second) {
+    return None;
+  }
+  let alpha_is_mask_value = match (
+    first.raster_operation_code(),
+    second.raster_operation_code(),
+  ) {
+    (WmfTernaryRasterOperationCode::SRCPAINT, WmfTernaryRasterOperationCode::SRCAND) => true,
+    (
+      WmfTernaryRasterOperationCode::SRCAND,
+      WmfTernaryRasterOperationCode::SRCPAINT | WmfTernaryRasterOperationCode::SRCINVERT,
+    ) => false,
+    _ => return None,
+  };
+  let mask = full_wmf_dib_source(first)?;
+  if !is_binary_monochrome_raster(&mask) {
+    return None;
+  }
+  let source = full_wmf_dib_source(second)?;
+  if source.width != mask.width || source.height != mask.height {
+    return None;
+  }
+  Some(WmfMaskedBitmapPair {
+    source,
+    mask,
+    alpha_is_mask_value,
+  })
+}
+
+fn wmf_masked_bitmap_layer(
+  state: &WmfSolidRectState,
+  first: &crate::wmf::WmfDibStretchBltRecord,
+  second: &crate::wmf::WmfDibStretchBltRecord,
+) -> Option<MetafileBitmapLayer> {
+  let pair = wmf_masked_bitmap_pair(first, second)?;
+  let (x, y, width, height, mapped_flip_horizontal, mapped_flip_vertical) = state.normalized_rect(
+    i32::from(first.x_dest),
+    i32::from(first.y_dest),
+    i32::from(first.dest_width),
+    i32::from(first.dest_height),
+  )?;
+  let mut rgba = Vec::with_capacity(pair.source.width * pair.source.height * BGRA_BYTES_PER_PIXEL);
+  for (source, mask) in pair
+    .source
+    .rgb
+    .chunks_exact(RGB_BYTES_PER_PIXEL)
+    .zip(pair.mask.rgb.chunks_exact(RGB_BYTES_PER_PIXEL))
+  {
+    rgba.extend_from_slice(source);
+    rgba.push(if pair.alpha_is_mask_value {
+      mask[0]
+    } else {
+      u8::MAX - mask[0]
+    });
+  }
+  let data = rgba_to_png(&rgba, pair.source.width as u32, pair.source.height as u32).ok()?;
+  Some(MetafileBitmapLayer {
+    data,
+    content_type: "image/png",
+    x,
+    y,
+    width,
+    height,
+    flip_horizontal: mapped_flip_horizontal ^ first.src_width.is_negative(),
+    flip_vertical: mapped_flip_vertical ^ first.src_height.is_negative(),
+  })
+}
+
+fn wmf_copy_bitmap_layer(
+  state: &WmfSolidRectState,
+  value: &crate::wmf::WmfDibStretchBltRecord,
+) -> Option<MetafileBitmapLayer> {
+  if value.raster_operation_code() != WmfTernaryRasterOperationCode::SRCCOPY {
+    return None;
+  }
+  let source = full_wmf_dib_source(value)?;
+  let (x, y, width, height, mapped_flip_horizontal, mapped_flip_vertical) = state.normalized_rect(
+    i32::from(value.x_dest),
+    i32::from(value.y_dest),
+    i32::from(value.dest_width),
+    i32::from(value.dest_height),
+  )?;
+  let data = rgb_to_png(&source.rgb, source.width as u32, source.height as u32).ok()?;
+  Some(MetafileBitmapLayer {
+    data,
+    content_type: "image/png",
+    x,
+    y,
+    width,
+    height,
+    flip_horizontal: mapped_flip_horizontal ^ value.src_width.is_negative(),
+    flip_vertical: mapped_flip_vertical ^ value.src_height.is_negative(),
+  })
+}
+
+fn extract_wmf_bitmap_layers(data: &[u8]) -> Vec<MetafileBitmapLayer> {
+  let Ok(metafile) = WmfMetafileRef::from_bytes(data) else {
+    return Vec::new();
+  };
+  let mut state = WmfSolidRectState::new(&metafile);
+  let mut layers = Vec::new();
+  let mut records = metafile.records().peekable();
+  while let Some(record) = records.next() {
+    let Ok(record) = record.parse_data() else {
+      continue;
+    };
+    match record {
+      WmfRecordData::Eof(_) => break,
+      WmfRecordData::SaveDc => state.save(),
+      WmfRecordData::RestoreDc(_) => state.restore(),
+      WmfRecordData::SetWindowOrg(value) => {
+        state.window_org_x = i32::from(value.x);
+        state.window_org_y = i32::from(value.y);
+      }
+      WmfRecordData::SetWindowExt(value) => {
+        state.window_ext_x = nonzero_mapping_extent(i32::from(value.x));
+        state.window_ext_y = nonzero_mapping_extent(i32::from(value.y));
+      }
+      WmfRecordData::SetViewportOrg(value) => {
+        state.viewport_org_x = i32::from(value.x);
+        state.viewport_org_y = i32::from(value.y);
+      }
+      WmfRecordData::SetViewportExt(value) => {
+        state.viewport_ext_x = nonzero_mapping_extent(i32::from(value.x));
+        state.viewport_ext_y = nonzero_mapping_extent(i32::from(value.y));
+      }
+      WmfRecordData::OffsetWindowOrg(value) => {
+        state.window_org_x += i32::from(value.x);
+        state.window_org_y += i32::from(value.y);
+      }
+      WmfRecordData::OffsetViewportOrg(value) => {
+        state.viewport_org_x += i32::from(value.x);
+        state.viewport_org_y += i32::from(value.y);
+      }
+      WmfRecordData::ScaleWindowExt(value) => state.scale_window(value),
+      WmfRecordData::ScaleViewportExt(value) => state.scale_viewport(value),
+      WmfRecordData::DibStretchBlt(first) => {
+        let next = records
+          .peek()
+          .copied()
+          .and_then(|record| record.parse_data().ok());
+        if let Some(WmfRecordData::DibStretchBlt(second)) = next
+          && let Some(layer) = wmf_masked_bitmap_layer(&state, &first, &second)
+        {
+          records.next();
+          layers.push(layer);
+          continue;
+        }
+        if let Some(layer) = wmf_copy_bitmap_layer(&state, &first) {
+          layers.push(layer);
+        }
+      }
+      _ => {}
+    }
+  }
+  layers
 }
 
 fn scale_wmf_extent(extent: i32, numerator: i16, denominator: i16) -> i32 {
@@ -648,15 +1311,23 @@ fn wmf_text_font(value: &crate::wmf::WmfFontObject) -> WmfTextFont {
     .iter()
     .position(|byte| *byte == 0)
     .unwrap_or(face_name.len())];
-  let family = crate::string::SdkEncoding::WmfCharset(value.char_set)
+  let family = crate::string::SdkEncoding::Windows1252
     .decode(face_name)
-    .or_else(|_| crate::string::SdkEncoding::Windows1252.decode(face_name))
+    .or_else(|_| crate::string::SdkEncoding::WmfCharset(value.char_set).decode(face_name))
     .ok()
     .map(|family| family.trim().to_string())
     .filter(|family| !family.is_empty());
+  let char_set = if family.as_deref().is_some_and(|family| {
+    family.eq_ignore_ascii_case("Symbol") || family.eq_ignore_ascii_case("MT Extra")
+  }) {
+    crate::wmf::WmfCharacterSet::Symbol.raw()
+  } else {
+    value.char_set
+  };
   WmfTextFont {
     height: i32::from(value.height),
     family,
+    char_set,
     weight: value.weight.max(0) as u16,
     italic: value.italic != 0,
   }
@@ -668,6 +1339,7 @@ fn extract_wmf_text_runs(data: &[u8]) -> Vec<MetafileTextRun> {
   };
   let mut state = WmfTextState::new(&metafile);
   let mut runs = Vec::new();
+  let mut requires_raster_backdrop = false;
   for record in metafile.records() {
     let Ok(record) = record.parse_data() else {
       continue;
@@ -705,6 +1377,10 @@ fn extract_wmf_text_runs(data: &[u8]) -> Vec<MetafileTextRun> {
       WmfRecordData::SetTextAlign(value) => {
         state.text_alignment = value.text_alignment_flags();
       }
+      WmfRecordData::MoveTo(value) => {
+        state.current_pos_x = i32::from(value.x);
+        state.current_pos_y = i32::from(value.y);
+      }
       WmfRecordData::CreateFontIndirect(value) => {
         state.insert_object(Some(wmf_text_font(&value)));
       }
@@ -721,23 +1397,37 @@ fn extract_wmf_text_runs(data: &[u8]) -> Vec<MetafileTextRun> {
         }
       }
       WmfRecordData::TextOut(value) => {
-        if let Some(run) = state.text_run(
-          single_byte_text(&value.string),
-          value.x_start,
-          value.y_start,
-          None,
-        ) {
+        let text = decode_wmf_text(&value.string, state.current_font_char_set);
+        if let Some(mut run) = state.text_run(text, value.x_start, value.y_start, None) {
+          run.requires_raster_backdrop = requires_raster_backdrop;
           runs.push(run);
         }
       }
       WmfRecordData::ExtTextOut(value) => {
-        let width = (!value.dx.is_empty())
-          .then(|| value.dx.iter().map(|advance| f32::from(*advance)).sum())
-          .filter(|width| *width > 0.0);
-        if let Some(run) = state.text_run(single_byte_text(&value.string), value.x, value.y, width)
-        {
+        let text = decode_wmf_text(&value.string, state.current_font_char_set);
+        let advances = (!value.dx.is_empty()).then_some(value.dx.as_slice());
+        if let Some(mut run) = state.text_run(text, value.x, value.y, advances) {
+          run.requires_raster_backdrop = requires_raster_backdrop;
           runs.push(run);
         }
+      }
+      WmfRecordData::BitBlt(value) => {
+        requires_raster_backdrop |= value.ternary_raster_operation().uses_destination();
+      }
+      WmfRecordData::DibBitBlt(value) => {
+        requires_raster_backdrop |= value.ternary_raster_operation().uses_destination();
+      }
+      WmfRecordData::StretchBlt(value) => {
+        requires_raster_backdrop |= value.ternary_raster_operation().uses_destination();
+      }
+      WmfRecordData::DibStretchBlt(value) => {
+        requires_raster_backdrop |= value.ternary_raster_operation().uses_destination();
+      }
+      WmfRecordData::StretchDib(value) => {
+        requires_raster_backdrop |= value.ternary_raster_operation().uses_destination();
+      }
+      WmfRecordData::PatBlt(value) => {
+        requires_raster_backdrop |= value.ternary_raster_operation().uses_destination();
       }
       _ => {}
     }
@@ -952,6 +1642,22 @@ struct EmfFont {
   italic: bool,
 }
 
+#[derive(Clone, Copy)]
+struct EmfTextSnapshot {
+  window_org_x: i32,
+  window_org_y: i32,
+  window_ext_x: i32,
+  window_ext_y: i32,
+  viewport_org_x: i32,
+  viewport_org_y: i32,
+  viewport_ext_x: i32,
+  viewport_ext_y: i32,
+  world_transform: EmfTransform,
+  current_pos: EmfPoint,
+  current_font: Option<u32>,
+  text_alignment: WmfTextAlignmentModeFlags,
+}
+
 struct EmfTextState {
   width: usize,
   height: usize,
@@ -964,9 +1670,11 @@ struct EmfTextState {
   viewport_ext_x: i32,
   viewport_ext_y: i32,
   world_transform: EmfTransform,
+  current_pos: EmfPoint,
   fonts: std::collections::HashMap<u32, EmfFont>,
   current_font: Option<u32>,
   text_alignment: WmfTextAlignmentModeFlags,
+  saved: Vec<EmfTextSnapshot>,
   font_cache: RenderFontCache,
 }
 
@@ -986,11 +1694,48 @@ impl EmfTextState {
       viewport_ext_x: width as i32,
       viewport_ext_y: height as i32,
       world_transform: EmfTransform::identity(),
+      current_pos: EmfPoint { x: 0, y: 0 },
       fonts: std::collections::HashMap::new(),
       current_font: None,
       text_alignment: WmfTextAlignmentModeFlags::empty(),
+      saved: Vec::new(),
       font_cache: RenderFontCache::load(),
     })
+  }
+
+  fn save(&mut self) {
+    self.saved.push(EmfTextSnapshot {
+      window_org_x: self.window_org_x,
+      window_org_y: self.window_org_y,
+      window_ext_x: self.window_ext_x,
+      window_ext_y: self.window_ext_y,
+      viewport_org_x: self.viewport_org_x,
+      viewport_org_y: self.viewport_org_y,
+      viewport_ext_x: self.viewport_ext_x,
+      viewport_ext_y: self.viewport_ext_y,
+      world_transform: self.world_transform,
+      current_pos: self.current_pos,
+      current_font: self.current_font,
+      text_alignment: self.text_alignment,
+    });
+  }
+
+  fn restore(&mut self) {
+    let Some(snapshot) = self.saved.pop() else {
+      return;
+    };
+    self.window_org_x = snapshot.window_org_x;
+    self.window_org_y = snapshot.window_org_y;
+    self.window_ext_x = snapshot.window_ext_x;
+    self.window_ext_y = snapshot.window_ext_y;
+    self.viewport_org_x = snapshot.viewport_org_x;
+    self.viewport_org_y = snapshot.viewport_org_y;
+    self.viewport_ext_x = snapshot.viewport_ext_x;
+    self.viewport_ext_y = snapshot.viewport_ext_y;
+    self.world_transform = snapshot.world_transform;
+    self.current_pos = snapshot.current_pos;
+    self.current_font = snapshot.current_font;
+    self.text_alignment = snapshot.text_alignment;
   }
 
   fn map_point(&self, point: EmfPoint) -> (f32, f32) {
@@ -1029,28 +1774,40 @@ impl EmfTextState {
     text: String,
   ) -> Option<MetafileTextRun> {
     let text_record = ext_text_record(data, record_offset, record_size)?;
-    let logical_width = ext_text_advances(data, record_offset, record_size, text_record)
-      .map(|values| values.iter().copied().sum::<i32>());
+    let logical_advances = ext_text_advances(data, record_offset, record_size, text_record);
+    let logical_displacement = ext_text_displacement(data, record_offset, record_size, text_record);
+    let logical_width = logical_displacement.map(|displacement| displacement.x);
+    let update_current_position = self
+      .text_alignment
+      .contains(WmfTextAlignmentModeFlags::UPDATE_CP);
+    let reference = if update_current_position {
+      self.current_pos
+    } else {
+      EmfPoint {
+        x: text_record.x,
+        y: text_record.y,
+      }
+    };
     let aligned_x = if self
       .text_alignment
       .contains(WmfTextAlignmentModeFlags::CENTER)
     {
-      text_record
+      reference
         .x
         .saturating_sub(logical_width.unwrap_or_default() / 2)
     } else if self
       .text_alignment
       .contains(WmfTextAlignmentModeFlags::RIGHT)
     {
-      text_record
+      reference
         .x
         .saturating_sub(logical_width.unwrap_or_default())
     } else {
-      text_record.x
+      reference.x
     };
     let (x, reference_y) = self.map_point(EmfPoint {
       x: aligned_x,
-      y: text_record.y,
+      y: reference.y,
     });
     let selected_font = self
       .current_font
@@ -1061,12 +1818,14 @@ impl EmfTextState {
       .map(|font| WmfTextFont {
         height: font.height,
         family: font.family.clone(),
+        char_set: 0,
         weight: font.weight,
         italic: font.italic,
       })
       .unwrap_or(WmfTextFont {
         height: 12,
         family: None,
+        char_set: 0,
         weight: 400,
         italic: false,
       });
@@ -1080,7 +1839,12 @@ impl EmfTextState {
       reference_y.round(),
       self.text_alignment,
     );
-    Some(MetafileTextRun {
+    let advances = logical_advances.as_deref().map(|values| {
+      cumulative_mapped_advances(values, |logical_cumulative| {
+        self.map_horizontal_distance(logical_cumulative) / self.width.max(1) as f32
+      })
+    });
+    let run = MetafileTextRun {
       text,
       x: x / self.width.max(1) as f32,
       y: y / self.height.max(1) as f32,
@@ -1108,7 +1872,19 @@ impl EmfTextState {
       width: logical_width
         .map(|width| self.map_horizontal_distance(i64::from(width)) / self.width.max(1) as f32)
         .filter(|width| width.is_finite() && *width > 0.0),
-    })
+      advances,
+      requires_raster_backdrop: false,
+    };
+    if update_current_position && let Some(displacement) = logical_displacement {
+      // LibreOffice MtfTools::DrawText follows GDI here: horizontal
+      // alignment first shifts the text rectangle, then TA_UPDATECP moves to
+      // that rectangle's final authored character-cell origin.
+      self.current_pos = EmfPoint {
+        x: aligned_x.saturating_add(displacement.x),
+        y: reference.y.saturating_add(displacement.y),
+      };
+    }
+    Some(run)
   }
 }
 
@@ -1142,6 +1918,7 @@ struct EmfVectorState {
   emf_plus_objects: Vec<Option<EmfPlusRenderObject>>,
   emf_plus_object_assembler: EmfPlusObjectAssembler,
   font_cache: RenderFontCache,
+  suppress_text: bool,
   rgb: Vec<u8>,
 }
 
@@ -1627,6 +2404,7 @@ impl EmfVectorState {
       emf_plus_objects: Vec::new(),
       emf_plus_object_assembler: EmfPlusObjectAssembler::default(),
       font_cache: RenderFontCache::load(),
+      suppress_text: options.suppress_text,
       rgb,
     })
   }
@@ -1994,6 +2772,7 @@ impl EmfVectorState {
       &WmfTextFont {
         height,
         family: None,
+        char_set: 0,
         weight: 400,
         italic: false,
       },
@@ -2008,11 +2787,32 @@ impl EmfVectorState {
     color: EmfColor,
     font: &WmfTextFont,
   ) {
+    self.draw_wmf_text(x, y, text, color, font, None);
+  }
+
+  fn draw_wmf_text(
+    &mut self,
+    x: i32,
+    y: i32,
+    text: &str,
+    color: EmfColor,
+    font: &WmfTextFont,
+    logical_advances: Option<&[i16]>,
+  ) {
     let (mapped_x, mapped_y) = self.map_point(EmfPoint { x, y });
     let height = self
       .mapped_vertical_length(if font.height == 0 { 12 } else { font.height })
       .round()
       .max(1.0);
+    let advances = logical_advances.map(|values| {
+      let values = values
+        .iter()
+        .map(|value| i32::from(*value))
+        .collect::<Vec<_>>();
+      cumulative_mapped_advances(&values, |logical_cumulative| {
+        self.mapped_horizontal_distance(logical_cumulative)
+      })
+    });
     self.draw_text_at_device(
       color,
       TextRenderRequest {
@@ -2022,7 +2822,7 @@ impl EmfVectorState {
         baseline_y: mapped_y.round(),
         height,
         horizontal_scale: 1.0,
-        advances: None,
+        advances: advances.as_deref(),
       },
     );
   }
@@ -2034,29 +2834,41 @@ impl EmfVectorState {
     color: EmfColor,
     font: &WmfTextFont,
     logical_advances: Option<&[i32]>,
+    logical_displacement: Option<EmfPoint>,
   ) {
     let font_height = if font.height == 0 { 12 } else { font.height };
-    let logical_width = logical_advances.map(|values| values.iter().copied().sum::<i32>());
+    let logical_width = logical_displacement.map(|displacement| displacement.x);
+    let update_current_position = self
+      .text_alignment
+      .contains(WmfTextAlignmentModeFlags::UPDATE_CP);
+    let reference = if update_current_position {
+      self.current_pos
+    } else {
+      EmfPoint {
+        x: text_record.x,
+        y: text_record.y,
+      }
+    };
     let aligned_x = if self
       .text_alignment
       .contains(WmfTextAlignmentModeFlags::CENTER)
     {
-      text_record
+      reference
         .x
         .saturating_sub(logical_width.unwrap_or_default() / 2)
     } else if self
       .text_alignment
       .contains(WmfTextAlignmentModeFlags::RIGHT)
     {
-      text_record
+      reference
         .x
         .saturating_sub(logical_width.unwrap_or_default())
     } else {
-      text_record.x
+      reference.x
     };
     let (mapped_x, reference_y) = self.map_point(EmfPoint {
       x: aligned_x,
-      y: text_record.y,
+      y: reference.y,
     });
     // GDI maps the logical text reference point and LOGFONT character height
     // to device units before selecting and rasterizing the realized font.
@@ -2102,9 +2914,18 @@ impl EmfVectorState {
         advances: advances.as_deref(),
       },
     );
+    if update_current_position && let Some(displacement) = logical_displacement {
+      self.current_pos = EmfPoint {
+        x: aligned_x.saturating_add(displacement.x),
+        y: reference.y.saturating_add(displacement.y),
+      };
+    }
   }
 
   fn draw_text_at_device(&mut self, color: EmfColor, request: TextRenderRequest<'_>) {
+    if self.suppress_text {
+      return;
+    }
     if let Some(glyphs) = self.font_cache.render_text(&request) {
       for glyph in &glyphs {
         self.draw_subpixel_glyph(glyph, color);
@@ -2940,12 +3761,14 @@ fn decode_vector_emf_as_png(
         {
           let font = emf_current_font(&state);
           let advances = ext_text_advances(data, pos, record_size, text_record);
+          let displacement = ext_text_displacement(data, pos, record_size, text_record);
           state.draw_emf_text(
             text_record,
             &text,
             state.text_color,
             &font,
             advances.as_deref(),
+            displacement,
           );
         }
       }
@@ -2955,12 +3778,14 @@ fn decode_vector_emf_as_png(
         {
           let font = emf_current_font(&state);
           let advances = ext_text_advances(data, pos, record_size, text_record);
+          let displacement = ext_text_displacement(data, pos, record_size, text_record);
           state.draw_emf_text(
             text_record,
             &text,
             state.text_color,
             &font,
             advances.as_deref(),
+            displacement,
           );
         }
       }
@@ -3311,6 +4136,7 @@ struct WmfSavedState {
   binary_raster_operation: WmfBinaryRasterOperation,
   background_color: EmfColor,
   current_pattern_brush: Option<WmfPatternBrush>,
+  current_solid_brush: bool,
   current_font: WmfTextFont,
   text_alignment: WmfTextAlignmentModeFlags,
 }
@@ -3325,7 +4151,10 @@ struct WmfPatternBrush {
 #[derive(Clone, Debug)]
 enum WmfRenderObject {
   Pen(Option<EmfPen>),
-  Brush(Option<EmfColor>),
+  Brush {
+    color: Option<EmfColor>,
+    solid: bool,
+  },
   PatternBrush(WmfPatternBrush),
   Font(WmfTextFont),
   Unsupported,
@@ -3338,6 +4167,7 @@ struct WmfRenderState {
   text_color: EmfColor,
   background_color: EmfColor,
   current_pattern_brush: Option<WmfPatternBrush>,
+  current_solid_brush: bool,
   current_font: WmfTextFont,
   text_alignment: WmfTextAlignmentModeFlags,
   saved: Vec<WmfSavedState>,
@@ -3397,6 +4227,7 @@ impl WmfRenderState {
         emf_plus_objects: Vec::new(),
         emf_plus_object_assembler: EmfPlusObjectAssembler::default(),
         font_cache: RenderFontCache::load(),
+        suppress_text: options.suppress_text,
         rgb,
       },
       objects: vec![None; object_count],
@@ -3408,9 +4239,11 @@ impl WmfRenderState {
         b: 255,
       },
       current_pattern_brush: None,
+      current_solid_brush: false,
       current_font: WmfTextFont {
         height: 12,
         family: None,
+        char_set: 0,
         weight: 400,
         italic: false,
       },
@@ -3444,6 +4277,7 @@ impl WmfRenderState {
       binary_raster_operation: self.canvas.binary_raster_operation,
       background_color: self.background_color,
       current_pattern_brush: self.current_pattern_brush.clone(),
+      current_solid_brush: self.current_solid_brush,
       current_font: self.current_font.clone(),
       text_alignment: self.text_alignment,
     });
@@ -3468,6 +4302,7 @@ impl WmfRenderState {
     self.canvas.binary_raster_operation = saved.binary_raster_operation;
     self.background_color = saved.background_color;
     self.current_pattern_brush = saved.current_pattern_brush;
+    self.current_solid_brush = saved.current_solid_brush;
     self.current_font = saved.current_font;
     self.text_alignment = saved.text_alignment;
   }
@@ -3478,12 +4313,14 @@ impl WmfRenderState {
     };
     match object {
       WmfRenderObject::Pen(pen) => self.canvas.current_pen = pen,
-      WmfRenderObject::Brush(brush) => {
-        self.canvas.current_brush = brush;
+      WmfRenderObject::Brush { color, solid } => {
+        self.canvas.current_brush = color;
         self.current_pattern_brush = None;
+        self.current_solid_brush = solid;
       }
       WmfRenderObject::PatternBrush(pattern) => {
         self.current_pattern_brush = Some(pattern);
+        self.current_solid_brush = false;
       }
       WmfRenderObject::Font(font) => self.current_font = font,
       WmfRenderObject::Unsupported => {}
@@ -3496,8 +4333,41 @@ impl WmfRenderState {
     }
   }
 
-  fn text_baseline_y(&self, reference_y: i16) -> i32 {
-    let reference_y = i32::from(reference_y);
+  fn text_reference_point(&self, x: i16, y: i16) -> EmfPoint {
+    if self
+      .text_alignment
+      .contains(WmfTextAlignmentModeFlags::UPDATE_CP)
+    {
+      self.current_pos
+    } else {
+      EmfPoint {
+        x: i32::from(x),
+        y: i32::from(y),
+      }
+    }
+  }
+
+  fn text_origin(&self, x: i16, y: i16, logical_width: Option<i32>) -> EmfPoint {
+    let mut reference = self.text_reference_point(x, y);
+    if self
+      .text_alignment
+      .contains(WmfTextAlignmentModeFlags::CENTER)
+    {
+      reference.x = reference
+        .x
+        .saturating_sub(logical_width.unwrap_or_default() / 2);
+    } else if self
+      .text_alignment
+      .contains(WmfTextAlignmentModeFlags::RIGHT)
+    {
+      reference.x = reference
+        .x
+        .saturating_sub(logical_width.unwrap_or_default());
+    }
+    reference
+  }
+
+  fn text_baseline_y(&self, reference_y: i32) -> i32 {
     if self
       .text_alignment
       .contains(WmfTextAlignmentModeFlags::BASELINE)
@@ -3511,6 +4381,21 @@ impl WmfRenderState {
       // Our outline painter takes a baseline, so advance by the logical
       // character-cell height before applying the device mapping.
       reference_y.saturating_add(self.current_font.height.unsigned_abs() as i32)
+    }
+  }
+
+  fn update_current_position_after_text(
+    &mut self,
+    text_origin: EmfPoint,
+    logical_width: Option<i32>,
+  ) {
+    if self
+      .text_alignment
+      .contains(WmfTextAlignmentModeFlags::UPDATE_CP)
+      && let Some(logical_width) = logical_width
+    {
+      self.current_pos.x = text_origin.x.saturating_add(logical_width);
+      self.current_pos.y = text_origin.y;
     }
   }
 
@@ -3582,7 +4467,8 @@ fn decode_wmf_as_raster(
   let metafile = WmfMetafileRef::from_bytes(data).map_err(|err| err.to_string())?;
   let mut state = WmfRenderState::new(&metafile, options)?;
 
-  for record in metafile.records() {
+  let mut records = metafile.records().peekable();
+  while let Some(record) = records.next() {
     // Compatibility-mode parsing preserves producer-specific and malformed
     // records so later valid drawing commands remain usable. Rendering must
     // follow the same recovery rule: one unsupported device escape must not
@@ -3655,11 +4541,15 @@ fn decode_wmf_as_raster(
         state.insert_object(WmfRenderObject::Pen(pen));
       }
       WmfRecordData::CreateBrushIndirect(value) => {
-        let brush = match value.brush_style_kind() {
+        let style = value.brush_style_kind();
+        let color = match style {
           Some(WmfBrushStyle::Null) => None,
           _ => Some(color_ref_to_emf(value.color_ref)),
         };
-        state.insert_object(WmfRenderObject::Brush(brush));
+        state.insert_object(WmfRenderObject::Brush {
+          color,
+          solid: style == Some(WmfBrushStyle::Solid),
+        });
       }
       WmfRecordData::CreateFontIndirect(value) => {
         state.insert_object(WmfRenderObject::Font(wmf_text_font(&value)));
@@ -3833,15 +4723,17 @@ fn decode_wmf_as_raster(
         true,
       ),
       WmfRecordData::TextOut(value) => {
-        let text = single_byte_text(&value.string);
-        let baseline_y = state.text_baseline_y(value.y_start);
+        let text = decode_wmf_text(&value.string, state.current_font.char_set);
+        let origin = state.text_origin(value.x_start, value.y_start, None);
+        let baseline_y = state.text_baseline_y(origin.y);
         state.canvas.draw_text_with_font(
-          i32::from(value.x_start),
+          origin.x,
           baseline_y,
           &text,
           state.text_color,
           &state.current_font,
         );
+        state.update_current_position_after_text(origin, None);
       }
       WmfRecordData::ExtTextOut(value) => {
         if let Some(rectangle) = value.rectangle
@@ -3858,8 +4750,14 @@ fn decode_wmf_as_raster(
           );
         }
 
-        let text = single_byte_text(&value.string);
-        let baseline_y = state.text_baseline_y(value.y);
+        let text = decode_wmf_text(&value.string, state.current_font.char_set);
+        let logical_width = (!value.dx.is_empty()).then(|| {
+          value.dx.iter().fold(0i32, |total, advance| {
+            total.saturating_add(i32::from(*advance))
+          })
+        });
+        let origin = state.text_origin(value.x, value.y, logical_width);
+        let baseline_y = state.text_baseline_y(origin.y);
         let saved_clip = value
           .rectangle
           .filter(|_| value.options.contains(WmfExtTextOutOptions::CLIPPED))
@@ -3886,13 +4784,15 @@ fn decode_wmf_as_raster(
             );
             saved
           });
-        state.canvas.draw_text_with_font(
-          i32::from(value.x),
+        state.canvas.draw_wmf_text(
+          origin.x,
           baseline_y,
           &text,
           state.text_color,
           &state.current_font,
+          (!value.dx.is_empty()).then_some(value.dx.as_slice()),
         );
+        state.update_current_position_after_text(origin, logical_width);
         if let Some((clip_rect, clip_mask)) = saved_clip {
           state.canvas.clip_rect = clip_rect;
           state.canvas.clip_mask = clip_mask;
@@ -3904,7 +4804,12 @@ fn decode_wmf_as_raster(
         let right = left + i32::from(value.width);
         let bottom = top + i32::from(value.height);
         let rop = value.raster_operation_code();
-        if !state.fill_pattern_rect(left, top, right, bottom, rop) {
+        let lifted_solid_rect = options.suppress_solid_pattern_rects
+          && rop == WmfTernaryRasterOperationCode::PATCOPY
+          && state.current_pattern_brush.is_none()
+          && state.current_solid_brush
+          && state.canvas.current_brush.is_some();
+        if !lifted_solid_rect && !state.fill_pattern_rect(left, top, right, bottom, rop) {
           state
             .canvas
             .fill_rect_with_rop(left, top, right, bottom, rop);
@@ -3952,6 +4857,23 @@ fn decode_wmf_as_raster(
         }
       }
       WmfRecordData::DibStretchBlt(value) => {
+        if options.suppress_bitmap_layers {
+          let next = records
+            .peek()
+            .copied()
+            .and_then(|record| record.parse_data().ok());
+          if let Some(WmfRecordData::DibStretchBlt(second)) = next
+            && wmf_masked_bitmap_pair(&value, &second).is_some()
+          {
+            records.next();
+            continue;
+          }
+          if value.raster_operation_code() == WmfTernaryRasterOperationCode::SRCCOPY
+            && full_wmf_dib_source(&value).is_some()
+          {
+            continue;
+          }
+        }
         if let Some(bytes) = value.target.source_bytes()
           && let Some(image) = packed_dib_to_rgb(bytes, DibColorUsage::RgbColors)?
         {
@@ -5292,12 +6214,25 @@ fn color_ref_to_emf(value: crate::ColorRef) -> EmfColor {
   }
 }
 
-fn single_byte_text(bytes: &[u8]) -> String {
-  bytes
-    .iter()
-    .take_while(|byte| **byte != 0)
-    .map(|byte| char::from(*byte))
-    .collect()
+fn decode_wmf_text(bytes: &[u8], char_set: u8) -> String {
+  let bytes = bytes.iter().take_while(|byte| **byte != 0).copied();
+  if char_set == crate::wmf::WmfCharacterSet::Symbol.raw() {
+    // [MS-WMF] §2.3.3.2 assigns SYMBOL_CHARSET to code page 42. LibreOffice
+    // represents its non-control bytes in the Symbol private-use range.
+    return bytes
+      .map(|byte| {
+        if byte <= 0x1F {
+          char::from(byte)
+        } else {
+          char::from_u32(0xF000 + u32::from(byte)).unwrap_or('\u{FFFD}')
+        }
+      })
+      .collect();
+  }
+  let bytes = bytes.collect::<Vec<_>>();
+  crate::string::SdkEncoding::WmfCharset(char_set)
+    .decode(&bytes)
+    .unwrap_or_else(|_| bytes.iter().map(|byte| char::from(*byte)).collect())
 }
 
 fn emf_current_font(state: &EmfVectorState) -> WmfTextFont {
@@ -5307,12 +6242,14 @@ fn emf_current_font(state: &EmfVectorState) -> WmfTextFont {
     .map(|font| WmfTextFont {
       height: font.height,
       family: font.family.clone(),
+      char_set: 0,
       weight: font.weight,
       italic: font.italic,
     })
     .unwrap_or(WmfTextFont {
       height: 12,
       family: None,
+      char_set: 0,
       weight: 400,
       italic: false,
     })
@@ -6486,6 +7423,36 @@ fn ext_text_advances(
     .collect()
 }
 
+fn ext_text_displacement(
+  data: &[u8],
+  record_offset: usize,
+  record_size: usize,
+  text: ExtTextRecord,
+) -> Option<EmfPoint> {
+  const ETO_PDY: u32 = 0x0000_2000;
+  let dx_offset = text.dx_offset?;
+  let has_vertical_advances = text.options & ETO_PDY != 0;
+  let stride = if has_vertical_advances { 2 } else { 1 };
+  let value_count = text.characters.checked_mul(stride)?;
+  let byte_count = value_count.checked_mul(4)?;
+  let start = record_offset.checked_add(dx_offset)?;
+  let end = start.checked_add(byte_count)?;
+  if end > record_offset.checked_add(record_size)? || end > data.len() {
+    return None;
+  }
+  let mut displacement = EmfPoint { x: 0, y: 0 };
+  for index in 0..text.characters {
+    let offset = start + index * stride * 4;
+    displacement.x = displacement.x.saturating_add(read_i32(data, offset).ok()?);
+    if has_vertical_advances {
+      displacement.y = displacement
+        .y
+        .saturating_add(read_i32(data, offset + 4).ok()?);
+    }
+  }
+  Some(displacement)
+}
+
 fn cumulative_mapped_advances(
   logical_advances: &[i32],
   mut map_cumulative: impl FnMut(i64) -> f32,
@@ -6614,9 +7581,10 @@ mod tests {
   use super::*;
   use crate::emf::EmrStretchBlt;
   use crate::wmf::{
-    WmfColorRecord, WmfDibCreatePatternBrushRecord, WmfExtTextOutRecord, WmfMetafileType,
-    WmfMetafileVersion, WmfObjectIndexRecord, WmfPatBltRecord, WmfPointRecord, WmfRectObject,
-    WmfSetPixelRecord,
+    WmfColorRecord, WmfDibCreatePatternBrushRecord, WmfDibStretchBltRecord, WmfDibTarget,
+    WmfExtTextOutRecord, WmfLogBrushObject, WmfMetafileType, WmfMetafileVersion,
+    WmfObjectIndexRecord, WmfPatBltRecord, WmfPointRecord, WmfRectObject, WmfSetPixelRecord,
+    WmfU16Record,
   };
   use crate::{
     BitmapSourceBounds, ColorRef, DibColorUsage, EMR_EOF, EMR_HEADER, EmfMetafile, EmfRecord,
@@ -6641,6 +7609,13 @@ mod tests {
       super::EMR_SET_TEXT_ALIGN,
       u32::from(alignment.bits()).to_le_bytes().to_vec(),
     )
+  }
+
+  fn move_to_ex_record(x: i32, y: i32) -> EmfRecord {
+    let mut data = Vec::with_capacity(8);
+    data.extend_from_slice(&x.to_le_bytes());
+    data.extend_from_slice(&y.to_le_bytes());
+    EmfRecord::new(super::EMR_MOVE_TO_EX, data)
   }
 
   fn ext_text_out_w_record(x: i32, y: i32, text: &str) -> EmfRecord {
@@ -6681,6 +7656,123 @@ mod tests {
     bytes.extend_from_slice(&0u32.to_le_bytes());
     bytes.extend_from_slice(&0u32.to_le_bytes());
     bytes
+  }
+
+  fn two_pixel_monochrome_dib(bits: u8) -> Vec<u8> {
+    let mut dib = bitmap_info(2, 1, 1, 0);
+    dib.extend_from_slice(&[
+      0, 0, 0, 0, // palette entry zero: black
+      255, 255, 255, 0, // palette entry one: white
+    ]);
+    dib.extend_from_slice(&[bits, 0, 0, 0]);
+    dib
+  }
+
+  fn two_pixel_color_dib() -> Vec<u8> {
+    let mut dib = bitmap_info(2, 1, 24, 0);
+    dib.extend_from_slice(&[
+      0, 0, 255, // red in BGR order
+      0, 255, 0, // green in BGR order
+      0, 0, // DWORD scan-line padding
+    ]);
+    dib
+  }
+
+  fn two_pixel_non_binary_mask_dib() -> Vec<u8> {
+    let mut dib = bitmap_info(2, 1, 24, 0);
+    dib.extend_from_slice(&[
+      128, 128, 128, // gray is not a valid binary transparency mask
+      255, 255, 255, // white
+      0, 0,
+    ]);
+    dib
+  }
+
+  fn masked_bitmap_wmf(mask: Vec<u8>, source: Vec<u8>) -> Vec<u8> {
+    let dib_record = |operation, target| {
+      WmfRecordData::DibStretchBlt(WmfDibStretchBltRecord {
+        raster_operation: operation,
+        src_height: 1,
+        src_width: 2,
+        y_src: 0,
+        x_src: 0,
+        dest_height: 1,
+        dest_width: 2,
+        y_dest: 0,
+        x_dest: 1,
+        target: WmfDibTarget::Source(target),
+      })
+      .to_record()
+      .unwrap()
+    };
+    WmfMetafile {
+      placeable_header: None,
+      header: WmfHeader {
+        metafile_type: WmfMetafileType::Memory.raw(),
+        header_size_words: 9,
+        version: WmfMetafileVersion::Version300.raw(),
+        file_size_words: 0,
+        number_of_objects: 0,
+        max_record_words: 0,
+        number_of_parameters: 0,
+      },
+      records: vec![
+        WmfRecordData::SetWindowExt(WmfPointRecord { x: 4, y: 2 })
+          .to_record()
+          .unwrap(),
+        dib_record(WmfTernaryRasterOperationCode::SRCAND.canonical_raw(), mask),
+        dib_record(
+          WmfTernaryRasterOperationCode::SRCPAINT.canonical_raw(),
+          source,
+        ),
+        WmfRecordData::Eof(crate::wmf::WmfEofRecord::default())
+          .to_record()
+          .unwrap(),
+      ],
+      trailing_data: Vec::new(),
+    }
+    .to_bytes()
+    .unwrap()
+  }
+
+  fn copy_bitmap_wmf() -> Vec<u8> {
+    WmfMetafile {
+      placeable_header: None,
+      header: WmfHeader {
+        metafile_type: WmfMetafileType::Memory.raw(),
+        header_size_words: 9,
+        version: WmfMetafileVersion::Version300.raw(),
+        file_size_words: 0,
+        number_of_objects: 0,
+        max_record_words: 0,
+        number_of_parameters: 0,
+      },
+      records: vec![
+        WmfRecordData::SetWindowExt(WmfPointRecord { x: 4, y: 2 })
+          .to_record()
+          .unwrap(),
+        WmfRecordData::DibStretchBlt(WmfDibStretchBltRecord {
+          raster_operation: WmfTernaryRasterOperationCode::SRCCOPY.canonical_raw(),
+          src_height: 1,
+          src_width: 2,
+          y_src: 0,
+          x_src: 0,
+          dest_height: 1,
+          dest_width: 2,
+          y_dest: 0,
+          x_dest: 1,
+          target: WmfDibTarget::Source(two_pixel_color_dib()),
+        })
+        .to_record()
+        .unwrap(),
+        WmfRecordData::Eof(crate::wmf::WmfEofRecord::default())
+          .to_record()
+          .unwrap(),
+      ],
+      trailing_data: Vec::new(),
+    }
+    .to_bytes()
+    .unwrap()
   }
 
   #[test]
@@ -6807,6 +7899,48 @@ mod tests {
   }
 
   #[test]
+  fn emf_update_cp_uses_move_to_and_dx_for_consecutive_text_origins() {
+    let emf = metafile_with_records(vec![
+      set_text_align_record(
+        WmfTextAlignmentModeFlags::UPDATE_CP | WmfTextAlignmentModeFlags::BASELINE,
+      ),
+      move_to_ex_record(10, 20),
+      ext_text_out_w_record(99, 88, "AB"),
+      ext_text_out_w_record(99, 88, "C"),
+    ]);
+    let (width, height) = emf_natural_canvas_size(&emf).unwrap();
+    let runs = extract_metafile_text_runs(&emf, Some("image/x-emf"));
+
+    assert_eq!(runs.len(), 2);
+    assert!((runs[0].x * width as f32 - 10.0).abs() < 0.000_1);
+    assert!((runs[0].y * height as f32 - 20.0).abs() < 0.000_1);
+    assert!((runs[1].x * width as f32 - 26.0).abs() < 0.000_1);
+    assert!((runs[1].y * height as f32 - 20.0).abs() < 0.000_1);
+  }
+
+  #[test]
+  fn emf_text_marks_only_runs_after_destination_dependent_raster_operations() {
+    let source_bits = vec![0; 16];
+    let emf = metafile_with_records(vec![
+      ext_text_out_w_record(0, 0, "before"),
+      stretch_blt_record(
+        bitmap_info(2, 2, 32, BI_RGB),
+        source_bits.clone(),
+        0x00CC_0020,
+      ),
+      ext_text_out_w_record(0, 0, "after copy"),
+      stretch_blt_record(bitmap_info(2, 2, 32, BI_RGB), source_bits, 0x0088_00C6),
+      ext_text_out_w_record(0, 0, "after destination readback"),
+    ]);
+
+    let runs = extract_metafile_text_runs(&emf, Some("image/x-emf"));
+    assert_eq!(runs.len(), 3);
+    assert!(!runs[0].requires_raster_backdrop);
+    assert!(!runs[1].requires_raster_backdrop);
+    assert!(runs[2].requires_raster_backdrop);
+  }
+
+  #[test]
   fn line_clip_limits_huge_off_canvas_segments() {
     let clipped = clip_line_to_rect(
       (-1_000_000_000.0, 5.0),
@@ -6840,6 +7974,9 @@ mod tests {
         background_color: None,
         monochrome_dib_palette_override: None,
         filter_high_frequency_pattern_brushes: false,
+        suppress_text: false,
+        suppress_solid_pattern_rects: false,
+        suppress_bitmap_layers: false,
       }
       .resolved_canvas_size(400, 300),
       (200, 100)
@@ -6853,6 +7990,9 @@ mod tests {
         background_color: None,
         monochrome_dib_palette_override: None,
         filter_high_frequency_pattern_brushes: false,
+        suppress_text: false,
+        suppress_solid_pattern_rects: false,
+        suppress_bitmap_layers: false,
       }
       .resolved_canvas_size(76, 76),
       (400, 300)
@@ -6960,6 +8100,288 @@ mod tests {
     assert_eq!(image.get_pixel(4, 4).0, [0, 192, 0]);
     assert_eq!(image.get_pixel(0, 0).0, [255, 0, 0]);
     assert_eq!(image.get_pixel(7, 7).0, [255, 255, 255]);
+  }
+
+  #[test]
+  fn wmf_text_can_be_lifted_out_of_raster_without_suppressing_graphics() {
+    let records = vec![
+      WmfRecordData::SetWindowExt(WmfPointRecord { x: 32, y: 20 })
+        .to_record()
+        .unwrap(),
+      WmfRecordData::SetPixel(WmfSetPixelRecord {
+        color: crate::ColorRef {
+          red: 255,
+          green: 0,
+          blue: 0,
+          reserved: 0,
+        },
+        y: 0,
+        x: 0,
+      })
+      .to_record()
+      .unwrap(),
+      WmfRecordData::ExtTextOut(WmfExtTextOutRecord {
+        y: 1,
+        x: 4,
+        string_length: 1,
+        options: WmfExtTextOutOptions::empty(),
+        rectangle: None,
+        string: b"A".to_vec(),
+        string_padding: vec![0],
+        dx: vec![8],
+        trailing_data: Vec::new(),
+      })
+      .to_record()
+      .unwrap(),
+      WmfRecordData::Eof(crate::wmf::WmfEofRecord::default())
+        .to_record()
+        .unwrap(),
+    ];
+    let bytes = WmfMetafile {
+      placeable_header: None,
+      header: WmfHeader {
+        metafile_type: WmfMetafileType::Memory.raw(),
+        header_size_words: 9,
+        version: WmfMetafileVersion::Version300.raw(),
+        file_size_words: 0,
+        number_of_objects: 0,
+        max_record_words: 0,
+        number_of_parameters: 0,
+      },
+      records,
+      trailing_data: Vec::new(),
+    }
+    .to_bytes()
+    .unwrap();
+
+    let decode = |suppress_text| {
+      let decoded = decode_metafile_as_raster_with_options(
+        &bytes,
+        Some("image/x-wmf"),
+        RenderOptions {
+          suppress_text,
+          ..RenderOptions::default()
+        },
+      )
+      .unwrap()
+      .unwrap();
+      image::load_from_memory_with_format(&decoded.data, image::ImageFormat::Png)
+        .unwrap()
+        .to_rgb8()
+    };
+    let painted = decode(false);
+    let lifted = decode(true);
+
+    assert_eq!(painted.get_pixel(0, 0).0, [255, 0, 0]);
+    assert_eq!(lifted.get_pixel(0, 0).0, [255, 0, 0]);
+    assert!(painted.pixels().any(|pixel| pixel.0 == [0, 0, 0]));
+    assert!(
+      lifted
+        .enumerate_pixels()
+        .all(|(x, y, pixel)| (x == 0 && y == 0) || pixel.0 == [255, 255, 255])
+    );
+  }
+
+  #[test]
+  fn wmf_solid_patcopy_rects_can_be_lifted_without_suppressing_other_graphics() {
+    let records = vec![
+      WmfRecordData::SetWindowExt(WmfPointRecord { x: 8, y: 8 })
+        .to_record()
+        .unwrap(),
+      WmfRecordData::CreateBrushIndirect(WmfLogBrushObject {
+        brush_style: WmfBrushStyle::Solid.raw(),
+        color_ref: ColorRef {
+          red: 255,
+          green: 0,
+          blue: 0,
+          reserved: 0,
+        },
+        brush_hatch: 0,
+      })
+      .to_record()
+      .unwrap(),
+      WmfRecordData::SelectObject(WmfObjectIndexRecord { index: 0 })
+        .to_record()
+        .unwrap(),
+      WmfRecordData::PatBlt(WmfPatBltRecord {
+        raster_operation: WmfTernaryRasterOperationCode::PATCOPY.canonical_raw(),
+        height: 2,
+        width: 4,
+        y_left: 3,
+        x_left: 2,
+      })
+      .to_record()
+      .unwrap(),
+      WmfRecordData::SetPixel(WmfSetPixelRecord {
+        color: ColorRef {
+          red: 0,
+          green: 0,
+          blue: 255,
+          reserved: 0,
+        },
+        y: 0,
+        x: 0,
+      })
+      .to_record()
+      .unwrap(),
+      WmfRecordData::Eof(crate::wmf::WmfEofRecord::default())
+        .to_record()
+        .unwrap(),
+    ];
+    let bytes = WmfMetafile {
+      placeable_header: None,
+      header: WmfHeader {
+        metafile_type: WmfMetafileType::Memory.raw(),
+        header_size_words: 9,
+        version: WmfMetafileVersion::Version300.raw(),
+        file_size_words: 0,
+        number_of_objects: 1,
+        max_record_words: 0,
+        number_of_parameters: 0,
+      },
+      records,
+      trailing_data: Vec::new(),
+    }
+    .to_bytes()
+    .unwrap();
+
+    assert_eq!(
+      extract_metafile_solid_rects(&bytes, Some("image/x-wmf")),
+      vec![MetafileSolidRect {
+        x: 0.25,
+        y: 0.375,
+        width: 0.5,
+        height: 0.25,
+        color: [255, 0, 0],
+      }]
+    );
+
+    let decode = |suppress_solid_pattern_rects| {
+      let decoded = decode_metafile_as_raster_with_options(
+        &bytes,
+        Some("image/x-wmf"),
+        RenderOptions {
+          suppress_solid_pattern_rects,
+          ..RenderOptions::default()
+        },
+      )
+      .unwrap()
+      .unwrap();
+      image::load_from_memory_with_format(&decoded.data, image::ImageFormat::Png)
+        .unwrap()
+        .to_rgb8()
+    };
+    let painted = decode(false);
+    let lifted = decode(true);
+
+    assert_eq!(painted.get_pixel(2, 3).0, [255, 0, 0]);
+    assert_eq!(lifted.get_pixel(2, 3).0, [255, 255, 255]);
+    assert_eq!(painted.get_pixel(0, 0).0, [0, 0, 255]);
+    assert_eq!(lifted.get_pixel(0, 0).0, [0, 0, 255]);
+  }
+
+  #[test]
+  fn wmf_binary_mask_pair_can_be_lifted_as_a_native_bitmap_layer() {
+    // Mask bits are black then white. SRCAND therefore clears the first
+    // destination pixel and retains the second; the following SRCPAINT paints
+    // red into the cleared pixel while its green second pixel remains hidden.
+    let bytes = masked_bitmap_wmf(two_pixel_monochrome_dib(0x40), two_pixel_color_dib());
+    let layers = extract_metafile_bitmap_layers(&bytes, Some("image/x-wmf"));
+    assert_eq!(layers.len(), 1);
+    let layer = &layers[0];
+    assert_eq!(
+      (layer.x, layer.y, layer.width, layer.height),
+      (0.25, 0.0, 0.5, 0.5)
+    );
+    assert!(!layer.flip_horizontal);
+    assert!(!layer.flip_vertical);
+    let image = image::load_from_memory_with_format(&layer.data, image::ImageFormat::Png)
+      .unwrap()
+      .to_rgba8();
+    assert_eq!(image.get_pixel(0, 0).0, [255, 0, 0, 255]);
+    assert_eq!(image.get_pixel(1, 0).0, [0, 255, 0, 0]);
+
+    let decode = |suppress_bitmap_layers| {
+      let decoded = decode_metafile_as_raster_with_options(
+        &bytes,
+        Some("image/x-wmf"),
+        RenderOptions {
+          suppress_bitmap_layers,
+          ..RenderOptions::default()
+        },
+      )
+      .unwrap()
+      .unwrap();
+      image::load_from_memory_with_format(&decoded.data, image::ImageFormat::Png)
+        .unwrap()
+        .to_rgb8()
+    };
+    let painted = decode(false);
+    let lifted = decode(true);
+    assert_eq!(painted.get_pixel(1, 0).0, [255, 0, 0]);
+    assert_eq!(painted.get_pixel(2, 0).0, [255, 255, 255]);
+    assert_eq!(lifted.get_pixel(1, 0).0, [255, 255, 255]);
+    assert_eq!(lifted.get_pixel(2, 0).0, [255, 255, 255]);
+  }
+
+  #[test]
+  fn wmf_source_copy_can_be_lifted_as_an_opaque_native_bitmap_layer() {
+    let bytes = copy_bitmap_wmf();
+    let layers = extract_metafile_bitmap_layers(&bytes, Some("image/x-wmf"));
+    assert_eq!(layers.len(), 1);
+    let layer = &layers[0];
+    assert_eq!(
+      (layer.x, layer.y, layer.width, layer.height),
+      (0.25, 0.0, 0.5, 0.5)
+    );
+    let image = image::load_from_memory_with_format(&layer.data, image::ImageFormat::Png)
+      .unwrap()
+      .to_rgb8();
+    assert_eq!(image.get_pixel(0, 0).0, [255, 0, 0]);
+    assert_eq!(image.get_pixel(1, 0).0, [0, 255, 0]);
+
+    let decode = |suppress_bitmap_layers| {
+      let decoded = decode_metafile_as_raster_with_options(
+        &bytes,
+        Some("image/x-wmf"),
+        RenderOptions {
+          suppress_bitmap_layers,
+          ..RenderOptions::default()
+        },
+      )
+      .unwrap()
+      .unwrap();
+      image::load_from_memory_with_format(&decoded.data, image::ImageFormat::Png)
+        .unwrap()
+        .to_rgb8()
+    };
+    let painted = decode(false);
+    let lifted = decode(true);
+    assert_eq!(painted.get_pixel(1, 0).0, [255, 0, 0]);
+    assert_eq!(painted.get_pixel(2, 0).0, [0, 255, 0]);
+    assert_eq!(lifted.get_pixel(1, 0).0, [255, 255, 255]);
+    assert_eq!(lifted.get_pixel(2, 0).0, [255, 255, 255]);
+  }
+
+  #[test]
+  fn wmf_non_binary_rop_pair_remains_in_destination_replay() {
+    let bytes = masked_bitmap_wmf(two_pixel_non_binary_mask_dib(), two_pixel_color_dib());
+    assert!(extract_metafile_bitmap_layers(&bytes, Some("image/x-wmf")).is_empty());
+
+    let decode = |suppress_bitmap_layers| {
+      decode_metafile_as_raster_with_options(
+        &bytes,
+        Some("image/x-wmf"),
+        RenderOptions {
+          suppress_bitmap_layers,
+          ..RenderOptions::default()
+        },
+      )
+      .unwrap()
+      .unwrap()
+      .data
+    };
+    assert_eq!(decode(false), decode(true));
   }
 
   #[test]
@@ -7164,6 +8586,9 @@ mod tests {
         background_color: None,
         monochrome_dib_palette_override: None,
         filter_high_frequency_pattern_brushes: false,
+        suppress_text: false,
+        suppress_solid_pattern_rects: false,
+        suppress_bitmap_layers: false,
       },
     )
     .expect("minimal EMF bounds");
@@ -7666,5 +9091,115 @@ mod tests {
         .unwrap()
         .is_none()
     );
+  }
+
+  #[test]
+  fn wmf_symbol_charset_decodes_glyph_bytes_as_private_use_characters() {
+    assert_eq!(
+      decode_wmf_text(b"wjlq\0", crate::wmf::WmfCharacterSet::Symbol.raw()),
+      "\u{F077}\u{F06A}\u{F06C}\u{F071}"
+    );
+    assert_eq!(
+      decode_wmf_text(b"ABC\0", crate::wmf::WmfCharacterSet::Ansi.raw()),
+      "ABC"
+    );
+  }
+
+  #[test]
+  fn wmf_symbol_face_uses_symbol_charset_even_with_default_declared() {
+    let mut face_name = [0; 32];
+    face_name[..6].copy_from_slice(b"Symbol");
+    let font = crate::wmf::WmfFontObject {
+      height: -12,
+      width: 0,
+      escapement: 0,
+      orientation: 0,
+      weight: 400,
+      italic: 0,
+      underline: 0,
+      strike_out: 0,
+      char_set: crate::wmf::WmfCharacterSet::Default.raw(),
+      out_precision: 0,
+      clip_precision: 0,
+      quality: 0,
+      pitch_and_family: 0,
+      face_name,
+      face_name_bytes: 6,
+    };
+    assert_eq!(
+      wmf_text_font(&font).char_set,
+      crate::wmf::WmfCharacterSet::Symbol.raw()
+    );
+  }
+
+  #[test]
+  fn wmf_update_cp_uses_move_to_and_dx_for_consecutive_text_origins() {
+    let records = vec![
+      WmfRecordData::SetWindowExt(WmfPointRecord { x: 100, y: 100 })
+        .to_record()
+        .unwrap(),
+      WmfRecordData::SetTextAlign(WmfU16Record {
+        value: (WmfTextAlignmentModeFlags::UPDATE_CP | WmfTextAlignmentModeFlags::BASELINE).bits(),
+        reserved: Vec::new(),
+      })
+      .to_record()
+      .unwrap(),
+      WmfRecordData::MoveTo(WmfPointRecord { x: 10, y: 20 })
+        .to_record()
+        .unwrap(),
+      WmfRecordData::ExtTextOut(WmfExtTextOutRecord {
+        y: 99,
+        x: 99,
+        string_length: 2,
+        options: WmfExtTextOutOptions::empty(),
+        rectangle: None,
+        string: b"AB".to_vec(),
+        string_padding: Vec::new(),
+        dx: vec![7, 5],
+        trailing_data: Vec::new(),
+      })
+      .to_record()
+      .unwrap(),
+      WmfRecordData::ExtTextOut(WmfExtTextOutRecord {
+        y: 99,
+        x: 99,
+        string_length: 1,
+        options: WmfExtTextOutOptions::empty(),
+        rectangle: None,
+        string: b"C".to_vec(),
+        string_padding: vec![0],
+        dx: vec![3],
+        trailing_data: Vec::new(),
+      })
+      .to_record()
+      .unwrap(),
+      WmfRecordData::Eof(crate::wmf::WmfEofRecord::default())
+        .to_record()
+        .unwrap(),
+    ];
+    let bytes = WmfMetafile {
+      placeable_header: None,
+      header: WmfHeader {
+        metafile_type: WmfMetafileType::Memory.raw(),
+        header_size_words: 9,
+        version: WmfMetafileVersion::Version300.raw(),
+        file_size_words: 0,
+        number_of_objects: 0,
+        max_record_words: 0,
+        number_of_parameters: 0,
+      },
+      records,
+      trailing_data: Vec::new(),
+    }
+    .to_bytes()
+    .unwrap();
+
+    let runs = extract_metafile_text_runs(&bytes, Some("image/x-wmf"));
+    assert_eq!(runs.len(), 2);
+    assert!((runs[0].x - 0.10).abs() < 0.000_1);
+    assert!((runs[0].y - 0.20).abs() < 0.000_1);
+    assert!((runs[0].width.unwrap() - 0.12).abs() < 0.000_1);
+    assert!((runs[1].x - 0.22).abs() < 0.000_1);
+    assert!((runs[1].y - 0.20).abs() < 0.000_1);
   }
 }

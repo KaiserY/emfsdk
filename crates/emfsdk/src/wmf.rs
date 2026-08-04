@@ -600,6 +600,22 @@ impl WmfTernaryRasterOperationCode {
     ((self.0 ^ (self.0 >> 2)) & 0x33) != 0
   }
 
+  /// Returns whether this truth table reads the destination pixel.
+  ///
+  /// A ternary raster operation is indexed by the eight combinations of
+  /// pattern, source, and destination bits.  If each pair that differs only
+  /// in the destination bit has the same result, the destination is unused.
+  /// This is the dependency test used by LibreOffice's EMF/WMF replay in
+  /// `emfio/source/reader/mtftools.cxx`.
+  pub const fn uses_destination(self) -> bool {
+    (self.0 & 0xAA) != ((self.0 & 0x55) << 1)
+  }
+
+  /// Returns whether this truth table reads the selected pattern pixel.
+  pub const fn uses_pattern(self) -> bool {
+    (self.0 & 0x0F) != (self.0 >> 4)
+  }
+
   pub const fn canonical_raw(self) -> u32 {
     WMF_TERNARY_RASTER_OPERATION_VALUES[self.0 as usize]
   }
@@ -635,6 +651,14 @@ impl WmfTernaryRasterOperation {
 
   pub const fn uses_source(self) -> bool {
     self.operation_code().uses_source()
+  }
+
+  pub const fn uses_destination(self) -> bool {
+    self.operation_code().uses_destination()
+  }
+
+  pub const fn uses_pattern(self) -> bool {
+    self.operation_code().uses_pattern()
   }
 
   pub const fn canonical_raw(self) -> u32 {
@@ -8372,6 +8396,13 @@ mod tests {
     let core_1bpp_dib = core_1bpp_dib_bytes();
     assert!(WmfTernaryRasterOperationCode::SRCCOPY.uses_source());
     assert!(!WmfTernaryRasterOperationCode::PATCOPY.uses_source());
+    assert!(!WmfTernaryRasterOperationCode::SRCCOPY.uses_destination());
+    assert!(WmfTernaryRasterOperationCode::SRCAND.uses_destination());
+    assert!(WmfTernaryRasterOperationCode::SRCINVERT.uses_destination());
+    assert!(!WmfTernaryRasterOperationCode::PATCOPY.uses_destination());
+    assert!(!WmfTernaryRasterOperationCode::SRCCOPY.uses_pattern());
+    assert!(WmfTernaryRasterOperationCode::PATCOPY.uses_pattern());
+    assert!(!WmfTernaryRasterOperationCode::SRCAND.uses_pattern());
     assert_eq!(
       WmfTernaryRasterOperationCode::SRCCOPY.canonical_raw(),
       0x00CC_0020
