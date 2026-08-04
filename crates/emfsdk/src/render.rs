@@ -417,7 +417,7 @@ fn extract_emf_text_runs(data: &[u8]) -> Vec<MetafileTextRun> {
         }
       }
       EMR_EXT_TEXTOUT_W => {
-        if let Some(text) = extract_emr_ext_text_out_w(data, pos, record_size)
+        if let Some(text) = extract_semantic_emr_ext_text_out_w(data, pos, record_size)
           && !text.trim().is_empty()
           && let Some(run) = state.text_run(data, pos, record_size, text)
         {
@@ -6353,6 +6353,36 @@ fn extract_emr_ext_text_out_w(
   record_offset: usize,
   record_size: usize,
 ) -> Option<String> {
+  let units = emr_ext_text_out_w_units(data, record_offset, record_size)?;
+  Some(
+    String::from_utf16_lossy(&units)
+      .trim_end_matches('\0')
+      .to_string(),
+  )
+}
+
+fn extract_semantic_emr_ext_text_out_w(
+  data: &[u8],
+  record_offset: usize,
+  record_size: usize,
+) -> Option<String> {
+  let units = emr_ext_text_out_w_units(data, record_offset, record_size)?;
+  // [MS-EMF] §2.3.5.8 defines each EMR_EXTTEXTOUTW record as an
+  // independent UTF-16LE Unicode string. A lone surrogate can still paint a
+  // GDI missing-glyph cell, but it has no Unicode scalar value and therefore
+  // must not become U+FFFD in searchable semantic text. Raster replay keeps
+  // using the lossy decoder above so the visible glyph cell is preserved.
+  let text = char::decode_utf16(units)
+    .filter_map(|character| character.ok())
+    .collect::<String>();
+  Some(text.trim_end_matches('\0').to_string())
+}
+
+fn emr_ext_text_out_w_units(
+  data: &[u8],
+  record_offset: usize,
+  record_size: usize,
+) -> Option<Vec<u16>> {
   let text = ext_text_record(data, record_offset, record_size)?;
   let byte_len = text.characters.checked_mul(2)?;
   let start = record_offset.checked_add(text.string_offset)?;
@@ -6362,11 +6392,7 @@ fn extract_emr_ext_text_out_w(
     .chunks_exact(2)
     .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
     .collect::<Vec<_>>();
-  Some(
-    String::from_utf16_lossy(&units)
-      .trim_end_matches('\0')
-      .to_string(),
-  )
+  Some(units)
 }
 
 fn extract_emr_ext_text_out_a(
