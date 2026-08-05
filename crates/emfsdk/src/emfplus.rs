@@ -4906,6 +4906,10 @@ impl EmfPlusRecord {
     self.as_ref().parse_data()
   }
 
+  pub(crate) fn parse_data_relaxed(&self) -> Result<EmfPlusRecordData<'_>> {
+    self.as_ref().parse_data_relaxed()
+  }
+
   pub fn rebuild_typed(&self) -> Result<Self> {
     self.as_ref().rebuild_typed()
   }
@@ -4919,6 +4923,14 @@ impl SdkWrite for EmfPlusRecord {
 
 impl<'a> EmfPlusRecordRef<'a> {
   pub fn parse_data(self) -> Result<EmfPlusRecordData<'a>> {
+    self.parse_data_with_validation(true)
+  }
+
+  pub(crate) fn parse_data_relaxed(self) -> Result<EmfPlusRecordData<'a>> {
+    self.parse_data_with_validation(false)
+  }
+
+  fn parse_data_with_validation(self, validate_semantics: bool) -> Result<EmfPlusRecordData<'a>> {
     if !self.data.len().is_multiple_of(4) || !self.padding.is_empty() {
       return Err(Error::invalid(
         0,
@@ -5501,7 +5513,9 @@ impl<'a> EmfPlusRecordRef<'a> {
       None => EmfPlusRecordData::Unknown(self),
     };
 
-    validate_emf_plus_record_data(&data, flags)?;
+    if validate_semantics {
+      validate_emf_plus_record_data(&data, flags)?;
+    }
     Ok(data)
   }
 

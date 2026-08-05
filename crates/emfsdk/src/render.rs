@@ -29,8 +29,8 @@ use crate::emfplus::{
   EmfPlusObjectAssembler, EmfPlusObjectData, EmfPlusObjectRecordData, EmfPlusPathObject,
   EmfPlusPathPointType, EmfPlusPathPointTypeFlags, EmfPlusPathPointTypeValue,
   EmfPlusPathPointTypes, EmfPlusPenObject, EmfPlusPointData, EmfPlusRecord, EmfPlusRecordData,
-  EmfPlusRecordType, EmfPlusRotateWorldTransformData, EmfPlusScaleWorldTransformData,
-  EmfPlusTranslateWorldTransformData, EmfPlusUnitType,
+  EmfPlusRecordType, EmfPlusRegionNodeDataType, EmfPlusRotateWorldTransformData,
+  EmfPlusScaleWorldTransformData, EmfPlusTranslateWorldTransformData, EmfPlusUnitType,
 };
 use crate::wmf::{
   WmfBinaryRasterOperation, WmfBrushStyle, WmfEscapeData, WmfExtTextOutOptions, WmfMetafileRef,
@@ -164,6 +164,22 @@ pub struct MetafilePhysicalSize {
   pub natural_height_px: u32,
 }
 
+/// The external physical header supplied when a non-placeable WMF is played.
+///
+/// `METAFILEPICT.xExt` and `yExt` are expressed in hundredths of a
+/// millimetre. Office supplies this header with `MM_ANISOTROPIC` for ActiveX
+/// and OLE replacement graphics whose WMF byte stream has no placeable
+/// header. Win32 also requires the resolution of the reference device context
+/// to realize that physical rectangle as a device grid. The WMF's own
+/// `META_SETWINDOWEXT` records continue to establish logical units.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WmfExternalHeader {
+  pub width_hundredths_mm: u32,
+  pub height_hundredths_mm: u32,
+  pub reference_device_dpi_x: u32,
+  pub reference_device_dpi_y: u32,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RenderOptions {
   pub target_width_px: Option<u32>,
@@ -212,6 +228,12 @@ pub struct RenderOptions {
   /// Unmatched, non-binary, and destination-dependent bitmap records remain
   /// in the raster replay.
   pub suppress_bitmap_layers: bool,
+  /// Physical playback header for a non-placeable WMF.
+  ///
+  /// This is intentionally caller-supplied rather than inferred from the
+  /// byte stream: a standard WMF does not contain `METAFILEPICT.xExt/yExt`.
+  /// Placeable WMFs retain their authored header and EMFs retain `Frame`.
+  pub wmf_external_header: Option<WmfExternalHeader>,
 }
 
 impl RenderOptions {
@@ -381,6 +403,14 @@ pub struct MetafileBitmapLayer {
 }
 
 pub fn extract_metafile_text_runs(data: &[u8], content_type: Option<&str>) -> Vec<MetafileTextRun> {
+  extract_metafile_text_runs_with_options(data, content_type, RenderOptions::default())
+}
+
+pub fn extract_metafile_text_runs_with_options(
+  data: &[u8],
+  content_type: Option<&str>,
+  options: RenderOptions,
+) -> Vec<MetafileTextRun> {
   if !looks_like_metafile(data, content_type) {
     return Vec::new();
   }
@@ -388,7 +418,7 @@ pub fn extract_metafile_text_runs(data: &[u8], content_type: Option<&str>) -> Ve
     return extract_emf_text_runs(data);
   }
   if crate::wmf::looks_like_wmf(data) {
-    return extract_wmf_text_runs(data);
+    return extract_wmf_text_runs(data, options.wmf_external_header);
   }
   Vec::new()
 }
@@ -402,10 +432,18 @@ pub fn extract_metafile_solid_rects(
   data: &[u8],
   content_type: Option<&str>,
 ) -> Vec<MetafileSolidRect> {
+  extract_metafile_solid_rects_with_options(data, content_type, RenderOptions::default())
+}
+
+pub fn extract_metafile_solid_rects_with_options(
+  data: &[u8],
+  content_type: Option<&str>,
+  options: RenderOptions,
+) -> Vec<MetafileSolidRect> {
   if !looks_like_metafile(data, content_type) || !crate::wmf::looks_like_wmf(data) {
     return Vec::new();
   }
-  extract_wmf_solid_rects(data)
+  extract_wmf_solid_rects(data, options.wmf_external_header)
 }
 
 /// Returns separable bitmap layers from WMF DIB records.
@@ -420,10 +458,18 @@ pub fn extract_metafile_bitmap_layers(
   data: &[u8],
   content_type: Option<&str>,
 ) -> Vec<MetafileBitmapLayer> {
+  extract_metafile_bitmap_layers_with_options(data, content_type, RenderOptions::default())
+}
+
+pub fn extract_metafile_bitmap_layers_with_options(
+  data: &[u8],
+  content_type: Option<&str>,
+  options: RenderOptions,
+) -> Vec<MetafileBitmapLayer> {
   if !looks_like_metafile(data, content_type) || !crate::wmf::looks_like_wmf(data) {
     return Vec::new();
   }
-  extract_wmf_bitmap_layers(data)
+  extract_wmf_bitmap_layers(data, options.wmf_external_header)
 }
 
 fn extract_emf_text_runs(data: &[u8]) -> Vec<MetafileTextRun> {
@@ -631,11 +677,13 @@ struct WmfTextState {
   text_alignment: WmfTextAlignmentModeFlags,
   saved: Vec<WmfTextSnapshot>,
   font_cache: RenderFontCache,
+  round_device_coordinates: bool,
 }
 
 impl WmfTextState {
-  fn new(metafile: &WmfMetafileRef<'_>) -> Self {
-    let (window_org_x, window_org_y, window_ext_x, window_ext_y) = wmf_initial_window(metafile);
+  fn new(metafile: &WmfMetafileRef<'_>, external_header: Option<WmfExternalHeader>) -> Self {
+    let (window_org_x, window_org_y, window_ext_x, window_ext_y) =
+      wmf_initial_window(metafile, external_header);
     Self {
       natural_width: window_ext_x.unsigned_abs().max(1) as f32,
       natural_height: window_ext_y.unsigned_abs().max(1) as f32,
@@ -659,6 +707,7 @@ impl WmfTextState {
       text_alignment: WmfTextAlignmentModeFlags::empty(),
       saved: Vec::new(),
       font_cache: RenderFontCache::load(),
+      round_device_coordinates: wmf_external_canvas_size(metafile, external_header).is_some(),
     }
   }
 
@@ -783,9 +832,19 @@ impl WmfTextState {
     } else {
       reference_x
     };
-    let mapped_x = self.viewport_org_x as f32 + (aligned_x - self.window_org_x) as f32 * scale_x;
-    let mapped_reference_y =
-      self.viewport_org_y as f32 + (reference_y - self.window_org_y) as f32 * scale_y;
+    let realize_coordinate = |value: f32| {
+      if self.round_device_coordinates {
+        value.round()
+      } else {
+        value
+      }
+    };
+    let mapped_x = realize_coordinate(
+      self.viewport_org_x as f32 + (aligned_x - self.window_org_x) as f32 * scale_x,
+    );
+    let mapped_reference_y = realize_coordinate(
+      self.viewport_org_y as f32 + (reference_y - self.window_org_y) as f32 * scale_y,
+    );
     let font = WmfTextFont {
       height: self.current_font_height,
       family: self.current_font_family.clone(),
@@ -816,10 +875,23 @@ impl WmfTextState {
     };
     let mapped_y = mapped_reference_y + realized_advance;
     let advances = logical_advances.map(|values| {
-      values
-        .iter()
-        .map(|advance| f32::from(*advance) * scale_x / self.natural_width)
+      if self.round_device_coordinates {
+        let values = values
+          .iter()
+          .map(|value| i32::from(*value))
+          .collect::<Vec<_>>();
+        cumulative_mapped_advances(&values, |logical_cumulative| {
+          (logical_cumulative as f32 * scale_x).round()
+        })
+        .into_iter()
+        .map(|advance| advance / self.natural_width)
         .collect::<Vec<_>>()
+      } else {
+        values
+          .iter()
+          .map(|advance| f32::from(*advance) * scale_x / self.natural_width)
+          .collect::<Vec<_>>()
+      }
     });
     let run = MetafileTextRun {
       text,
@@ -877,11 +949,13 @@ struct WmfSolidRectState {
   objects: Vec<Option<WmfSolidRectObject>>,
   current_solid_brush: Option<EmfColor>,
   saved: Vec<WmfSolidRectSnapshot>,
+  round_device_coordinates: bool,
 }
 
 impl WmfSolidRectState {
-  fn new(metafile: &WmfMetafileRef<'_>) -> Self {
-    let (window_org_x, window_org_y, window_ext_x, window_ext_y) = wmf_initial_window(metafile);
+  fn new(metafile: &WmfMetafileRef<'_>, external_header: Option<WmfExternalHeader>) -> Self {
+    let (window_org_x, window_org_y, window_ext_x, window_ext_y) =
+      wmf_initial_window(metafile, external_header);
     let natural_width = mapping_extent_magnitude(window_ext_x) as f32;
     let natural_height = mapping_extent_magnitude(window_ext_y) as f32;
     Self {
@@ -898,6 +972,7 @@ impl WmfSolidRectState {
       objects: vec![None; metafile.header.number_of_objects as usize],
       current_solid_brush: None,
       saved: Vec::new(),
+      round_device_coordinates: wmf_external_canvas_size(metafile, external_header).is_some(),
     }
   }
 
@@ -964,10 +1039,19 @@ impl WmfSolidRectState {
   ) -> Option<(f32, f32, f32, f32, bool, bool)> {
     let scale_x = self.viewport_ext_x as f32 / self.window_ext_x as f32;
     let scale_y = self.viewport_ext_y as f32 / self.window_ext_y as f32;
-    let map_x =
-      |value: i32| self.viewport_org_x as f32 + (value - self.window_org_x) as f32 * scale_x;
-    let map_y =
-      |value: i32| self.viewport_org_y as f32 + (value - self.window_org_y) as f32 * scale_y;
+    let realize_coordinate = |value: f32| {
+      if self.round_device_coordinates {
+        value.round()
+      } else {
+        value
+      }
+    };
+    let map_x = |value: i32| {
+      realize_coordinate(self.viewport_org_x as f32 + (value - self.window_org_x) as f32 * scale_x)
+    };
+    let map_y = |value: i32| {
+      realize_coordinate(self.viewport_org_y as f32 + (value - self.window_org_y) as f32 * scale_y)
+    };
     let first_x = map_x(x);
     let second_x = map_x(x.saturating_add(width));
     let first_y = map_y(y);
@@ -1013,11 +1097,14 @@ impl WmfSolidRectState {
   }
 }
 
-fn extract_wmf_solid_rects(data: &[u8]) -> Vec<MetafileSolidRect> {
+fn extract_wmf_solid_rects(
+  data: &[u8],
+  external_header: Option<WmfExternalHeader>,
+) -> Vec<MetafileSolidRect> {
   let Ok(metafile) = WmfMetafileRef::from_bytes(data) else {
     return Vec::new();
   };
-  let mut state = WmfSolidRectState::new(&metafile);
+  let mut state = WmfSolidRectState::new(&metafile, external_header);
   let mut rects = Vec::new();
   let mut records = metafile.records().peekable();
   while let Some(record) = records.next() {
@@ -1223,11 +1310,14 @@ fn wmf_copy_bitmap_layer(
   })
 }
 
-fn extract_wmf_bitmap_layers(data: &[u8]) -> Vec<MetafileBitmapLayer> {
+fn extract_wmf_bitmap_layers(
+  data: &[u8],
+  external_header: Option<WmfExternalHeader>,
+) -> Vec<MetafileBitmapLayer> {
   let Ok(metafile) = WmfMetafileRef::from_bytes(data) else {
     return Vec::new();
   };
-  let mut state = WmfSolidRectState::new(&metafile);
+  let mut state = WmfSolidRectState::new(&metafile, external_header);
   let mut layers = Vec::new();
   let mut records = metafile.records().peekable();
   while let Some(record) = records.next() {
@@ -1333,11 +1423,14 @@ fn wmf_text_font(value: &crate::wmf::WmfFontObject) -> WmfTextFont {
   }
 }
 
-fn extract_wmf_text_runs(data: &[u8]) -> Vec<MetafileTextRun> {
+fn extract_wmf_text_runs(
+  data: &[u8],
+  external_header: Option<WmfExternalHeader>,
+) -> Vec<MetafileTextRun> {
   let Ok(metafile) = WmfMetafileRef::from_bytes(data) else {
     return Vec::new();
   };
-  let mut state = WmfTextState::new(&metafile);
+  let mut state = WmfTextState::new(&metafile, external_header);
   let mut runs = Vec::new();
   let mut requires_raster_backdrop = false;
   for record in metafile.records() {
@@ -1891,6 +1984,8 @@ impl EmfTextState {
 struct EmfVectorState {
   width: usize,
   height: usize,
+  natural_width: usize,
+  natural_height: usize,
   output_scale_x: f32,
   output_scale_y: f32,
   window_org_x: i32,
@@ -1915,6 +2010,8 @@ struct EmfVectorState {
   clip_rect: Option<(i32, i32, i32, i32)>,
   clip_mask: Option<Vec<bool>>,
   saved_states: Vec<EmfVectorSnapshot>,
+  emf_plus_saved_states: Vec<(u32, EmfVectorSnapshot)>,
+  emf_plus_containers: Vec<(u32, EmfVectorSnapshot)>,
   emf_plus_objects: Vec<Option<EmfPlusRenderObject>>,
   emf_plus_object_assembler: EmfPlusObjectAssembler,
   font_cache: RenderFontCache,
@@ -1944,15 +2041,35 @@ struct EmfVectorSnapshot {
   clip_mask: Option<Vec<bool>>,
 }
 
+struct EmfDeviceContextBridge {
+  snapshot: EmfVectorSnapshot,
+  saved_states: Vec<EmfVectorSnapshot>,
+  brush_colors: std::collections::HashMap<u32, EmfColor>,
+  pens: std::collections::HashMap<u32, Option<EmfPen>>,
+  fonts: std::collections::HashMap<u32, EmfFont>,
+}
+
 #[derive(Clone, Debug)]
 enum EmfPlusRenderObject {
   Brush(Option<EmfPlusRenderBrush>),
   Pen(Option<EmfPen>),
   Path(Vec<EmfPoint>),
-  Region(Vec<EmfPoint>),
+  Region(EmfPlusRenderRegion),
   Image(RasterPixels),
   Font(EmfPlusFontObject),
   Unsupported,
+}
+
+#[derive(Clone, Debug)]
+enum EmfPlusRenderRegion {
+  Empty,
+  Infinite,
+  Polygon(Vec<EmfPoint>),
+  Combine {
+    mode: u8,
+    left: Box<EmfPlusRenderRegion>,
+    right: Box<EmfPlusRenderRegion>,
+  },
 }
 
 #[derive(Clone, Debug)]
@@ -2373,6 +2490,8 @@ impl EmfVectorState {
     Ok(Self {
       width,
       height,
+      natural_width,
+      natural_height,
       output_scale_x,
       output_scale_y,
       window_org_x: 0,
@@ -2401,6 +2520,8 @@ impl EmfVectorState {
       clip_rect: None,
       clip_mask: None,
       saved_states: Vec::new(),
+      emf_plus_saved_states: Vec::new(),
+      emf_plus_containers: Vec::new(),
       emf_plus_objects: Vec::new(),
       emf_plus_object_assembler: EmfPlusObjectAssembler::default(),
       font_cache: RenderFontCache::load(),
@@ -2998,7 +3119,11 @@ impl EmfVectorState {
   }
 
   fn save_state(&mut self) {
-    self.saved_states.push(EmfVectorSnapshot {
+    self.saved_states.push(self.snapshot());
+  }
+
+  fn snapshot(&self) -> EmfVectorSnapshot {
+    EmfVectorSnapshot {
       window_org_x: self.window_org_x,
       window_org_y: self.window_org_y,
       window_ext_x: self.window_ext_x,
@@ -3017,13 +3142,17 @@ impl EmfVectorState {
       text_alignment: self.text_alignment,
       clip_rect: self.clip_rect,
       clip_mask: self.clip_mask.clone(),
-    });
+    }
   }
 
   fn restore_state(&mut self) {
     let Some(saved) = self.saved_states.pop() else {
       return;
     };
+    self.restore_snapshot(saved);
+  }
+
+  fn restore_snapshot(&mut self, saved: EmfVectorSnapshot) {
     self.window_org_x = saved.window_org_x;
     self.window_org_y = saved.window_org_y;
     self.window_ext_x = saved.window_ext_x;
@@ -3042,6 +3171,80 @@ impl EmfVectorState {
     self.text_alignment = saved.text_alignment;
     self.clip_rect = saved.clip_rect;
     self.clip_mask = saved.clip_mask;
+  }
+
+  fn save_emf_plus_state(&mut self, stack_index: u32, container: bool) {
+    let snapshot = self.snapshot();
+    let stack = if container {
+      &mut self.emf_plus_containers
+    } else {
+      &mut self.emf_plus_saved_states
+    };
+    stack.retain(|(index, _)| *index != stack_index);
+    stack.push((stack_index, snapshot));
+  }
+
+  fn restore_emf_plus_state(&mut self, stack_index: u32, container: bool) {
+    let snapshot = {
+      let stack = if container {
+        &mut self.emf_plus_containers
+      } else {
+        &mut self.emf_plus_saved_states
+      };
+      let Some(position) = stack.iter().rposition(|(index, _)| *index == stack_index) else {
+        return;
+      };
+      let snapshot = stack[position].1.clone();
+      // Restore/EndContainer pops the addressed level and every level
+      // nested after it; Save and container stacks are independent.
+      stack.truncate(position);
+      snapshot
+    };
+    self.restore_snapshot(snapshot);
+  }
+
+  fn begin_emf_device_context(&mut self) -> EmfDeviceContextBridge {
+    let bridge = EmfDeviceContextBridge {
+      snapshot: self.snapshot(),
+      saved_states: std::mem::take(&mut self.saved_states),
+      brush_colors: std::mem::take(&mut self.brush_colors),
+      pens: std::mem::take(&mut self.pens),
+      fonts: std::mem::take(&mut self.fonts),
+    };
+
+    // [MS-EMFPLUS] 2.3.3.2 hands subsequent EMF records a device
+    // context. GDI mapping and SaveDC state start in device coordinates;
+    // they must not inherit the EMF+ world transform or graphics-state
+    // stack. The active clip is deliberately retained for the borrowed DC.
+    self.window_org_x = 0;
+    self.window_org_y = 0;
+    self.window_ext_x = self.natural_width.max(1) as i32;
+    self.window_ext_y = self.natural_height.max(1) as i32;
+    self.viewport_org_x = 0;
+    self.viewport_org_y = 0;
+    self.viewport_ext_x = self.natural_width.max(1) as i32;
+    self.viewport_ext_y = self.natural_height.max(1) as i32;
+    self.world_transform = EmfTransform::identity();
+    self.current_brush = None;
+    self.current_pen = Some(EmfPen {
+      color: EmfColor { r: 0, g: 0, b: 0 },
+      width: 1,
+      transform_width: false,
+    });
+    self.current_font = None;
+    self.current_pos = EmfPoint { x: 0, y: 0 };
+    self.text_color = EmfColor { r: 0, g: 0, b: 0 };
+    self.binary_raster_operation = WmfBinaryRasterOperation::CopyPen;
+    self.text_alignment = WmfTextAlignmentModeFlags::empty();
+    bridge
+  }
+
+  fn end_emf_device_context(&mut self, bridge: EmfDeviceContextBridge) {
+    self.restore_snapshot(bridge.snapshot);
+    self.saved_states = bridge.saved_states;
+    self.brush_colors = bridge.brush_colors;
+    self.pens = bridge.pens;
+    self.fonts = bridge.fonts;
   }
 
   fn set_clip_rect_logical(&mut self, left: i32, top: i32, right: i32, bottom: i32) {
@@ -3095,6 +3298,49 @@ impl EmfVectorState {
     self.combine_clip_mask(mask, combine_mode);
   }
 
+  fn set_clip_region(&mut self, region: &EmfPlusRenderRegion, combine_mode: u8) {
+    let next = self.emf_plus_region_mask(region);
+    self.combine_clip_region_mask(next, combine_mode);
+  }
+
+  fn fill_emf_plus_region(&mut self, region: &EmfPlusRenderRegion, brush: &EmfPlusRenderBrush) {
+    let mask = self.emf_plus_region_mask(region);
+    for y in 0..self.height {
+      for x in 0..self.width {
+        if mask.as_ref().is_some_and(|mask| !mask[y * self.width + x]) {
+          continue;
+        }
+        self.set_pixel(x as i32, y as i32, brush.color_at(x as i32, y as i32));
+      }
+    }
+  }
+
+  /// Returns `None` for an infinite region and a device-space mask for
+  /// every finite region, including an all-false mask for an empty region.
+  fn emf_plus_region_mask(&self, region: &EmfPlusRenderRegion) -> Option<Vec<bool>> {
+    match region {
+      EmfPlusRenderRegion::Empty => Some(vec![false; self.width * self.height]),
+      EmfPlusRenderRegion::Infinite => None,
+      EmfPlusRenderRegion::Polygon(points) => {
+        let mapped = points
+          .iter()
+          .map(|point| self.map_point(*point))
+          .collect::<Vec<_>>();
+        Some(
+          axis_aligned_clip_rect(&mapped, self.width, self.height).map_or_else(
+            || self.polygon_mask(&mapped),
+            |rect| self.rect_clip_mask(rect),
+          ),
+        )
+      }
+      EmfPlusRenderRegion::Combine { mode, left, right } => {
+        let left = self.emf_plus_region_mask(left);
+        let right = self.emf_plus_region_mask(right);
+        self.combine_region_masks(left, right, *mode)
+      }
+    }
+  }
+
   fn offset_clip(&mut self, dx: f32, dy: f32) {
     if let Some((left, top, right, bottom)) = self.clip_rect {
       self.clip_rect = Some((
@@ -3126,56 +3372,76 @@ impl EmfVectorState {
   }
 
   fn combine_clip_mask(&mut self, next: Vec<bool>, combine_mode: u8) {
+    self.combine_clip_region_mask(Some(next), combine_mode);
+  }
+
+  fn combine_clip_region_mask(&mut self, next: Option<Vec<bool>>, combine_mode: u8) {
     let current = match self.clip_mask.take() {
       Some(mask) => Some(mask),
       None => self.clip_rect.map(|rect| self.rect_clip_mask(rect)),
     };
-    let mask = match (current, combine_mode) {
-      (_, 0) => Some(next),
-      (None, 1) => Some(next),
-      (Some(current), 1) => Some(
-        current
+    let mask = self.combine_region_masks(current, next, combine_mode);
+    self.clip_mask = mask;
+    self.update_clip_rect_from_mask();
+  }
+
+  fn combine_region_masks(
+    &self,
+    left: Option<Vec<bool>>,
+    right: Option<Vec<bool>>,
+    combine_mode: u8,
+  ) -> Option<Vec<bool>> {
+    let empty = || vec![false; self.width * self.height];
+    match (left, right, combine_mode) {
+      (_, right, 0) => right,
+      (None, right, 1) => right,
+      (left, None, 1) => left,
+      (Some(left), Some(right), 1) => Some(
+        left
           .into_iter()
-          .zip(next)
+          .zip(right)
           .map(|(left, right)| left && right)
           .collect(),
       ),
-      (None, 2) => None,
-      (Some(current), 2) => Some(
-        current
+      (None, _, 2) | (_, None, 2) => None,
+      (Some(left), Some(right), 2) => Some(
+        left
           .into_iter()
-          .zip(next)
+          .zip(right)
           .map(|(left, right)| left || right)
           .collect(),
       ),
-      (None, 3) => Some(next),
-      (Some(current), 3) => Some(
-        current
+      (None, None, 3) => Some(empty()),
+      (None, Some(mask), 3) | (Some(mask), None, 3) => {
+        Some(mask.into_iter().map(|value| !value).collect())
+      }
+      (Some(left), Some(right), 3) => Some(
+        left
           .into_iter()
-          .zip(next)
+          .zip(right)
           .map(|(left, right)| left ^ right)
           .collect(),
       ),
-      (None, 4) => None,
-      (Some(current), 4) => Some(
-        current
+      (None, None, 4) | (Some(_), None, 4) => Some(empty()),
+      (None, Some(right), 4) => Some(right.into_iter().map(|value| !value).collect()),
+      (Some(left), Some(right), 4) => Some(
+        left
           .into_iter()
-          .zip(next)
+          .zip(right)
           .map(|(left, right)| left && !right)
           .collect(),
       ),
-      (None, 5) => Some(next.into_iter().map(|value| !value).collect()),
-      (Some(current), 5) => Some(
-        current
+      (None, _, 5) => Some(empty()),
+      (Some(left), None, 5) => Some(left.into_iter().map(|value| !value).collect()),
+      (Some(left), Some(right), 5) => Some(
+        left
           .into_iter()
-          .zip(next)
+          .zip(right)
           .map(|(left, right)| right && !left)
           .collect(),
       ),
-      (_, _) => Some(next),
-    };
-    self.clip_mask = mask;
-    self.update_clip_rect_from_mask();
+      (_, right, _) => right,
+    }
   }
 
   fn rect_clip_mask(&self, rect: (i32, i32, i32, i32)) -> Vec<bool> {
@@ -3470,6 +3736,8 @@ fn decode_vector_emf_as_png(
 ) -> Result<DecodedMetafile, String> {
   let mut state = EmfVectorState::new_with_options(data, options)?;
   let mut pos = EMF_HEADER_SIZE;
+  let mut emf_plus_playback = false;
+  let mut emf_device_context = None;
 
   while pos + EMF_RECORD_HEADER_SIZE <= data.len() {
     let record_type = read_u32(data, pos)?;
@@ -3478,6 +3746,24 @@ fn decode_vector_emf_as_png(
       return Err(format!(
         "invalid EMF record at offset {pos}: type=0x{record_type:08x} size={record_size}"
       ));
+    }
+    let is_emf_plus_comment =
+      record_type == EMR_COMMENT && emf_comment_is_emf_plus(data, pos, record_size);
+    if is_emf_plus_comment && let Some(bridge) = emf_device_context.take() {
+      // The next EMF+ record ends the GetDC interval. Restore the EMF+
+      // graphics state before consuming that record.
+      state.end_emf_device_context(bridge);
+    }
+    if emf_plus_playback
+      && emf_device_context.is_none()
+      && record_type != EMR_COMMENT
+      && record_type != EMR_EOF
+    {
+      // [MS-EMFPLUS] 1.3: EMF+ playback ignores the complete classic EMF
+      // fallback in both Only and Dual metafiles. Classic drawing records
+      // are consumed only inside an explicit EmfPlusGetDC interval.
+      pos += record_size;
+      continue;
     }
     let mut consumed_following_record_size = 0usize;
 
@@ -3818,7 +4104,12 @@ fn decode_vector_emf_as_png(
         }
       }
       EMR_COMMENT if record_size >= 16 => {
-        process_emf_plus_comment(data, pos, record_size, &mut state)?;
+        if let Some(control) = process_emf_plus_comment(data, pos, record_size, &mut state)? {
+          emf_plus_playback |= control.header;
+          if emf_plus_playback && control.get_dc {
+            emf_device_context = Some(state.begin_emf_device_context());
+          }
+        }
       }
       EMR_EOF => break,
       _ => {}
@@ -3831,6 +4122,12 @@ fn decode_vector_emf_as_png(
     data: rgb_to_png(&state.rgb, state.width as u32, state.height as u32)?,
     content_type: "image/png",
   })
+}
+
+fn emf_comment_is_emf_plus(data: &[u8], record_offset: usize, record_size: usize) -> bool {
+  record_size >= 16
+    && read_u32(data, record_offset + 8).is_ok_and(|data_size| data_size >= 4)
+    && read_u32(data, record_offset + 12).is_ok_and(|identifier| identifier == EMR_COMMENT_EMFPLUS)
 }
 
 fn cropped_emf_bitmap(
@@ -4175,7 +4472,8 @@ struct WmfRenderState {
 
 impl WmfRenderState {
   fn new(metafile: &WmfMetafileRef<'_>, options: RenderOptions) -> Result<Self, String> {
-    let (window_org_x, window_org_y, window_ext_x, window_ext_y) = wmf_initial_window(metafile);
+    let (window_org_x, window_org_y, window_ext_x, window_ext_y) =
+      wmf_initial_window(metafile, options.wmf_external_header);
     let natural_width = window_ext_x.unsigned_abs().max(1) as usize;
     let natural_height = window_ext_y.unsigned_abs().max(1) as usize;
     let (width, height) = options.resolved_canvas_size(natural_width, natural_height);
@@ -4192,6 +4490,8 @@ impl WmfRenderState {
       canvas: EmfVectorState {
         width,
         height,
+        natural_width,
+        natural_height,
         output_scale_x,
         output_scale_y,
         window_org_x,
@@ -4224,6 +4524,8 @@ impl WmfRenderState {
         clip_rect: None,
         clip_mask: None,
         saved_states: Vec::new(),
+        emf_plus_saved_states: Vec::new(),
+        emf_plus_containers: Vec::new(),
         emf_plus_objects: Vec::new(),
         emf_plus_object_assembler: EmfPlusObjectAssembler::default(),
         font_cache: RenderFontCache::load(),
@@ -4946,7 +5248,52 @@ fn decode_wmf_as_raster(
   }))
 }
 
-fn wmf_initial_window(metafile: &WmfMetafileRef<'_>) -> (i32, i32, i32, i32) {
+fn wmf_external_canvas_size(
+  metafile: &WmfMetafileRef<'_>,
+  external_header: Option<WmfExternalHeader>,
+) -> Option<(i32, i32)> {
+  if metafile.placeable_header.is_some() {
+    return None;
+  }
+  let external_header = external_header?;
+  if external_header.width_hundredths_mm == 0 || external_header.height_hundredths_mm == 0 {
+    return None;
+  }
+
+  // SetWinMetaFileBits uses both METAFILEPICT and the reference DC's
+  // resolution. The resulting viewport extent is a pixel count; rclBounds is
+  // then reported with an inclusive last *coordinate* (for example, an extent
+  // of 280 has a right bound of 279). Do not turn that coordinate convention
+  // into an extra viewport pixel. A Win32 conversion of the 5080x3016-mm100
+  // ActiveX counterexample at 140 DPI yields viewport extents 280x166 and
+  // bounds 0,0,279,165.
+  const HUNDREDTHS_MM_PER_INCH: u64 = 2_540;
+  let axis = |hundredths_mm: u32, dpi: u32| {
+    if dpi == 0 {
+      return None;
+    }
+    let rounded_pixels = (u64::from(hundredths_mm) * u64::from(dpi) + HUNDREDTHS_MM_PER_INCH / 2)
+      / HUNDREDTHS_MM_PER_INCH;
+    i32::try_from(rounded_pixels.min(i32::MAX as u64)).ok()
+  };
+  Some((
+    axis(
+      external_header.width_hundredths_mm,
+      external_header.reference_device_dpi_x,
+    )?
+    .max(1),
+    axis(
+      external_header.height_hundredths_mm,
+      external_header.reference_device_dpi_y,
+    )?
+    .max(1),
+  ))
+}
+
+fn wmf_initial_window(
+  metafile: &WmfMetafileRef<'_>,
+  external_header: Option<WmfExternalHeader>,
+) -> (i32, i32, i32, i32) {
   if let Some(placeable) = &metafile.placeable_header {
     return (
       i32::from(placeable.left),
@@ -4954,6 +5301,10 @@ fn wmf_initial_window(metafile: &WmfMetafileRef<'_>) -> (i32, i32, i32, i32) {
       placeable.bounding_box_width().abs().max(1),
       placeable.bounding_box_height().abs().max(1),
     );
+  }
+
+  if let Some((width, height)) = wmf_external_canvas_size(metafile, external_header) {
+    return (0, 0, width, height);
   }
 
   let mut org_x = 0;
@@ -5201,13 +5552,14 @@ fn process_emf_plus_comment(
   record_offset: usize,
   record_size: usize,
   state: &mut EmfVectorState,
-) -> Result<(), String> {
+) -> Result<Option<EmfPlusCommentControl>, String> {
   // EMR_COMMENT_EMFPLUS chunks as a stream of 12-byte EMF+ record headers.
   let data_size = read_u32(data, record_offset + 8)? as usize;
   let comment_identifier = read_u32(data, record_offset + 12)?;
   if comment_identifier != EMR_COMMENT_EMFPLUS || data_size < 4 {
-    return Ok(());
+    return Ok(None);
   }
+  let mut control = EmfPlusCommentControl::default();
   let mut cursor = record_offset + 16;
   let end = record_offset
     .checked_add(12)
@@ -5222,17 +5574,26 @@ fn process_emf_plus_comment(
     let record_bytes = &data[cursor..cursor + size];
     let mut reader = Reader::new(std::io::Cursor::new(record_bytes));
     if let Ok(record) = EmfPlusRecord::read_from(&mut reader, record_bytes.len() as u64) {
-      if record.record_kind() == Some(EmfPlusRecordType::Object) {
+      let record_kind = record.record_kind();
+      control.header |= record_kind == Some(EmfPlusRecordType::Header);
+      control.get_dc |= record_kind == Some(EmfPlusRecordType::GetDc);
+      if record_kind == Some(EmfPlusRecordType::Object) {
         if let Ok(fragment) = record.into_object_fragment() {
           process_emf_plus_object(fragment, state)?;
         }
-      } else if let Ok(parsed) = record.parse_data() {
+      } else if let Ok(parsed) = record.parse_data_relaxed() {
         process_emf_plus_record(parsed, state)?;
       }
     }
     cursor += size;
   }
-  Ok(())
+  Ok(Some(control))
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct EmfPlusCommentControl {
+  header: bool,
+  get_dc: bool,
 }
 
 fn process_emf_plus_record(
@@ -5292,9 +5653,9 @@ fn process_emf_plus_record(
     }
     EmfPlusRecordData::FillRegion(value) => {
       if let Some(brush) = emf_plus_brush_ref(value.brush, state)
-        && let Some(points) = emf_plus_region_points(value.object_id, state)
+        && let Some(region) = emf_plus_region(value.object_id, state)
       {
-        state.fill_polygon_with_emf_plus_brush(&points, &brush);
+        state.fill_emf_plus_region(&region, &brush);
       }
     }
     EmfPlusRecordData::FillPath(value) => {
@@ -5380,10 +5741,17 @@ fn process_emf_plus_record(
         state.draw_text(first.x as i32, first.y as i32, &text, color, 12);
       }
     }
-    EmfPlusRecordData::Save(_)
-    | EmfPlusRecordData::BeginContainer(_)
-    | EmfPlusRecordData::BeginContainerNoParams(_) => state.save_state(),
-    EmfPlusRecordData::Restore(_) | EmfPlusRecordData::EndContainer(_) => state.restore_state(),
+    EmfPlusRecordData::Save(value) => state.save_emf_plus_state(value.stack_index, false),
+    EmfPlusRecordData::Restore(value) => state.restore_emf_plus_state(value.stack_index, false),
+    EmfPlusRecordData::BeginContainer(value) => {
+      state.save_emf_plus_state(value.stack_index, true);
+    }
+    EmfPlusRecordData::BeginContainerNoParams(value) => {
+      state.save_emf_plus_state(value.stack_index, true);
+    }
+    EmfPlusRecordData::EndContainer(value) => {
+      state.restore_emf_plus_state(value.stack_index, true);
+    }
     EmfPlusRecordData::SetClipRect(value) => {
       let (left, top, right, bottom) = emf_plus_rectf_bounds(value.clip_rect);
       let points = [
@@ -5403,8 +5771,8 @@ fn process_emf_plus_record(
       }
     }
     EmfPlusRecordData::SetClipRegion(value) => {
-      if let Some(points) = emf_plus_region_points(value.object_id, state) {
-        state.set_clip_points_logical(&points, value.combine_mode);
+      if let Some(region) = emf_plus_region(value.object_id, state) {
+        state.set_clip_region(&region, value.combine_mode);
       }
     }
     EmfPlusRecordData::OffsetClip(value) => {
@@ -5474,9 +5842,9 @@ fn process_complete_emf_plus_object(value: EmfPlusObjectRecordData, state: &mut 
     Ok(EmfPlusObjectData::Path(path)) => {
       EmfPlusRenderObject::Path(emf_plus_path_object_points(&path))
     }
-    Ok(EmfPlusObjectData::Region(region)) => {
-      EmfPlusRenderObject::Region(emf_plus_region_object_points(&region))
-    }
+    Ok(EmfPlusObjectData::Region(region)) => emf_plus_region_object(&region)
+      .map(EmfPlusRenderObject::Region)
+      .unwrap_or(EmfPlusRenderObject::Unsupported),
     Ok(EmfPlusObjectData::Image(image)) => match emf_plus_image_object_to_rgb(&image) {
       Ok(Some(image)) => EmfPlusRenderObject::Image(image),
       _ => EmfPlusRenderObject::Unsupported,
@@ -5700,6 +6068,16 @@ fn arc_segment_points(
   sweep_angle: f32,
   pie: bool,
 ) -> Vec<EmfPoint> {
+  if !start_angle.is_finite() || !sweep_angle.is_finite() {
+    return Vec::new();
+  }
+  // [MS-EMFPLUS] requires StartAngle to be interpreted modulo 360 and
+  // SweepAngle to be clamped to one revolution. LibreOffice emits negative
+  // StartAngle values in otherwise valid EMF+ streams, so playback applies
+  // the required interpretation even when strict validation rejects the
+  // producer's non-conforming sign.
+  let start_angle = start_angle.rem_euclid(360.0);
+  let sweep_angle = sweep_angle.clamp(-360.0, 360.0);
   let steps = ((sweep_angle.abs() / 5.0).ceil() as usize).clamp(6, 144);
   let cx = (left + right) as f32 / 2.0;
   let cy = (top + bottom) as f32 / 2.0;
@@ -5927,75 +6305,54 @@ fn emf_plus_path_points(id: u8, state: &EmfVectorState) -> Option<Vec<EmfPoint>>
   }
 }
 
-fn emf_plus_region_points(id: u8, state: &EmfVectorState) -> Option<Vec<EmfPoint>> {
+fn emf_plus_region(id: u8, state: &EmfVectorState) -> Option<EmfPlusRenderRegion> {
   match state.emf_plus_objects.get(id as usize)? {
-    Some(EmfPlusRenderObject::Region(points)) => Some(points.clone()),
+    Some(EmfPlusRenderObject::Region(region)) => Some(region.clone()),
     _ => None,
   }
 }
 
-fn emf_plus_region_object_points(region: &crate::emfplus::EmfPlusRegionObject) -> Vec<EmfPoint> {
-  let Ok(nodes) = region.parse_region_nodes() else {
-    return Vec::new();
-  };
-  nodes
+fn emf_plus_region_object(
+  region: &crate::emfplus::EmfPlusRegionObject,
+) -> Option<EmfPlusRenderRegion> {
+  region
+    .parse_region_nodes()
+    .ok()?
     .first()
-    .and_then(emf_plus_region_node_points)
-    .unwrap_or_default()
+    .and_then(emf_plus_region_node)
 }
 
-fn emf_plus_region_node_points(node: &crate::emfplus::EmfPlusRegionNode) -> Option<Vec<EmfPoint>> {
+fn emf_plus_region_node(node: &crate::emfplus::EmfPlusRegionNode) -> Option<EmfPlusRenderRegion> {
   match &node.data {
     crate::emfplus::EmfPlusRegionNodeData::Rect(rect) => {
       let (left, top, right, bottom) = emf_plus_rectf_bounds(*rect);
-      Some(rect_points(left, top, right, bottom))
+      Some(EmfPlusRenderRegion::Polygon(rect_points(
+        left, top, right, bottom,
+      )))
     }
-    crate::emfplus::EmfPlusRegionNodeData::Path(path) => {
-      path.path().map(emf_plus_path_object_points)
-    }
-    crate::emfplus::EmfPlusRegionNodeData::Infinite => Some(rect_points(
-      0,
-      0,
-      DEFAULT_RENDER_WIDTH as i32,
-      DEFAULT_RENDER_HEIGHT as i32,
-    )),
+    crate::emfplus::EmfPlusRegionNodeData::Path(path) => path
+      .path()
+      .map(emf_plus_path_object_points)
+      .map(EmfPlusRenderRegion::Polygon),
+    crate::emfplus::EmfPlusRegionNodeData::Empty => Some(EmfPlusRenderRegion::Empty),
+    crate::emfplus::EmfPlusRegionNodeData::Infinite => Some(EmfPlusRenderRegion::Infinite),
     crate::emfplus::EmfPlusRegionNodeData::ChildNodes(children) => {
-      let left = emf_plus_region_node_points(&children.left);
-      let right = emf_plus_region_node_points(&children.right);
-      union_point_bounds(left.as_deref(), right.as_deref())
+      let mode = match node.node_type_kind()? {
+        EmfPlusRegionNodeDataType::And => 1,
+        EmfPlusRegionNodeDataType::Or => 2,
+        EmfPlusRegionNodeDataType::Xor => 3,
+        EmfPlusRegionNodeDataType::Exclude => 4,
+        EmfPlusRegionNodeDataType::Complement => 5,
+        _ => return None,
+      };
+      Some(EmfPlusRenderRegion::Combine {
+        mode,
+        left: Box::new(emf_plus_region_node(&children.left)?),
+        right: Box::new(emf_plus_region_node(&children.right)?),
+      })
     }
-    crate::emfplus::EmfPlusRegionNodeData::Empty
-    | crate::emfplus::EmfPlusRegionNodeData::Raw(_) => None,
+    crate::emfplus::EmfPlusRegionNodeData::Raw(_) => None,
   }
-}
-
-fn union_point_bounds(
-  left: Option<&[EmfPoint]>,
-  right: Option<&[EmfPoint]>,
-) -> Option<Vec<EmfPoint>> {
-  let mut points = Vec::new();
-  if let Some(left) = left {
-    points.extend_from_slice(left);
-  }
-  if let Some(right) = right {
-    points.extend_from_slice(right);
-  }
-  point_bounds(&points).map(|(left, top, right, bottom)| rect_points(left, top, right, bottom))
-}
-
-fn point_bounds(points: &[EmfPoint]) -> Option<(i32, i32, i32, i32)> {
-  let first = points.first().copied()?;
-  let mut left = first.x;
-  let mut top = first.y;
-  let mut right = first.x;
-  let mut bottom = first.y;
-  for point in points.iter().copied().skip(1) {
-    left = left.min(point.x);
-    top = top.min(point.y);
-    right = right.max(point.x);
-    bottom = bottom.max(point.y);
-  }
-  Some((left, top, right, bottom))
 }
 
 fn rect_points(left: i32, top: i32, right: i32, bottom: i32) -> Vec<EmfPoint> {
@@ -7580,6 +7937,10 @@ fn apply_binary_raster_operation(
 mod tests {
   use super::*;
   use crate::emf::EmrStretchBlt;
+  use crate::emfplus::{
+    EmfPlusGraphicsVersion, EmfPlusGraphicsVersionValue, EmfPlusHeaderData, EmfPlusRecordFlags,
+    EmfPlusRegionObject, EmfPlusStream,
+  };
   use crate::wmf::{
     WmfColorRecord, WmfDibCreatePatternBrushRecord, WmfDibStretchBltRecord, WmfDibTarget,
     WmfExtTextOutRecord, WmfLogBrushObject, WmfMetafileType, WmfMetafileVersion,
@@ -7977,6 +8338,7 @@ mod tests {
         suppress_text: false,
         suppress_solid_pattern_rects: false,
         suppress_bitmap_layers: false,
+        wmf_external_header: None,
       }
       .resolved_canvas_size(400, 300),
       (200, 100)
@@ -7993,6 +8355,7 @@ mod tests {
         suppress_text: false,
         suppress_solid_pattern_rects: false,
         suppress_bitmap_layers: false,
+        wmf_external_header: None,
       }
       .resolved_canvas_size(76, 76),
       (400, 300)
@@ -8278,6 +8641,125 @@ mod tests {
     assert_eq!(lifted.get_pixel(2, 3).0, [255, 255, 255]);
     assert_eq!(painted.get_pixel(0, 0).0, [0, 0, 255]);
     assert_eq!(lifted.get_pixel(0, 0).0, [0, 0, 255]);
+  }
+
+  #[test]
+  fn non_placeable_wmf_external_header_uses_the_reference_device_grid() {
+    let records = vec![
+      WmfRecordData::SetWindowExt(WmfPointRecord { x: 8, y: 8 })
+        .to_record()
+        .unwrap(),
+      WmfRecordData::CreateBrushIndirect(WmfLogBrushObject {
+        brush_style: WmfBrushStyle::Solid.raw(),
+        color_ref: ColorRef {
+          red: 255,
+          green: 0,
+          blue: 0,
+          reserved: 0,
+        },
+        brush_hatch: 0,
+      })
+      .to_record()
+      .unwrap(),
+      WmfRecordData::SelectObject(WmfObjectIndexRecord { index: 0 })
+        .to_record()
+        .unwrap(),
+      WmfRecordData::PatBlt(WmfPatBltRecord {
+        raster_operation: WmfTernaryRasterOperationCode::PATCOPY.canonical_raw(),
+        height: 2,
+        width: 4,
+        y_left: 3,
+        x_left: 2,
+      })
+      .to_record()
+      .unwrap(),
+      WmfRecordData::Eof(crate::wmf::WmfEofRecord::default())
+        .to_record()
+        .unwrap(),
+    ];
+    let bytes = WmfMetafile {
+      placeable_header: None,
+      header: WmfHeader {
+        metafile_type: WmfMetafileType::Memory.raw(),
+        header_size_words: 9,
+        version: WmfMetafileVersion::Version300.raw(),
+        file_size_words: 0,
+        number_of_objects: 1,
+        max_record_words: 0,
+        number_of_parameters: 0,
+      },
+      records,
+      trailing_data: Vec::new(),
+    }
+    .to_bytes()
+    .unwrap();
+    let external_header = WmfExternalHeader {
+      // 212 mm100 rounds to eight pixels at the sourced 96-DPI reference.
+      width_hundredths_mm: 212,
+      height_hundredths_mm: 212,
+      reference_device_dpi_x: 96,
+      reference_device_dpi_y: 96,
+    };
+    let external = extract_metafile_solid_rects_with_options(
+      &bytes,
+      Some("image/x-wmf"),
+      RenderOptions {
+        wmf_external_header: Some(external_header),
+        ..RenderOptions::default()
+      },
+    );
+    assert_eq!(external.len(), 1);
+    assert!((external[0].x - 2.0 / 8.0).abs() < f32::EPSILON);
+    assert!((external[0].y - 3.0 / 8.0).abs() < f32::EPSILON);
+    assert!((external[0].width - 4.0 / 8.0).abs() < f32::EPSILON);
+    assert!((external[0].height - 2.0 / 8.0).abs() < f32::EPSILON);
+
+    let decoded = decode_metafile_as_raster_with_options(
+      &bytes,
+      Some("image/x-wmf"),
+      RenderOptions {
+        wmf_external_header: Some(external_header),
+        ..RenderOptions::default()
+      },
+    )
+    .unwrap()
+    .unwrap();
+    let image = image::load_from_memory_with_format(&decoded.data, image::ImageFormat::Png)
+      .unwrap()
+      .to_rgb8();
+    assert_eq!(image.dimensions(), (8, 8));
+
+    let windows_probe_header = WmfExternalHeader {
+      width_hundredths_mm: 5_080,
+      height_hundredths_mm: 3_016,
+      reference_device_dpi_x: 140,
+      reference_device_dpi_y: 140,
+    };
+    assert_eq!(
+      wmf_external_canvas_size(
+        &WmfMetafileRef::from_bytes(&bytes).unwrap(),
+        Some(windows_probe_header)
+      ),
+      Some((280, 166))
+    );
+
+    let ignored_zero_header = extract_metafile_solid_rects_with_options(
+      &bytes,
+      Some("image/x-wmf"),
+      RenderOptions {
+        wmf_external_header: Some(WmfExternalHeader {
+          width_hundredths_mm: 0,
+          height_hundredths_mm: 212,
+          reference_device_dpi_x: 96,
+          reference_device_dpi_y: 96,
+        }),
+        ..RenderOptions::default()
+      },
+    );
+    assert_eq!(
+      ignored_zero_header,
+      extract_metafile_solid_rects(&bytes, Some("image/x-wmf"))
+    );
   }
 
   #[test]
@@ -8589,6 +9071,7 @@ mod tests {
         suppress_text: false,
         suppress_solid_pattern_rects: false,
         suppress_bitmap_layers: false,
+        wmf_external_header: None,
       },
     )
     .expect("minimal EMF bounds");
@@ -8753,6 +9236,37 @@ mod tests {
     EmfRecord::new(super::EMR_SET_PIXEL_V, data)
   }
 
+  fn emf_plus_comment_record(records: Vec<EmfPlusRecord>) -> EmfRecord {
+    let stream = EmfPlusStream {
+      records,
+      trailing_data: Vec::new(),
+    }
+    .to_bytes()
+    .unwrap();
+    let mut data = Vec::with_capacity(8 + stream.len());
+    data.extend_from_slice(&(u32::try_from(stream.len()).unwrap() + 4).to_le_bytes());
+    data.extend_from_slice(&EMR_COMMENT_EMFPLUS.to_le_bytes());
+    data.extend_from_slice(&stream);
+    EmfRecord::new(super::EMR_COMMENT, data)
+  }
+
+  fn emf_plus_record(data: EmfPlusRecordData<'_>) -> EmfPlusRecord {
+    EmfPlusRecord::from_data(&data, EmfPlusRecordFlags::empty()).unwrap()
+  }
+
+  fn emf_plus_header_comment(dual: bool) -> EmfRecord {
+    let data = EmfPlusRecordData::Header(EmfPlusHeaderData {
+      graphics_version: EmfPlusGraphicsVersion::from_graphics_version(
+        EmfPlusGraphicsVersionValue::Version1_1,
+      ),
+      emf_plus_flags: 0,
+      logical_dpi_x: 96,
+      logical_dpi_y: 96,
+    });
+    let flags = EmfPlusRecordFlags::from_bits_retain(u16::from(dual));
+    emf_plus_comment_record(vec![EmfPlusRecord::from_data(&data, flags).unwrap()])
+  }
+
   #[test]
   fn polygon_scanlines_are_limited_to_the_visible_vertical_bounds() {
     let points = [(2.0, 10.0), (5.0, 10.0), (5.0, 12.0), (2.0, 12.0)];
@@ -8852,6 +9366,153 @@ mod tests {
     assert_eq!(decoded.content_type, "image/png");
     let image = image::load_from_memory(&decoded.data).unwrap().to_rgb8();
     assert_eq!(image.get_pixel(0, 0).0, [255, 0, 0]);
+  }
+
+  #[test]
+  fn emf_plus_playback_skips_classic_fallback_in_only_and_dual_modes() {
+    for dual in [false, true] {
+      let emf = metafile_with_records(vec![
+        emf_plus_header_comment(dual),
+        set_pixel_record(0, 0, 0x0000_00ff),
+      ]);
+
+      let decoded = decode_metafile_as_raster(&emf, Some("image/x-emf"))
+        .unwrap()
+        .unwrap();
+      let image = image::load_from_memory(&decoded.data).unwrap().to_rgb8();
+      assert_eq!(image.get_pixel(0, 0).0, [255, 255, 255]);
+    }
+  }
+
+  #[test]
+  fn emf_plus_get_dc_borrows_a_fresh_classic_device_context() {
+    let emf = metafile_with_records(vec![
+      emf_plus_header_comment(true),
+      emf_plus_comment_record(vec![
+        emf_plus_record(EmfPlusRecordData::SetWorldTransform(XForm {
+          m11: 1.0,
+          m12: 0.0,
+          m21: 0.0,
+          m22: 1.0,
+          dx: 1.0,
+          dy: 1.0,
+        })),
+        emf_plus_record(EmfPlusRecordData::GetDc),
+      ]),
+      set_pixel_record(0, 0, 0x0000_00ff),
+      emf_plus_comment_record(vec![emf_plus_record(EmfPlusRecordData::ResetClip)]),
+      set_pixel_record(1, 1, 0x00ff_0000),
+    ]);
+
+    let decoded = decode_metafile_as_raster(&emf, Some("image/x-emf"))
+      .unwrap()
+      .unwrap();
+    let image = image::load_from_memory(&decoded.data).unwrap().to_rgb8();
+    assert_eq!(image.get_pixel(0, 0).0, [255, 0, 0]);
+    assert_eq!(image.get_pixel(1, 1).0, [255, 255, 255]);
+  }
+
+  #[test]
+  fn emf_plus_infinite_region_uses_the_playback_surface_not_a_fixed_rectangle() {
+    let region = EmfPlusRegionObject {
+      version: EmfPlusGraphicsVersion::from_graphics_version(
+        EmfPlusGraphicsVersionValue::Version1_1,
+      ),
+      region_node_count: 0,
+      region_nodes: EmfPlusRegionNodeDataType::Infinite
+        .raw()
+        .to_le_bytes()
+        .to_vec(),
+    };
+    let region = emf_plus_region_object(&region).unwrap();
+    assert!(matches!(region, EmfPlusRenderRegion::Infinite));
+
+    let data = metafile_with_records(Vec::new());
+    let mut state = EmfVectorState::new_with_options(&data, RenderOptions::default()).unwrap();
+    state.set_clip_rect_device((0, 0, 1, 1), 0);
+    state.set_clip_region(&region, 0);
+    assert_eq!(state.clip_rect, None);
+    assert_eq!(state.clip_mask, None);
+
+    let red = EmfColor { r: 255, g: 0, b: 0 };
+    state.set_pixel(1, 1, red);
+    assert_eq!(state.pixel(1, 1), Some(red));
+  }
+
+  #[test]
+  fn emf_plus_region_boolean_operations_distinguish_empty_from_infinite() {
+    let data = metafile_with_records(Vec::new());
+    let state = EmfVectorState::new_with_options(&data, RenderOptions::default()).unwrap();
+    let finite = vec![true, false, false, true];
+
+    assert_eq!(
+      state.combine_region_masks(None, Some(finite.clone()), 3),
+      Some(vec![false, true, true, false])
+    );
+    assert_eq!(
+      state.combine_region_masks(None, Some(finite.clone()), 4),
+      Some(vec![false, true, true, false])
+    );
+    assert_eq!(
+      state.combine_region_masks(None, Some(finite), 5),
+      Some(vec![false; 4])
+    );
+  }
+
+  #[test]
+  fn emf_plus_restore_uses_stack_index_instead_of_the_latest_state() {
+    let data = metafile_with_records(Vec::new());
+    let mut state = EmfVectorState::new_with_options(&data, RenderOptions::default()).unwrap();
+    state.save_emf_plus_state(7, false);
+    state.set_clip_rect_device((0, 0, 1, 1), 0);
+    state.save_emf_plus_state(9, false);
+    state.set_clip_rect_device((1, 1, 2, 2), 0);
+
+    state.restore_emf_plus_state(7, false);
+
+    assert_eq!(state.clip_rect, None);
+    assert_eq!(state.clip_mask, None);
+    assert!(state.emf_plus_saved_states.is_empty());
+  }
+
+  #[test]
+  fn emf_plus_rendering_interprets_negative_start_angles_modulo_360() {
+    let data = EmfPlusRecordData::FillPie(EmfPlusFillPieData {
+      brush: EmfPlusBrushRef::Color(crate::EmfPlusArgb {
+        blue: 189,
+        green: 129,
+        red: 79,
+        alpha: 255,
+      }),
+      start_angle: 30.0,
+      sweep_angle: -60.0,
+      rect: crate::EmfPlusRect::Float(crate::RectF {
+        x: 0.0,
+        y: 0.0,
+        width: 100.0,
+        height: 100.0,
+      }),
+    });
+    let mut record = EmfPlusRecord::from_data(&data, EmfPlusRecordFlags::empty()).unwrap();
+    record.data[4..8].copy_from_slice(&(-30.0f32).to_le_bytes());
+
+    assert!(record.parse_data().is_err());
+    assert!(matches!(
+      record.parse_data_relaxed().unwrap(),
+      EmfPlusRecordData::FillPie(EmfPlusFillPieData {
+        start_angle: -30.0,
+        ..
+      })
+    ));
+    let negative = arc_segment_points(0, 0, 100, 100, -30.0, -60.0, true)
+      .into_iter()
+      .map(|point| (point.x, point.y))
+      .collect::<Vec<_>>();
+    let normalized = arc_segment_points(0, 0, 100, 100, 330.0, -60.0, true)
+      .into_iter()
+      .map(|point| (point.x, point.y))
+      .collect::<Vec<_>>();
+    assert_eq!(negative, normalized);
   }
 
   #[test]
