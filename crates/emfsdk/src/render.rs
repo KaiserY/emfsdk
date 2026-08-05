@@ -11,9 +11,10 @@ use skrifa::outline::{
 use skrifa::prelude::{FontRef, LocationRef, MetadataProvider, Size as FontSize};
 use std::collections::HashMap;
 use thiserror::Error;
-use zeno::{
-  Command as ZenoCommand, Format as ZenoMaskFormat, Mask as ZenoMask, Origin as ZenoOrigin,
-  Point as ZenoPoint, Scratch as ZenoScratch, Transform as ZenoTransform, Vector as ZenoVector,
+use tiny_skia::{
+  FillRule as TinySkiaFillRule, Mask as TinySkiaMask, Path as TinySkiaPath,
+  PathBuilder as TinySkiaPathBuilder, PathSegment as TinySkiaPathSegment, Point as TinySkiaPoint,
+  Transform as TinySkiaTransform,
 };
 
 use crate::bitmap::{
@@ -285,7 +286,8 @@ pub fn decode_metafile_as_raster_with_options(
     return decode_transparent_metafile_as_raster(data, content_type, options).map_err(Into::into);
   }
 
-  decode_opaque_metafile_as_raster(data, content_type, options, false).map_err(Into::into)
+  decode_opaque_metafile_as_raster(data, content_type, options, false, GdiTextSurface::Color)
+    .map_err(Into::into)
 }
 
 /// Returns the physical playback frame recorded by an EMF header.
@@ -308,12 +310,13 @@ fn decode_opaque_metafile_as_raster(
   _content_type: Option<&str>,
   options: RenderOptions,
   force_vector_replay: bool,
+  text_surface: GdiTextSurface,
 ) -> Result<Option<DecodedMetafile>, String> {
-  if let Some(raster) = decode_emf_as_raster(data, options, force_vector_replay)? {
+  if let Some(raster) = decode_emf_as_raster(data, options, force_vector_replay, text_surface)? {
     return Ok(Some(raster));
   }
 
-  if let Some(raster) = decode_wmf_as_raster(data, options)? {
+  if let Some(raster) = decode_wmf_as_raster(data, options, text_surface)? {
     return Ok(Some(raster));
   }
 
@@ -332,21 +335,62 @@ fn decode_transparent_metafile_as_raster(
   white_options.transparent_background = false;
   white_options.background_color = Some([255; 3]);
 
-  let Some(black) = decode_opaque_metafile_as_raster(data, content_type, black_options, true)?
+  let Some(color_black) = decode_opaque_metafile_as_raster(
+    data,
+    content_type,
+    black_options,
+    true,
+    GdiTextSurface::Color,
+  )?
   else {
     return Ok(None);
   };
-  let white = decode_opaque_metafile_as_raster(data, content_type, white_options, true)?
-    .ok_or_else(|| "metafile white-background replay produced no raster".to_string())?;
-  let black = decoded_png_to_rgb(&black)?;
-  let white = decoded_png_to_rgb(&white)?;
-  if black.width != white.width || black.height != white.height {
+  let color_white = decode_opaque_metafile_as_raster(
+    data,
+    content_type,
+    white_options,
+    true,
+    GdiTextSurface::Color,
+  )?
+  .ok_or_else(|| "metafile white-background replay produced no raster".to_string())?;
+  let mask_black = decode_opaque_metafile_as_raster(
+    data,
+    content_type,
+    black_options,
+    true,
+    GdiTextSurface::Monochrome,
+  )?
+  .ok_or_else(|| "metafile monochrome black-background replay produced no raster".to_string())?;
+  let mask_white = decode_opaque_metafile_as_raster(
+    data,
+    content_type,
+    white_options,
+    true,
+    GdiTextSurface::Monochrome,
+  )?
+  .ok_or_else(|| "metafile monochrome white-background replay produced no raster".to_string())?;
+  let color_black = decoded_png_to_rgb(&color_black)?;
+  let color_white = decoded_png_to_rgb(&color_white)?;
+  let mask_black = decoded_png_to_rgb(&mask_black)?;
+  let mask_white = decoded_png_to_rgb(&mask_white)?;
+  if color_black.width != color_white.width
+    || color_black.height != color_white.height
+    || color_black.width != mask_black.width
+    || color_black.height != mask_black.height
+    || color_black.width != mask_white.width
+    || color_black.height != mask_white.height
+  {
     return Err("metafile black/white replays have different dimensions".to_string());
   }
 
-  let rgba = straight_rgba_from_black_white(&black.rgb, &white.rgb)?;
+  let rgba = straight_rgba_from_black_white_with_mask(
+    &color_black.rgb,
+    &color_white.rgb,
+    &mask_black.rgb,
+    &mask_white.rgb,
+  )?;
   Ok(Some(DecodedMetafile {
-    data: rgba_to_png(&rgba, black.width as u32, black.height as u32)?,
+    data: rgba_to_png(&rgba, color_black.width as u32, color_black.height as u32)?,
     content_type: "image/png",
   }))
 }
@@ -642,6 +686,7 @@ struct WmfTextSnapshot {
   current_font_weight: u16,
   current_font_bold: bool,
   current_font_italic: bool,
+  current_font_quality: u8,
   text_alignment: WmfTextAlignmentModeFlags,
 }
 
@@ -652,6 +697,7 @@ struct WmfTextFont {
   char_set: u8,
   weight: u16,
   italic: bool,
+  quality: u8,
 }
 
 struct WmfTextState {
@@ -674,6 +720,7 @@ struct WmfTextState {
   current_font_weight: u16,
   current_font_bold: bool,
   current_font_italic: bool,
+  current_font_quality: u8,
   text_alignment: WmfTextAlignmentModeFlags,
   saved: Vec<WmfTextSnapshot>,
   font_cache: RenderFontCache,
@@ -704,6 +751,7 @@ impl WmfTextState {
       current_font_weight: 400,
       current_font_bold: false,
       current_font_italic: false,
+      current_font_quality: crate::wmf::WmfFontQuality::Default.raw(),
       text_alignment: WmfTextAlignmentModeFlags::empty(),
       saved: Vec::new(),
       font_cache: RenderFontCache::load(),
@@ -718,6 +766,7 @@ impl WmfTextState {
       char_set: crate::wmf::WmfCharacterSet::Ansi.raw(),
       weight: 400,
       italic: false,
+      quality: crate::wmf::WmfFontQuality::Default.raw(),
     });
     if let Some(slot) = self.objects.iter_mut().find(|slot| slot.is_none()) {
       *slot = Some(object);
@@ -736,6 +785,7 @@ impl WmfTextState {
       self.current_font_weight = font.weight;
       self.current_font_bold = font.weight > 400;
       self.current_font_italic = font.italic;
+      self.current_font_quality = font.quality;
     }
   }
 
@@ -757,6 +807,7 @@ impl WmfTextState {
       current_font_weight: self.current_font_weight,
       current_font_bold: self.current_font_bold,
       current_font_italic: self.current_font_italic,
+      current_font_quality: self.current_font_quality,
       text_alignment: self.text_alignment,
     });
   }
@@ -781,6 +832,7 @@ impl WmfTextState {
     self.current_font_weight = snapshot.current_font_weight;
     self.current_font_bold = snapshot.current_font_bold;
     self.current_font_italic = snapshot.current_font_italic;
+    self.current_font_quality = snapshot.current_font_quality;
     self.text_alignment = snapshot.text_alignment;
   }
 
@@ -851,6 +903,7 @@ impl WmfTextState {
       char_set: self.current_font_char_set,
       weight: self.current_font_weight,
       italic: self.current_font_italic,
+      quality: self.current_font_quality,
     };
     // [MS-WMF] §2.1.2.3 defines TA_TOP against the realized font's
     // alignment box. GDI therefore advances by TEXTMETRIC.tmAscent, not by
@@ -1106,8 +1159,7 @@ fn extract_wmf_solid_rects(
   };
   let mut state = WmfSolidRectState::new(&metafile, external_header);
   let mut rects = Vec::new();
-  let mut records = metafile.records().peekable();
-  while let Some(record) = records.next() {
+  for record in metafile.records() {
     let Ok(record) = record.parse_data() else {
       continue;
     };
@@ -1420,6 +1472,7 @@ fn wmf_text_font(value: &crate::wmf::WmfFontObject) -> WmfTextFont {
     char_set,
     weight: value.weight.max(0) as u16,
     italic: value.italic != 0,
+    quality: value.quality,
   }
 }
 
@@ -1540,6 +1593,7 @@ fn decode_emf_as_raster(
   data: &[u8],
   options: RenderOptions,
   force_vector_replay: bool,
+  text_surface: GdiTextSurface,
 ) -> Result<Option<DecodedMetafile>, String> {
   if !is_emf(data) {
     return Ok(None);
@@ -1584,12 +1638,12 @@ fn decode_emf_as_raster(
   }
 
   if needs_vector_replay || force_vector_replay {
-    return decode_vector_emf_as_png(data, options).map(Some);
+    return decode_vector_emf_as_png(data, options, text_surface).map(Some);
   }
 
   let (record_type, record_offset, record_size) = match bitmap_record {
     Some(record) => record,
-    None => return decode_vector_emf_as_png(data, options).map(Some),
+    None => return decode_vector_emf_as_png(data, options, text_surface).map(Some),
   };
   decode_bitmap_record_as_raster(data, record_type, record_offset, record_size).map(Some)
 }
@@ -1733,6 +1787,7 @@ struct EmfFont {
   family: Option<String>,
   weight: u16,
   italic: bool,
+  quality: u8,
 }
 
 #[derive(Clone, Copy)]
@@ -1914,6 +1969,7 @@ impl EmfTextState {
         char_set: 0,
         weight: font.weight,
         italic: font.italic,
+        quality: font.quality,
       })
       .unwrap_or(WmfTextFont {
         height: 12,
@@ -1921,6 +1977,7 @@ impl EmfTextState {
         char_set: 0,
         weight: 400,
         italic: false,
+        quality: crate::wmf::WmfFontQuality::Default.raw(),
       });
     let font_size = self.map_height(current_font.height);
     // [MS-EMF] 2.3.11.25 and 2.3.5 define these as reference coordinates.
@@ -2015,6 +2072,7 @@ struct EmfVectorState {
   emf_plus_objects: Vec<Option<EmfPlusRenderObject>>,
   emf_plus_object_assembler: EmfPlusObjectAssembler,
   font_cache: RenderFontCache,
+  text_surface: GdiTextSurface,
   suppress_text: bool,
   rgb: Vec<u8>,
 }
@@ -2165,6 +2223,7 @@ struct RenderFontFace {
 struct RenderHintingKey {
   font: RenderFontKey,
   pixel_height_bits: u32,
+  format: GdiGlyphFormat,
 }
 
 struct RenderFontCache {
@@ -2172,16 +2231,62 @@ struct RenderFontCache {
   source_cache: SourceCache,
   faces: HashMap<RenderFontKey, Option<RenderFontFace>>,
   hinting_instances: HashMap<RenderHintingKey, HintingInstance>,
-  raster_scratch: ZenoScratch,
+}
+
+/// Destination class used by GDI when selecting a glyph bitmap format.
+///
+/// Wine's DIB driver forces `GGO_BITMAP` for destinations with at most eight
+/// bits per pixel, while a color destination follows the realized LOGFONT
+/// quality and system smoothing mode. A transparent metafile replay therefore
+/// needs a color pass for source color and a separate monochrome pass for its
+/// alpha plane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GdiTextSurface {
+  Color,
+  Monochrome,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum GdiGlyphFormat {
+  Monochrome,
+  Grayscale,
+  Lcd,
+}
+
+impl GdiTextSurface {
+  fn glyph_format(self, quality: u8) -> GdiGlyphFormat {
+    if self == Self::Monochrome {
+      return GdiGlyphFormat::Monochrome;
+    }
+    match crate::wmf::WmfFontQuality::from_raw(quality) {
+      Some(crate::wmf::WmfFontQuality::NonAntialiased) => GdiGlyphFormat::Monochrome,
+      Some(crate::wmf::WmfFontQuality::Antialiased) => GdiGlyphFormat::Grayscale,
+      // Wine only gives NONANTIALIASED_QUALITY and ANTIALIASED_QUALITY
+      // unconditional formats. ClearType explicitly requests LCD and the
+      // remaining quality values use the color device's smoothing default.
+      _ => GdiGlyphFormat::Lcd,
+    }
+  }
 }
 
 #[derive(Clone, Debug)]
-struct RenderedSubpixelGlyph {
+struct RenderedGlyph {
   left: i32,
   top: i32,
   width: usize,
   height: usize,
-  coverage: Vec<[u8; 3]>,
+  mask: RenderedGlyphMask,
+}
+
+#[derive(Clone, Debug)]
+enum RenderedGlyphMask {
+  /// MSB-first one-bit rows padded to a DWORD boundary, matching GGO_BITMAP.
+  Monochrome {
+    stride: usize,
+    bits: Vec<u8>,
+  },
+  Grayscale(Vec<u8>),
+  Lcd(Vec<[u8; 3]>),
 }
 
 struct TextRenderRequest<'a> {
@@ -2192,6 +2297,7 @@ struct TextRenderRequest<'a> {
   height: f32,
   horizontal_scale: f32,
   advances: Option<&'a [f32]>,
+  surface: GdiTextSurface,
 }
 
 impl RenderFontCache {
@@ -2204,7 +2310,6 @@ impl RenderFontCache {
       source_cache: SourceCache::default(),
       faces: HashMap::new(),
       hinting_instances: HashMap::new(),
-      raster_scratch: ZenoScratch::default(),
     }
   }
 
@@ -2272,7 +2377,7 @@ impl RenderFontCache {
     }
   }
 
-  fn render_text(&mut self, request: &TextRenderRequest<'_>) -> Option<Vec<RenderedSubpixelGlyph>> {
+  fn render_text(&mut self, request: &TextRenderRequest<'_>) -> Option<Vec<RenderedGlyph>> {
     let face_data = self.resolve_face(request.font)?.clone();
     let data = face_data.font_data.as_ref();
     let face = FontRef::from_index(data, face_data.face_index).ok()?;
@@ -2281,6 +2386,7 @@ impl RenderFontCache {
     let outlines = face.outline_glyphs();
     let charmap = face.charmap();
     let metrics = face.glyph_metrics(size, location);
+    let format = request.surface.glyph_format(request.font.quality);
     let hinting_key = RenderHintingKey {
       font: RenderFontKey {
         family: request.font.family.clone(),
@@ -2288,29 +2394,40 @@ impl RenderFontCache {
         italic: request.font.italic,
       },
       pixel_height_bits: request.height.max(1.0).to_bits(),
+      format,
     };
     if !self.hinting_instances.contains_key(&hinting_key) {
-      // ExtTextOut's Dx array owns inter-glyph placement. Use the linear-metric
-      // LCD mode from the Swash/Skrifa text pipeline so hinting cannot alter
-      // the externally supplied spacing.
+      // Wine maps GGO_BITMAP to FT_LOAD_TARGET_MONO, GGO_GRAY* to
+      // FT_LOAD_TARGET_NORMAL and horizontal subpixel output to
+      // FT_LOAD_TARGET_LCD. Skrifa exposes the same TrueType interpreter
+      // targets. ExtTextOut's Dx array still owns inter-glyph placement, so
+      // smooth targets preserve linear metrics.
+      let target = match format {
+        GdiGlyphFormat::Monochrome => Target::Mono,
+        GdiGlyphFormat::Grayscale => Target::Smooth {
+          mode: SmoothMode::Normal,
+          symmetric_rendering: false,
+          preserve_linear_metrics: true,
+        },
+        GdiGlyphFormat::Lcd => Target::Smooth {
+          mode: SmoothMode::Lcd,
+          symmetric_rendering: false,
+          preserve_linear_metrics: true,
+        },
+      };
       let hinting = HintingInstance::new(
         &outlines,
         size,
         location,
         HintingOptions {
           engine: Default::default(),
-          target: Target::Smooth {
-            mode: SmoothMode::Lcd,
-            symmetric_rendering: false,
-            preserve_linear_metrics: true,
-          },
+          target,
         },
       )
       .ok()?;
       self.hinting_instances.insert(hinting_key.clone(), hinting);
     }
-    let (hinting_instances, raster_scratch) = (&self.hinting_instances, &mut self.raster_scratch);
-    let hinting = hinting_instances.get(&hinting_key)?;
+    let hinting = self.hinting_instances.get(&hinting_key)?;
     let mut cursor_x = request.x;
     let mut glyphs = Vec::with_capacity(request.text.chars().count());
     for (index, ch) in request.text.chars().enumerate() {
@@ -2327,60 +2444,24 @@ impl RenderFontCache {
       }
       let glyph_id = charmap.map(ch)?;
       let outline = outlines.get(glyph_id)?;
-      let mut commands = Vec::new();
-      let mut collector = ZenoGlyphPathCollector {
-        commands: &mut commands,
+      let mut path_builder = TinySkiaPathBuilder::new();
+      let mut collector = TinySkiaGlyphPathCollector {
+        builder: &mut path_builder,
       };
       let adjusted_metrics = outline
         .draw(DrawSettings::hinted(hinting, false), &mut collector)
         .ok()?;
-      let mut mask = ZenoMask::with_scratch(&commands, raster_scratch);
-      // Microsoft ClearType consumes a bitmap oversampled by at least six in
-      // the horizontal direction, then applies one-pixel-wide displaced box
-      // filters at the RGB stripe locations. Rasterize that producer input
-      // directly instead of treating three shifted whole-pixel masks as its
-      // final coverage.
-      const CLEARTYPE_X_SCALE: f32 = 6.0;
-      let fractional_offset = ZenoVector::new(
-        cursor_x.fract() * CLEARTYPE_X_SCALE,
-        request.baseline_y.fract(),
-      );
-      mask
-        .format(ZenoMaskFormat::Alpha)
-        .origin(ZenoOrigin::BottomLeft)
-        .offset(fractional_offset)
-        .render_offset(fractional_offset);
-      mask.transform(Some(ZenoTransform::scale(
-        request.horizontal_scale * CLEARTYPE_X_SCALE,
-        1.0,
-      )));
-      // Zeno's BottomLeft placement includes the computed mask height. Match
-      // Swash's render path by materializing that size before render_into;
-      // calling Mask::render directly leaves placement.top without it.
-      let mut data = Vec::new();
-      mask.inspect(|format, width, height| {
-        data.resize(format.buffer_size(width, height), 0);
-      });
-      let placement = mask.render_into(&mut data, None);
-      if data.len() != placement.width as usize * placement.height as usize {
-        return None;
+      if let Some(path) = path_builder.finish()
+        && let Some(glyph) = rasterize_gdi_glyph(
+          path,
+          cursor_x,
+          request.baseline_y,
+          request.horizontal_scale,
+          format,
+        )
+      {
+        glyphs.push(glyph);
       }
-      let high_resolution_left = (cursor_x.floor() as i32)
-        .saturating_mul(CLEARTYPE_X_SCALE as i32)
-        .saturating_add(placement.left);
-      let (left, width, coverage) = cleartype_box_decimate(
-        &data,
-        placement.width as usize,
-        placement.height as usize,
-        high_resolution_left,
-      );
-      glyphs.push(RenderedSubpixelGlyph {
-        left,
-        top: request.baseline_y.floor() as i32 - placement.top,
-        width,
-        height: placement.height as usize,
-        coverage,
-      });
       let advance = adjusted_metrics
         .advance_width
         .or_else(|| metrics.advance_width(glyph_id))
@@ -2392,6 +2473,507 @@ impl RenderFontCache {
         .unwrap_or(advance);
     }
     Some(glyphs)
+  }
+}
+
+/// Rasterizes one hinted outline using the bitmap formats selected by GDI.
+///
+/// Skrifa outlines use a Y-up baseline coordinate system. The device bitmap
+/// is Y-down, so the path is reflected before its pixel bounds are rounded.
+/// Monochrome output uses tiny-skia's integer scan converter and is then
+/// packed exactly like `GGO_BITMAP`: MSB-first and DWORD-aligned per row.
+fn rasterize_gdi_glyph(
+  path: TinySkiaPath,
+  cursor_x: f32,
+  baseline_y: f32,
+  horizontal_scale: f32,
+  format: GdiGlyphFormat,
+) -> Option<RenderedGlyph> {
+  const CLEARTYPE_X_SCALE: i32 = 6;
+  let x_samples = if format == GdiGlyphFormat::Lcd {
+    CLEARTYPE_X_SCALE
+  } else {
+    1
+  };
+  let path = path.transform(TinySkiaTransform::from_row(
+    horizontal_scale * x_samples as f32,
+    0.0,
+    0.0,
+    -1.0,
+    cursor_x.fract() * x_samples as f32,
+    baseline_y.fract(),
+  ))?;
+  let bounds = path.compute_tight_bounds().unwrap_or_else(|| path.bounds());
+  let local_left = bounds.left().floor() as i64;
+  let local_top = bounds.top().floor() as i64;
+  let local_right = bounds.right().ceil() as i64;
+  let local_bottom = bounds.bottom().ceil() as i64;
+  let width = u32::try_from(local_right.checked_sub(local_left)?).ok()?;
+  let height = u32::try_from(local_bottom.checked_sub(local_top)?).ok()?;
+  if width == 0 || height == 0 {
+    return None;
+  }
+  let path = path.transform(TinySkiaTransform::from_translate(
+    -(local_left as f32),
+    -(local_top as f32),
+  ))?;
+  let mut mask = TinySkiaMask::new(width, height)?;
+  mask.fill_path(
+    &path,
+    TinySkiaFillRule::Winding,
+    format != GdiGlyphFormat::Monochrome,
+    TinySkiaTransform::identity(),
+  );
+  let mut data = mask.take();
+  if format == GdiGlyphFormat::Monochrome {
+    apply_gdi_smart_dropout_control(&path, &mut data, width as usize, height as usize);
+  }
+  let top = (baseline_y.floor() as i32).saturating_add(i32::try_from(local_top).ok()?);
+
+  match format {
+    GdiGlyphFormat::Lcd => {
+      let high_resolution_left = (cursor_x.floor() as i32)
+        .saturating_mul(CLEARTYPE_X_SCALE)
+        .saturating_add(i32::try_from(local_left).ok()?);
+      let (left, width, coverage) =
+        cleartype_box_decimate(&data, width as usize, height as usize, high_resolution_left);
+      Some(RenderedGlyph {
+        left,
+        top,
+        width,
+        height: height as usize,
+        mask: RenderedGlyphMask::Lcd(coverage),
+      })
+    }
+    GdiGlyphFormat::Grayscale => Some(RenderedGlyph {
+      left: (cursor_x.floor() as i32).saturating_add(i32::try_from(local_left).ok()?),
+      top,
+      width: width as usize,
+      height: height as usize,
+      mask: RenderedGlyphMask::Grayscale(data),
+    }),
+    GdiGlyphFormat::Monochrome => {
+      let (stride, bits) = pack_gdi_monochrome_mask(&data, width as usize, height as usize)?;
+      Some(RenderedGlyph {
+        left: (cursor_x.floor() as i32).saturating_add(i32::try_from(local_left).ok()?),
+        top,
+        width: width as usize,
+        height: height as usize,
+        mask: RenderedGlyphMask::Monochrome { stride, bits },
+      })
+    }
+  }
+}
+
+/// A line segment used by the local monochrome drop-out scanner.
+///
+/// Skrifa has already grid-fitted the outline.  The remaining operation is
+/// scan conversion, so these coordinates are in final device pixels.
+#[derive(Clone, Copy, Debug)]
+struct GdiDropoutLine {
+  start: GdiDropoutPoint,
+  end: GdiDropoutPoint,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GdiDropoutPoint {
+  x: f32,
+  y: f32,
+}
+
+impl From<TinySkiaPoint> for GdiDropoutPoint {
+  fn from(point: TinySkiaPoint) -> Self {
+    Self {
+      x: point.x,
+      y: point.y,
+    }
+  }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GdiDropoutSpan {
+  start: f32,
+  end: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum GdiDropoutAxis {
+  Horizontal,
+  Vertical,
+}
+
+/// Adds the pixels required by the OpenType smart drop-out rules to a
+/// tiny-skia bilevel mask.
+///
+/// The public Skrifa API returns the hinted outline but not the final
+/// `SCANCTRL`/`SCANTYPE` graphics state.  This deliberately bounded fallback
+/// therefore uses one deterministic mode: smart drop-outs excluding stubs
+/// (OpenType scan-conversion rules 5 and 6).  Like FreeType's monochrome
+/// rasterizer, it scans in both directions and never changes antialiased text.
+fn apply_gdi_smart_dropout_control(
+  path: &TinySkiaPath,
+  coverage: &mut [u8],
+  width: usize,
+  height: usize,
+) {
+  if coverage.len() != width.saturating_mul(height) || width == 0 || height == 0 {
+    return;
+  }
+
+  let lines = flatten_gdi_dropout_path(path);
+  if lines.is_empty() {
+    return;
+  }
+
+  let horizontal_spans = collect_gdi_dropout_spans(&lines, height, GdiDropoutAxis::Horizontal);
+  apply_gdi_dropout_spans(
+    &horizontal_spans,
+    coverage,
+    width,
+    height,
+    GdiDropoutAxis::Horizontal,
+  );
+
+  let vertical_spans = collect_gdi_dropout_spans(&lines, width, GdiDropoutAxis::Vertical);
+  apply_gdi_dropout_spans(
+    &vertical_spans,
+    coverage,
+    width,
+    height,
+    GdiDropoutAxis::Vertical,
+  );
+}
+
+fn flatten_gdi_dropout_path(path: &TinySkiaPath) -> Vec<GdiDropoutLine> {
+  let mut lines = Vec::new();
+  let mut current = None;
+  let mut segments = path.segments();
+  segments.set_auto_close(true);
+
+  for segment in segments {
+    match segment {
+      TinySkiaPathSegment::MoveTo(point) => current = Some(point.into()),
+      TinySkiaPathSegment::LineTo(point) => {
+        let point = GdiDropoutPoint::from(point);
+        if let Some(start) = current {
+          push_gdi_dropout_line(&mut lines, start, point);
+        }
+        current = Some(point);
+      }
+      TinySkiaPathSegment::QuadTo(control, end) => {
+        let control = GdiDropoutPoint::from(control);
+        let end = GdiDropoutPoint::from(end);
+        if let Some(start) = current {
+          flatten_gdi_dropout_quad(start, control, end, 0, &mut lines);
+        }
+        current = Some(end);
+      }
+      TinySkiaPathSegment::CubicTo(control1, control2, end) => {
+        let control1 = GdiDropoutPoint::from(control1);
+        let control2 = GdiDropoutPoint::from(control2);
+        let end = GdiDropoutPoint::from(end);
+        if let Some(start) = current {
+          flatten_gdi_dropout_cubic(start, control1, control2, end, 0, &mut lines);
+        }
+        current = Some(end);
+      }
+      TinySkiaPathSegment::Close => current = None,
+    }
+  }
+
+  lines
+}
+
+fn push_gdi_dropout_line(
+  lines: &mut Vec<GdiDropoutLine>,
+  start: GdiDropoutPoint,
+  end: GdiDropoutPoint,
+) {
+  if start.x != end.x || start.y != end.y {
+    lines.push(GdiDropoutLine { start, end });
+  }
+}
+
+fn midpoint_gdi_dropout_point(first: GdiDropoutPoint, second: GdiDropoutPoint) -> GdiDropoutPoint {
+  GdiDropoutPoint {
+    x: (first.x + second.x) * 0.5,
+    y: (first.y + second.y) * 0.5,
+  }
+}
+
+fn squared_gdi_dropout_distance_to_line(
+  point: GdiDropoutPoint,
+  start: GdiDropoutPoint,
+  end: GdiDropoutPoint,
+) -> f32 {
+  let dx = end.x - start.x;
+  let dy = end.y - start.y;
+  let length_squared = dx * dx + dy * dy;
+  if length_squared == 0.0 {
+    let px = point.x - start.x;
+    let py = point.y - start.y;
+    return px * px + py * py;
+  }
+
+  let cross = dx * (point.y - start.y) - dy * (point.x - start.x);
+  cross * cross / length_squared
+}
+
+fn flatten_gdi_dropout_quad(
+  start: GdiDropoutPoint,
+  control: GdiDropoutPoint,
+  end: GdiDropoutPoint,
+  depth: u8,
+  lines: &mut Vec<GdiDropoutLine>,
+) {
+  // FreeType's normal B/W raster precision is 1/64 pixel.  Matching that
+  // granularity is sufficient for deciding whether a pixel-center gap was
+  // crossed, while the depth guard bounds malformed or extreme curves.
+  const TOLERANCE_SQUARED: f32 = 1.0 / (64.0 * 64.0);
+  const MAX_DEPTH: u8 = 12;
+  if depth == MAX_DEPTH
+    || squared_gdi_dropout_distance_to_line(control, start, end) <= TOLERANCE_SQUARED
+  {
+    push_gdi_dropout_line(lines, start, end);
+    return;
+  }
+
+  let start_control = midpoint_gdi_dropout_point(start, control);
+  let control_end = midpoint_gdi_dropout_point(control, end);
+  let midpoint = midpoint_gdi_dropout_point(start_control, control_end);
+  flatten_gdi_dropout_quad(start, start_control, midpoint, depth + 1, lines);
+  flatten_gdi_dropout_quad(midpoint, control_end, end, depth + 1, lines);
+}
+
+fn flatten_gdi_dropout_cubic(
+  start: GdiDropoutPoint,
+  control1: GdiDropoutPoint,
+  control2: GdiDropoutPoint,
+  end: GdiDropoutPoint,
+  depth: u8,
+  lines: &mut Vec<GdiDropoutLine>,
+) {
+  const TOLERANCE_SQUARED: f32 = 1.0 / (64.0 * 64.0);
+  const MAX_DEPTH: u8 = 12;
+  let flatness = squared_gdi_dropout_distance_to_line(control1, start, end)
+    .max(squared_gdi_dropout_distance_to_line(control2, start, end));
+  if depth == MAX_DEPTH || flatness <= TOLERANCE_SQUARED {
+    push_gdi_dropout_line(lines, start, end);
+    return;
+  }
+
+  let start_control = midpoint_gdi_dropout_point(start, control1);
+  let controls = midpoint_gdi_dropout_point(control1, control2);
+  let control_end = midpoint_gdi_dropout_point(control2, end);
+  let left_control = midpoint_gdi_dropout_point(start_control, controls);
+  let right_control = midpoint_gdi_dropout_point(controls, control_end);
+  let midpoint = midpoint_gdi_dropout_point(left_control, right_control);
+  flatten_gdi_dropout_cubic(
+    start,
+    start_control,
+    left_control,
+    midpoint,
+    depth + 1,
+    lines,
+  );
+  flatten_gdi_dropout_cubic(midpoint, right_control, control_end, end, depth + 1, lines);
+}
+
+fn collect_gdi_dropout_spans(
+  lines: &[GdiDropoutLine],
+  scan_count: usize,
+  axis: GdiDropoutAxis,
+) -> Vec<Vec<GdiDropoutSpan>> {
+  let mut scans = Vec::with_capacity(scan_count);
+  for scan_index in 0..scan_count {
+    let scan_coordinate = scan_index as f32 + 0.5;
+    let mut crossings = Vec::new();
+    for line in lines {
+      let (start_axis, end_axis, start_cross, end_cross) = match axis {
+        GdiDropoutAxis::Horizontal => (line.start.y, line.end.y, line.start.x, line.end.x),
+        GdiDropoutAxis::Vertical => (line.start.x, line.end.x, line.start.y, line.end.y),
+      };
+      let crossing = if start_axis <= scan_coordinate && scan_coordinate < end_axis {
+        Some(1)
+      } else if end_axis <= scan_coordinate && scan_coordinate < start_axis {
+        Some(-1)
+      } else {
+        None
+      };
+      let Some(winding) = crossing else {
+        continue;
+      };
+      let t = (scan_coordinate - start_axis) / (end_axis - start_axis);
+      crossings.push((start_cross + (end_cross - start_cross) * t, winding));
+    }
+    crossings.sort_by(|left, right| left.0.total_cmp(&right.0));
+
+    let mut winding = 0i32;
+    let mut span_start = None;
+    let mut spans = Vec::new();
+    for (coordinate, delta) in crossings {
+      let previous_winding = winding;
+      winding += delta;
+      if previous_winding == 0 && winding != 0 {
+        span_start = Some(coordinate);
+      } else if previous_winding != 0
+        && winding == 0
+        && let Some(start) = span_start.take()
+        && coordinate > start
+      {
+        spans.push(GdiDropoutSpan {
+          start,
+          end: coordinate,
+        });
+      }
+    }
+    scans.push(spans);
+  }
+  scans
+}
+
+fn apply_gdi_dropout_spans(
+  scans: &[Vec<GdiDropoutSpan>],
+  coverage: &mut [u8],
+  width: usize,
+  height: usize,
+  axis: GdiDropoutAxis,
+) {
+  if scans.len() < 3 {
+    return;
+  }
+
+  for scan_index in 1..scans.len() - 1 {
+    for span in &scans[scan_index] {
+      let first_center = (span.start - 0.5).ceil() as i32;
+      let last_center = (span.end - 0.5).floor() as i32;
+      if first_center <= last_center {
+        continue;
+      }
+
+      // Rule 6 excludes a stub unless both contours continue to intersect
+      // scan lines in both directions.  Interval overlap is the local
+      // equivalent for the flattened hinted outline; steep features are
+      // recovered by the perpendicular pass.
+      if !gdi_dropout_span_continues(*span, &scans[scan_index - 1])
+        || !gdi_dropout_span_continues(*span, &scans[scan_index + 1])
+      {
+        continue;
+      }
+
+      let lower = (span.start - 0.5).floor() as i32;
+      let Some(upper) = lower.checked_add(1) else {
+        continue;
+      };
+      let midpoint = (span.start + span.end) * 0.5;
+      // FreeType's SMART macro has a 63/64-pixel pre-division bias.  In
+      // device coordinates this is a 1/128-pixel tie bias toward the left;
+      // reflection into the Y-down bitmap reverses it for vertical scans.
+      const SMART_TIE_BIAS: f32 = 1.0 / 128.0;
+      let preferred = match axis {
+        GdiDropoutAxis::Horizontal => (midpoint - SMART_TIE_BIAS).floor() as i32,
+        GdiDropoutAxis::Vertical => (midpoint + SMART_TIE_BIAS).floor() as i32,
+      }
+      .clamp(lower, upper);
+      let other = if preferred == lower { upper } else { lower };
+
+      let preferred_index = gdi_dropout_mask_index(axis, scan_index, preferred, width, height);
+      let other_index = gdi_dropout_mask_index(axis, scan_index, other, width, height);
+      if let Some(preferred_index) = preferred_index {
+        if other_index.is_some_and(|index| coverage[index] != 0) {
+          continue;
+        }
+        coverage[preferred_index] = u8::MAX;
+      } else if let Some(other_index) = other_index {
+        // FreeType keeps the drop-out inside the glyph bitmap when its
+        // preferred pixel lies just outside the rounded bounding box.
+        coverage[other_index] = u8::MAX;
+      }
+    }
+  }
+}
+
+fn gdi_dropout_span_continues(span: GdiDropoutSpan, adjacent: &[GdiDropoutSpan]) -> bool {
+  adjacent
+    .iter()
+    .any(|candidate| candidate.start < span.end && span.start < candidate.end)
+}
+
+fn gdi_dropout_mask_index(
+  axis: GdiDropoutAxis,
+  scan_index: usize,
+  pixel: i32,
+  width: usize,
+  height: usize,
+) -> Option<usize> {
+  let pixel = usize::try_from(pixel).ok()?;
+  match axis {
+    GdiDropoutAxis::Horizontal if scan_index < height && pixel < width => {
+      scan_index.checked_mul(width)?.checked_add(pixel)
+    }
+    GdiDropoutAxis::Vertical if scan_index < width && pixel < height => {
+      pixel.checked_mul(width)?.checked_add(scan_index)
+    }
+    _ => None,
+  }
+}
+
+fn pack_gdi_monochrome_mask(
+  coverage: &[u8],
+  width: usize,
+  height: usize,
+) -> Option<(usize, Vec<u8>)> {
+  if coverage.len() != width.checked_mul(height)? {
+    return None;
+  }
+  let stride = width.checked_add(31)?.checked_div(32)?.checked_mul(4)?;
+  let mut bits = vec![0; stride.checked_mul(height)?];
+  for y in 0..height {
+    for x in 0..width {
+      if coverage[y * width + x] != 0 {
+        bits[y * stride + x / 8] |= 0x80 >> (x % 8);
+      }
+    }
+  }
+  Some((stride, bits))
+}
+
+fn gdi_subpixel_blend(destination: u8, text: u8, alpha: u8) -> u8 {
+  ((u32::from(text) * u32::from(alpha) + u32::from(destination) * u32::from(u8::MAX - alpha) + 127)
+    / 255) as u8
+}
+
+/// Seventeen-level grayscale intensity ramp used by the Wine DIB GDI driver.
+///
+/// `GGO_GRAY4_BITMAP` exposes coverage levels 0..=16. Windows' grayscale text
+/// blend is not the same operation as ordinary source alpha; the ramp and the
+/// destination-relative interpolation below are Wine's source-backed model of
+/// native GDI output.
+fn gdi_grayscale_blend(destination: EmfColor, text: EmfColor, level: usize) -> EmfColor {
+  const RAMP: [u8; 17] = [
+    0x00, 0x4D, 0x68, 0x7C, 0x8C, 0x9A, 0xA7, 0xB2, 0xBD, 0xC7, 0xD0, 0xD9, 0xE1, 0xE9, 0xF0, 0xF8,
+    0xFF,
+  ];
+  let blend = |destination: u8, text: u8| {
+    let minimum = u16::from(RAMP[level]) * u16::from(text) / 255;
+    let reverse = u16::from(RAMP[16 - level]);
+    let maximum = reverse + (255 - reverse) * u16::from(text) / 255;
+    if destination == text {
+      destination
+    } else if destination > text {
+      let difference = u32::from(destination - text);
+      let range = u32::from(maximum as u8 - text);
+      text + ((difference * range) / u32::from(255 - text)) as u8
+    } else {
+      let difference = u32::from(text - destination);
+      let range = u32::from(text - minimum as u8);
+      text - ((difference * range) / u32::from(text)) as u8
+    }
+  };
+  EmfColor {
+    r: blend(destination.r, text.r),
+    g: blend(destination.g, text.g),
+    b: blend(destination.b, text.b),
   }
 }
 
@@ -2438,45 +3020,42 @@ fn cleartype_box_decimate(
   (left, width, output)
 }
 
-struct ZenoGlyphPathCollector<'a> {
-  commands: &'a mut Vec<ZenoCommand>,
+struct TinySkiaGlyphPathCollector<'a> {
+  builder: &'a mut TinySkiaPathBuilder,
 }
 
-impl OutlinePen for ZenoGlyphPathCollector<'_> {
+impl OutlinePen for TinySkiaGlyphPathCollector<'_> {
   fn move_to(&mut self, x: f32, y: f32) {
-    self
-      .commands
-      .push(ZenoCommand::MoveTo(ZenoPoint::new(x, y)));
+    self.builder.move_to(x, y);
   }
 
   fn line_to(&mut self, x: f32, y: f32) {
-    self
-      .commands
-      .push(ZenoCommand::LineTo(ZenoPoint::new(x, y)));
+    self.builder.line_to(x, y);
   }
 
   fn quad_to(&mut self, x1: f32, y1: f32, x: f32, y: f32) {
-    self.commands.push(ZenoCommand::QuadTo(
-      ZenoPoint::new(x1, y1),
-      ZenoPoint::new(x, y),
-    ));
+    self.builder.quad_to(x1, y1, x, y);
   }
 
   fn curve_to(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, x: f32, y: f32) {
-    self.commands.push(ZenoCommand::CurveTo(
-      ZenoPoint::new(x1, y1),
-      ZenoPoint::new(x2, y2),
-      ZenoPoint::new(x, y),
-    ));
+    self.builder.cubic_to(x1, y1, x2, y2, x, y);
   }
 
   fn close(&mut self) {
-    self.commands.push(ZenoCommand::Close);
+    self.builder.close();
   }
 }
 
 impl EmfVectorState {
   fn new_with_options(data: &[u8], options: RenderOptions) -> Result<Self, String> {
+    Self::new_with_options_and_text_surface(data, options, GdiTextSurface::Color)
+  }
+
+  fn new_with_options_and_text_surface(
+    data: &[u8],
+    options: RenderOptions,
+    text_surface: GdiTextSurface,
+  ) -> Result<Self, String> {
     let (natural_width, natural_height) = emf_natural_canvas_size(data)?;
     let (width, height) = options.resolved_canvas_size(natural_width, natural_height);
     let output_scale_x = width as f32 / natural_width.max(1) as f32;
@@ -2525,6 +3104,7 @@ impl EmfVectorState {
       emf_plus_objects: Vec::new(),
       emf_plus_object_assembler: EmfPlusObjectAssembler::default(),
       font_cache: RenderFontCache::load(),
+      text_surface,
       suppress_text: options.suppress_text,
       rgb,
     })
@@ -2896,6 +3476,7 @@ impl EmfVectorState {
         char_set: 0,
         weight: 400,
         italic: false,
+        quality: crate::wmf::WmfFontQuality::Default.raw(),
       },
     );
   }
@@ -2944,6 +3525,7 @@ impl EmfVectorState {
         height,
         horizontal_scale: 1.0,
         advances: advances.as_deref(),
+        surface: self.text_surface,
       },
     );
   }
@@ -3033,6 +3615,7 @@ impl EmfVectorState {
         height,
         horizontal_scale,
         advances: advances.as_deref(),
+        surface: self.text_surface,
       },
     );
     if update_current_position && let Some(displacement) = logical_displacement {
@@ -3049,7 +3632,7 @@ impl EmfVectorState {
     }
     if let Some(glyphs) = self.font_cache.render_text(&request) {
       for glyph in &glyphs {
-        self.draw_subpixel_glyph(glyph, color);
+        self.draw_gdi_glyph(glyph, color);
       }
       return;
     }
@@ -3085,17 +3668,50 @@ impl EmfVectorState {
     }
   }
 
-  fn draw_subpixel_glyph(&mut self, glyph: &RenderedSubpixelGlyph, color: EmfColor) {
-    // DEFAULT_QUALITY GDI text uses the system smoothing target. During
-    // metafile playback its covered edge samples are written as destination
-    // colors. Office's GDI+ playback preserves the union of the three
-    // ClearType coverage channels as opaque text-color pixels in the embedded
-    // image, rather than exporting fractional-alpha or white-blended edges.
+  fn draw_gdi_glyph(&mut self, glyph: &RenderedGlyph, color: EmfColor) {
     for y in 0..glyph.height {
       for x in 0..glyph.width {
-        let coverage = glyph.coverage[y * glyph.width + x];
-        if coverage != [0; 3] {
-          self.set_vector_pixel(glyph.left + x as i32, glyph.top + y as i32, color);
+        let device_x = glyph.left + x as i32;
+        let device_y = glyph.top + y as i32;
+        match &glyph.mask {
+          RenderedGlyphMask::Monochrome { stride, bits } => {
+            if bits[y * stride + x / 8] & (0x80 >> (x % 8)) != 0 {
+              self.set_vector_pixel(device_x, device_y, color);
+            }
+          }
+          RenderedGlyphMask::Grayscale(coverage) => {
+            let level = (u16::from(coverage[y * glyph.width + x]) * 16 + 127) / 255;
+            if level <= 1 {
+              continue;
+            }
+            let Some(destination) = self.pixel(device_x, device_y) else {
+              continue;
+            };
+            let blended = if level >= 16 {
+              color
+            } else {
+              gdi_grayscale_blend(destination, color, level as usize)
+            };
+            self.set_vector_pixel(device_x, device_y, blended);
+          }
+          RenderedGlyphMask::Lcd(coverage) => {
+            let coverage = coverage[y * glyph.width + x];
+            if coverage == [0; 3] {
+              continue;
+            }
+            let Some(destination) = self.pixel(device_x, device_y) else {
+              continue;
+            };
+            self.set_vector_pixel(
+              device_x,
+              device_y,
+              EmfColor {
+                r: gdi_subpixel_blend(destination.r, color.r, coverage[0]),
+                g: gdi_subpixel_blend(destination.g, color.g, coverage[1]),
+                b: gdi_subpixel_blend(destination.b, color.b, coverage[2]),
+              },
+            );
+          }
         }
       }
     }
@@ -3733,8 +4349,13 @@ impl EmfVectorState {
 fn decode_vector_emf_as_png(
   data: &[u8],
   options: RenderOptions,
+  text_surface: GdiTextSurface,
 ) -> Result<DecodedMetafile, String> {
-  let mut state = EmfVectorState::new_with_options(data, options)?;
+  let mut state = if text_surface == GdiTextSurface::Color {
+    EmfVectorState::new_with_options(data, options)?
+  } else {
+    EmfVectorState::new_with_options_and_text_surface(data, options, text_surface)?
+  };
   let mut pos = EMF_HEADER_SIZE;
   let mut emf_plus_playback = false;
   let mut emf_device_context = None;
@@ -4471,7 +5092,11 @@ struct WmfRenderState {
 }
 
 impl WmfRenderState {
-  fn new(metafile: &WmfMetafileRef<'_>, options: RenderOptions) -> Result<Self, String> {
+  fn new(
+    metafile: &WmfMetafileRef<'_>,
+    options: RenderOptions,
+    text_surface: GdiTextSurface,
+  ) -> Result<Self, String> {
     let (window_org_x, window_org_y, window_ext_x, window_ext_y) =
       wmf_initial_window(metafile, options.wmf_external_header);
     let natural_width = window_ext_x.unsigned_abs().max(1) as usize;
@@ -4529,6 +5154,7 @@ impl WmfRenderState {
         emf_plus_objects: Vec::new(),
         emf_plus_object_assembler: EmfPlusObjectAssembler::default(),
         font_cache: RenderFontCache::load(),
+        text_surface,
         suppress_text: options.suppress_text,
         rgb,
       },
@@ -4548,6 +5174,7 @@ impl WmfRenderState {
         char_set: 0,
         weight: 400,
         italic: false,
+        quality: crate::wmf::WmfFontQuality::Default.raw(),
       },
       text_alignment: WmfTextAlignmentModeFlags::empty(),
       saved: Vec::new(),
@@ -4761,13 +5388,14 @@ impl WmfRenderState {
 fn decode_wmf_as_raster(
   data: &[u8],
   options: RenderOptions,
+  text_surface: GdiTextSurface,
 ) -> Result<Option<DecodedMetafile>, String> {
   if !crate::wmf::looks_like_wmf(data) {
     return Ok(None);
   }
 
   let metafile = WmfMetafileRef::from_bytes(data).map_err(|err| err.to_string())?;
-  let mut state = WmfRenderState::new(&metafile, options)?;
+  let mut state = WmfRenderState::new(&metafile, options, text_surface)?;
 
   let mut records = metafile.records().peekable();
   while let Some(record) = records.next() {
@@ -5222,7 +5850,12 @@ fn decode_wmf_as_raster(
           enhanced_metafile_data,
           ..
         }) = value.typed_data()
-          && let Some(raster) = decode_emf_as_raster(enhanced_metafile_data, options, false)?
+          && let Some(raster) = decode_emf_as_raster(
+            enhanced_metafile_data,
+            options,
+            false,
+            state.canvas.text_surface,
+          )?
           && let Some(image) = decoded_raster_to_rgb(&raster)?
         {
           state.canvas.draw_rgb_image(
@@ -6602,6 +7235,7 @@ fn emf_current_font(state: &EmfVectorState) -> WmfTextFont {
       char_set: 0,
       weight: font.weight,
       italic: font.italic,
+      quality: font.quality,
     })
     .unwrap_or(WmfTextFont {
       height: 12,
@@ -6609,6 +7243,7 @@ fn emf_current_font(state: &EmfVectorState) -> WmfTextFont {
       char_set: 0,
       weight: 400,
       italic: false,
+      quality: crate::wmf::WmfFontQuality::Default.raw(),
     })
 }
 
@@ -6716,6 +7351,37 @@ fn straight_rgba_from_black_white(black: &[u8], white: &[u8]) -> Result<Vec<u8>,
       rgba.push(straight.min(u32::from(u8::MAX)) as u8);
     }
     rgba.push(alpha);
+  }
+  Ok(rgba)
+}
+
+fn straight_rgba_from_black_white_with_mask(
+  color_black: &[u8],
+  color_white: &[u8],
+  mask_black: &[u8],
+  mask_white: &[u8],
+) -> Result<Vec<u8>, String> {
+  if color_black.len() != mask_black.len() || color_white.len() != mask_white.len() {
+    return Err("metafile color and monochrome replay buffers have incompatible lengths".into());
+  }
+  let color = straight_rgba_from_black_white(color_black, color_white)?;
+  let mask = straight_rgba_from_black_white(mask_black, mask_white)?;
+  let mut rgba = Vec::with_capacity(color.len());
+  for (color, mask) in color
+    .chunks_exact(BGRA_BYTES_PER_PIXEL)
+    .zip(mask.chunks_exact(BGRA_BYTES_PER_PIXEL))
+  {
+    let alpha = mask[3];
+    if alpha == 0 {
+      rgba.extend_from_slice(&[0, 0, 0, 0]);
+    } else if color[3] != 0 {
+      rgba.extend_from_slice(&[color[0], color[1], color[2], alpha]);
+    } else {
+      // A strongly hinted monochrome outline can cover a pixel that the
+      // smooth color pass misses. Use the monochrome pass's source color for
+      // that pixel instead of inventing color from a transparent sample.
+      rgba.extend_from_slice(&[mask[0], mask[1], mask[2], alpha]);
+    }
   }
   Ok(rgba)
 }
@@ -7842,6 +8508,7 @@ fn read_logfont_object(
   const LOGFONT_HEIGHT_OFFSET: usize = LOGFONT_OFFSET;
   const LOGFONT_WEIGHT_OFFSET: usize = LOGFONT_OFFSET + 16;
   const LOGFONT_ITALIC_OFFSET: usize = LOGFONT_OFFSET + 20;
+  const LOGFONT_QUALITY_OFFSET: usize = LOGFONT_OFFSET + 26;
   const LOGFONT_FACE_NAME_OFFSET: usize = LOGFONT_OFFSET + 28;
   let face_end = LOGFONT_FACE_NAME_OFFSET.checked_add(LOGFONT_FACE_NAME_CHARS * 2)?;
   if record_size < face_end {
@@ -7853,6 +8520,7 @@ fn read_logfont_object(
     .ok()?
     .clamp(0, 1000) as u16;
   let italic = *data.get(record_offset + LOGFONT_ITALIC_OFFSET)? != 0;
+  let quality = *data.get(record_offset + LOGFONT_QUALITY_OFFSET)?;
   let face_bytes = data.get(
     record_offset + LOGFONT_FACE_NAME_OFFSET
       ..record_offset + LOGFONT_FACE_NAME_OFFSET + LOGFONT_FACE_NAME_CHARS * 2,
@@ -7871,6 +8539,7 @@ fn read_logfont_object(
       family: (!family.is_empty()).then_some(family),
       weight,
       italic,
+      quality,
     },
   ))
 }
@@ -8173,6 +8842,7 @@ mod tests {
     record[12..16].copy_from_slice(&(-11i32).to_le_bytes());
     record[28..32].copy_from_slice(&700i32.to_le_bytes());
     record[32] = 1;
+    record[38] = crate::wmf::WmfFontQuality::ClearType.raw();
     for (index, unit) in "Segoe UI".encode_utf16().enumerate() {
       let offset = 40 + index * 2;
       record[offset..offset + 2].copy_from_slice(&unit.to_le_bytes());
@@ -8184,6 +8854,7 @@ mod tests {
     assert_eq!(font.family.as_deref(), Some("Segoe UI"));
     assert_eq!(font.weight, 700);
     assert!(font.italic);
+    assert_eq!(font.quality, crate::wmf::WmfFontQuality::ClearType.raw());
   }
 
   #[test]
@@ -9684,6 +10355,127 @@ mod tests {
       [[0, 0, 85], [170, 255, 170], [85, 0, 0]],
       "the one-pixel box is centered independently on the R, G, and B stripes"
     );
+  }
+
+  #[test]
+  fn gdi_text_surface_and_logfont_quality_select_the_bitmap_format() {
+    assert_eq!(
+      GdiTextSurface::Color.glyph_format(crate::wmf::WmfFontQuality::NonAntialiased.raw()),
+      GdiGlyphFormat::Monochrome
+    );
+    assert_eq!(
+      GdiTextSurface::Color.glyph_format(crate::wmf::WmfFontQuality::Antialiased.raw()),
+      GdiGlyphFormat::Grayscale
+    );
+    assert_eq!(
+      GdiTextSurface::Color.glyph_format(crate::wmf::WmfFontQuality::ClearType.raw()),
+      GdiGlyphFormat::Lcd
+    );
+    assert_eq!(
+      GdiTextSurface::Monochrome.glyph_format(crate::wmf::WmfFontQuality::ClearType.raw()),
+      GdiGlyphFormat::Monochrome,
+      "an indexed destination overrides LOGFONT smoothing quality"
+    );
+  }
+
+  fn rectangular_dropout_test_path(left: f32, top: f32, right: f32, bottom: f32) -> TinySkiaPath {
+    let mut builder = TinySkiaPathBuilder::new();
+    builder.move_to(left, top);
+    builder.line_to(right, top);
+    builder.line_to(right, bottom);
+    builder.line_to(left, bottom);
+    builder.close();
+    builder.finish().unwrap()
+  }
+
+  fn rasterize_dropout_test_path(path: &TinySkiaPath, width: usize, height: usize) -> Vec<u8> {
+    let mut mask = TinySkiaMask::new(width as u32, height as u32).unwrap();
+    mask.fill_path(
+      path,
+      TinySkiaFillRule::Winding,
+      false,
+      TinySkiaTransform::identity(),
+    );
+    let mut coverage = mask.take();
+    apply_gdi_smart_dropout_control(path, &mut coverage, width, height);
+    coverage
+  }
+
+  #[test]
+  fn smart_dropout_recovers_a_vertical_stem_in_both_directions() {
+    let path = rectangular_dropout_test_path(0.75, 0.0, 1.25, 4.0);
+
+    assert_eq!(
+      rasterize_dropout_test_path(&path, 2, 4),
+      [0, 0, u8::MAX, 0, u8::MAX, 0, 0, 0],
+      "rule 6 excludes the two terminal stubs but preserves the continuing stem"
+    );
+  }
+
+  #[test]
+  fn smart_dropout_second_pass_recovers_a_horizontal_stem() {
+    let path = rectangular_dropout_test_path(0.0, 0.75, 4.0, 1.25);
+
+    assert_eq!(
+      rasterize_dropout_test_path(&path, 4, 2),
+      [0, 0, 0, 0, 0, u8::MAX, u8::MAX, 0],
+      "the perpendicular scan is required for horizontal drop-outs"
+    );
+  }
+
+  #[test]
+  fn smart_dropout_excludes_an_isolated_stub() {
+    let path = rectangular_dropout_test_path(0.75, 1.0, 1.25, 2.0);
+
+    assert_eq!(rasterize_dropout_test_path(&path, 2, 3), [0; 6]);
+  }
+
+  #[test]
+  fn smart_dropout_does_not_duplicate_an_already_set_neighbor() {
+    let path = rectangular_dropout_test_path(0.75, 0.0, 1.25, 4.0);
+    let mut coverage = vec![0; 8];
+    coverage[3] = u8::MAX;
+    coverage[5] = u8::MAX;
+
+    apply_gdi_smart_dropout_control(&path, &mut coverage, 2, 4);
+
+    assert_eq!(coverage, [0, 0, 0, u8::MAX, 0, u8::MAX, 0, 0]);
+  }
+
+  #[test]
+  fn ggo_bitmap_rows_are_msb_first_and_dword_aligned() {
+    let (stride, bits) = pack_gdi_monochrome_mask(
+      &[
+        255, 0, 0, 0, 0, 0, 0, 0, 255, // row 0: bits 0 and 8
+        0, 255, 0, 0, 0, 0, 0, 255, 0, // row 1: bits 1 and 7
+      ],
+      9,
+      2,
+    )
+    .unwrap();
+
+    assert_eq!(stride, 4);
+    assert_eq!(bits, [0x80, 0x80, 0, 0, 0x41, 0, 0, 0]);
+  }
+
+  #[test]
+  fn transparent_color_replay_uses_the_monochrome_text_alpha() {
+    let rgba = straight_rgba_from_black_white_with_mask(
+      &[0, 0, 0],
+      &[127, 127, 127],
+      &[0, 0, 0],
+      &[0, 0, 0],
+    )
+    .unwrap();
+
+    assert_eq!(rgba, [0, 0, 0, 255]);
+  }
+
+  #[test]
+  fn gdi_subpixel_blend_matches_the_dib_driver_integer_formula() {
+    assert_eq!(gdi_subpixel_blend(255, 0, 128), 127);
+    assert_eq!(gdi_subpixel_blend(17, 201, 0), 17);
+    assert_eq!(gdi_subpixel_blend(17, 201, 255), 201);
   }
 
   #[test]

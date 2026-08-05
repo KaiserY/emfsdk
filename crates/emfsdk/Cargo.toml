@@ -19,9 +19,9 @@ encoding_rs = { workspace = true }
 fontique = { workspace = true, optional = true }
 image = { workspace = true, optional = true }
 skrifa = { workspace = true, optional = true }
-zeno = { workspace = true, optional = true }
+tiny-skia = { workspace = true, optional = true }
 thiserror = { workspace = true }
 
 [features]
 default = []
-render = ["dep:fontique", "dep:image", "dep:skrifa", "dep:zeno"]
+render = ["dep:fontique", "dep:image", "dep:skrifa", "dep:tiny-skia"]
