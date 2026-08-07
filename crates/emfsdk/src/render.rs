@@ -338,6 +338,7 @@ fn decode_transparent_metafile_as_raster(
   content_type: Option<&str>,
   options: RenderOptions,
 ) -> Result<Option<DecodedMetafile>, String> {
+  let uses_binary_coverage_surface = emf_uses_binary_coverage_surface(data)?;
   let mut black_options = options;
   black_options.transparent_background = false;
   black_options.background_color = Some([0; 3]);
@@ -393,12 +394,21 @@ fn decode_transparent_metafile_as_raster(
     return Err("metafile black/white replays have different dimensions".to_string());
   }
 
-  let rgba = straight_rgba_from_black_white_with_mask(
-    &color_black.rgb,
-    &color_white.rgb,
-    &mask_black.rgb,
-    &mask_white.rgb,
-  )?;
+  let rgba = if uses_binary_coverage_surface {
+    straight_rgba_with_binary_coverage(
+      &color_black.rgb,
+      &color_white.rgb,
+      &mask_black.rgb,
+      &mask_white.rgb,
+    )?
+  } else {
+    straight_rgba_from_black_white_with_mask(
+      &color_black.rgb,
+      &color_white.rgb,
+      &mask_black.rgb,
+      &mask_white.rgb,
+    )?
+  };
   Ok(Some(DecodedMetafile {
     data: rgba_to_png(&rgba, color_black.width as u32, color_black.height as u32)?,
     content_type: "image/png",
@@ -2443,21 +2453,14 @@ impl RenderFontCache {
     if !self.hinting_instances.contains_key(&hinting_key) {
       // Wine maps GGO_BITMAP to FT_LOAD_TARGET_MONO, GGO_GRAY* to
       // FT_LOAD_TARGET_NORMAL and horizontal subpixel output to
-      // FT_LOAD_TARGET_LCD. Skrifa exposes the same TrueType interpreter
-      // targets. ExtTextOut's Dx array still owns inter-glyph placement, so
-      // smooth targets preserve linear metrics.
+      // FT_LOAD_TARGET_LCD. Skrifa exposes those targets directly. Keep their
+      // native interpreter settings: ExtTextOut's Dx array is applied to the
+      // resulting glyph origins and does not require disabling horizontal
+      // grid fitting inside each glyph.
       let target = match format {
         GdiGlyphFormat::Monochrome => Target::Mono,
-        GdiGlyphFormat::Grayscale => Target::Smooth {
-          mode: SmoothMode::Normal,
-          symmetric_rendering: false,
-          preserve_linear_metrics: true,
-        },
-        GdiGlyphFormat::Lcd => Target::Smooth {
-          mode: SmoothMode::Lcd,
-          symmetric_rendering: false,
-          preserve_linear_metrics: true,
-        },
+        GdiGlyphFormat::Grayscale => SmoothMode::Normal.into(),
+        GdiGlyphFormat::Lcd => SmoothMode::Lcd.into(),
       };
       let hinting = HintingInstance::new(
         &outlines,
@@ -3642,24 +3645,45 @@ impl EmfVectorState {
 
   fn mapped_vertical_length(&self, logical_height: i32) -> f32 {
     let height = logical_height.unsigned_abs().max(1) as f32;
-    let scale_x = self.viewport_ext_x as f32 / nonzero_mapping_extent(self.window_ext_x) as f32
-      * self.output_scale_x;
-    let scale_y = self.viewport_ext_y as f32 / nonzero_mapping_extent(self.window_ext_y) as f32
-      * self.output_scale_y;
-    let x = height * self.world_transform.m21 * scale_x;
-    let y = height * self.world_transform.m22 * scale_y;
+    let (x, y) = self.map_vector(0.0, height);
     x.hypot(y).max(1.0)
   }
 
-  fn mapped_horizontal_distance(&self, logical_width: i64) -> f32 {
-    let width = logical_width as f32;
+  fn mapped_horizontal_length(&self, logical_width: i32) -> f32 {
+    let width = logical_width.unsigned_abs().max(1) as f32;
+    let (x, y) = self.map_vector(width, 0.0);
+    x.hypot(y).max(f32::EPSILON)
+  }
+
+  fn map_vector(&self, x: f32, y: f32) -> (f32, f32) {
+    let mapped_x = x * self.world_transform.m11 + y * self.world_transform.m21;
+    let mapped_y = x * self.world_transform.m12 + y * self.world_transform.m22;
+    let (page_scale_x, page_scale_y) = self.emf_plus_page_device_scale();
     let scale_x = self.viewport_ext_x as f32 / nonzero_mapping_extent(self.window_ext_x) as f32
+      * page_scale_x
+      * self.playback_scale_x
       * self.output_scale_x;
     let scale_y = self.viewport_ext_y as f32 / nonzero_mapping_extent(self.window_ext_y) as f32
+      * page_scale_y
+      * self.playback_scale_y
       * self.output_scale_y;
-    let x = (width * self.world_transform.m11 * scale_x).round();
-    let y = (width * self.world_transform.m12 * scale_y).round();
-    x.hypot(y).copysign(width)
+    (mapped_x * scale_x, mapped_y * scale_y)
+  }
+
+  fn mapped_horizontal_distance(&self, logical_width: i64) -> f32 {
+    let width = i32::try_from(logical_width).unwrap_or(if logical_width < 0 {
+      i32::MIN
+    } else {
+      i32::MAX
+    });
+    // ExtTextOut maps the cumulative logical origin and the zero origin to
+    // device coordinates separately, rounds both, and then subtracts them.
+    // Keeping that phase also retains the outer playback viewport.
+    let origin = self.map_point(EmfPoint { x: 0, y: 0 });
+    let endpoint = self.map_point(EmfPoint { x: width, y: 0 });
+    let x = endpoint.0.round() - origin.0.round();
+    let y = endpoint.1.round() - origin.1.round();
+    x.hypot(y).copysign(width as f32)
   }
 
   fn draw_text(&mut self, x: i32, y: i32, text: &str, color: EmfColor, height: i32) {
@@ -3789,17 +3813,21 @@ impl EmfVectorState {
         self.mapped_horizontal_distance(logical_cumulative)
       })
     });
-    // [MS-EMF] 2.3.5.8 defines exScale/eyScale for GM_COMPATIBLE
-    // text. LibreOffice's EMF reader applies their absolute ratio to the
-    // realized font width while mapping the supplied Dx positions separately.
-    // A controlled Windows GDI+ replay with exScale changed to equal eyScale
-    // also widens the glyphs without changing their supplied origins.
+    // [MS-EMF] 2.3.5.8 defines exScale/eyScale as page-space to physical
+    // (.01mm) scales for GM_COMPATIBLE text. Convert equal physical X/Y font
+    // dimensions through the player's full output mapping; supplied Dx
+    // positions remain independent page-space origins. This matters when an
+    // OLE preview is played into a host viewport with a different aspect
+    // ratio from its recorded device.
     let horizontal_scale = if text_record.graphics_mode == 1
       && text_record.x_scale.is_finite()
       && text_record.y_scale.is_finite()
       && text_record.x_scale != 0.0
+      && text_record.y_scale != 0.0
     {
-      (text_record.y_scale / text_record.x_scale).abs()
+      let output_axis_ratio =
+        self.mapped_horizontal_length(font_height) / self.mapped_vertical_length(font_height);
+      output_axis_ratio * (text_record.y_scale / text_record.x_scale).abs()
     } else {
       1.0
     };
@@ -5165,13 +5193,27 @@ fn cropped_emf_bitmap(
   ))
 }
 
-fn replay_masked_blt_pair(
+#[derive(Clone, Copy, Debug)]
+struct EmfMaskedBltPair {
+  mask_target: EmfBitmapDrawTarget,
+  source_offset: usize,
+  source_type: u32,
+  source_record_size: usize,
+  source_target: EmfBitmapDrawTarget,
+}
+
+struct DecodedEmfMaskedBltPair {
+  records: EmfMaskedBltPair,
+  mask: RasterPixels,
+  source: RasterPixels,
+}
+
+fn emf_masked_blt_pair(
   data: &[u8],
   record_offset: usize,
   record_type: u32,
   record_size: usize,
-  state: &mut EmfVectorState,
-) -> Result<Option<usize>, String> {
+) -> Result<Option<EmfMaskedBltPair>, String> {
   if !matches!(record_type, EMR_BIT_BLT | EMR_STRETCH_BLT) {
     return Ok(None);
   }
@@ -5188,7 +5230,10 @@ fn replay_masked_blt_pair(
     return Ok(None);
   }
   let source_type = read_u32(data, source_offset)?;
-  if !matches!(source_type, EMR_BIT_BLT | EMR_STRETCH_BLT) {
+  if !matches!(
+    source_type,
+    EMR_BIT_BLT | EMR_STRETCH_BLT | EMR_STRETCH_DIBITS
+  ) {
     return Ok(None);
   }
   let source_record_size = read_u32(data, source_offset + 4)? as usize;
@@ -5206,7 +5251,31 @@ fn replay_masked_blt_pair(
   {
     return Ok(None);
   }
-  let Some(mask) = cropped_emf_bitmap(data, record_offset, record_type, record_size, mask_target)?
+  Ok(Some(EmfMaskedBltPair {
+    mask_target,
+    source_offset,
+    source_type,
+    source_record_size,
+    source_target,
+  }))
+}
+
+fn decode_emf_masked_blt_pair(
+  data: &[u8],
+  record_offset: usize,
+  record_type: u32,
+  record_size: usize,
+) -> Result<Option<DecodedEmfMaskedBltPair>, String> {
+  let Some(records) = emf_masked_blt_pair(data, record_offset, record_type, record_size)? else {
+    return Ok(None);
+  };
+  let Some(mask) = cropped_emf_bitmap(
+    data,
+    record_offset,
+    record_type,
+    record_size,
+    records.mask_target,
+  )?
   else {
     return Ok(None);
   };
@@ -5215,10 +5284,10 @@ fn replay_masked_blt_pair(
   }
   let Some(source) = cropped_emf_bitmap(
     data,
-    source_offset,
-    source_type,
-    source_record_size,
-    source_target,
+    records.source_offset,
+    records.source_type,
+    records.source_record_size,
+    records.source_target,
   )?
   else {
     return Ok(None);
@@ -5226,16 +5295,57 @@ fn replay_masked_blt_pair(
   if mask.width != source.width || mask.height != source.height {
     return Ok(None);
   }
+  Ok(Some(DecodedEmfMaskedBltPair {
+    records,
+    mask,
+    source,
+  }))
+}
+
+fn emf_uses_binary_coverage_surface(data: &[u8]) -> Result<bool, String> {
+  let Some(mut record_offset) = emf_header_record_size(data) else {
+    return Ok(false);
+  };
+  while record_offset + EMF_RECORD_HEADER_SIZE <= data.len() {
+    let record_type = read_u32(data, record_offset)?;
+    let record_size = read_u32(data, record_offset + 4)? as usize;
+    if record_size < EMF_RECORD_HEADER_SIZE || record_offset + record_size > data.len() {
+      return Err(format!(
+        "invalid EMF record at offset {record_offset}: type=0x{record_type:08x} size={record_size}"
+      ));
+    }
+    if decode_emf_masked_blt_pair(data, record_offset, record_type, record_size)?.is_some() {
+      return Ok(true);
+    }
+    record_offset += record_size;
+    if record_type == EMR_EOF {
+      break;
+    }
+  }
+  Ok(false)
+}
+
+fn replay_masked_blt_pair(
+  data: &[u8],
+  record_offset: usize,
+  record_type: u32,
+  record_size: usize,
+  state: &mut EmfVectorState,
+) -> Result<Option<usize>, String> {
+  let Some(pair) = decode_emf_masked_blt_pair(data, record_offset, record_type, record_size)?
+  else {
+    return Ok(None);
+  };
 
   state.draw_masked_rgb_image(
-    mask_target.dest_x,
-    mask_target.dest_y,
-    mask_target.dest_width,
-    mask_target.dest_height,
-    &source,
-    &mask,
+    pair.records.mask_target.dest_x,
+    pair.records.mask_target.dest_y,
+    pair.records.mask_target.dest_width,
+    pair.records.mask_target.dest_height,
+    &pair.source,
+    &pair.mask,
   );
-  Ok(Some(source_record_size))
+  Ok(Some(pair.records.source_record_size))
 }
 
 #[derive(Clone, Debug)]
@@ -7949,6 +8059,39 @@ fn straight_rgba_from_black_white_with_mask(
       // smooth color pass misses. Use the monochrome pass's source color for
       // that pixel instead of inventing color from a transparent sample.
       rgba.extend_from_slice(&[mask[0], mask[1], mask[2], alpha]);
+    }
+  }
+  Ok(rgba)
+}
+
+fn straight_rgba_with_binary_coverage(
+  color_black: &[u8],
+  color_white: &[u8],
+  mask_black: &[u8],
+  mask_white: &[u8],
+) -> Result<Vec<u8>, String> {
+  if color_black.len() != color_white.len()
+    || color_black.len() != mask_black.len()
+    || color_white.len() != mask_white.len()
+  {
+    return Err("metafile color and monochrome replay buffers have incompatible lengths".into());
+  }
+  let color = straight_rgba_from_black_white(color_black, color_white)?;
+  let mask = straight_rgba_from_black_white(mask_black, mask_white)?;
+  let mut rgba = Vec::with_capacity(color.len());
+  for (color, mask) in color
+    .chunks_exact(BGRA_BYTES_PER_PIXEL)
+    .zip(mask.chunks_exact(BGRA_BYTES_PER_PIXEL))
+  {
+    if color[3] == 0 && mask[3] == 0 {
+      rgba.extend_from_slice(&[0, 0, 0, 0]);
+    } else if color[3] != 0 {
+      // Office keeps black/white-matte color recovery independent from the
+      // one-bit OLE replacement mask: source RGB is straight, while every
+      // covered destination pixel is opaque.
+      rgba.extend_from_slice(&[color[0], color[1], color[2], u8::MAX]);
+    } else {
+      rgba.extend_from_slice(&[mask[0], mask[1], mask[2], u8::MAX]);
     }
   }
   Ok(rgba)
@@ -10739,6 +10882,14 @@ mod tests {
   }
 
   fn stretch_record(bitmap_info: Vec<u8>, bitmap_bits: Vec<u8>) -> EmfRecord {
+    stretch_dibits_record(bitmap_info, bitmap_bits, 0x00CC_0020)
+  }
+
+  fn stretch_dibits_record(
+    bitmap_info: Vec<u8>,
+    bitmap_bits: Vec<u8>,
+    raster_operation: u32,
+  ) -> EmfRecord {
     EmfRecordData::StretchDiBits(EmrStretchDiBits {
       bounds: RectL::default(),
       dest: crate::PointL { x: 0, y: 0 },
@@ -10749,7 +10900,7 @@ mod tests {
         height: 2,
       },
       color_usage: DibColorUsage::RgbColors.raw(),
-      raster_operation: 0x00CC_0020,
+      raster_operation,
       dest_size: SizeL { cx: 2, cy: 2 },
       bitmap: EmrBitmapBuffer {
         undefined_space_before_bitmap_info: Vec::new(),
@@ -11322,6 +11473,47 @@ mod tests {
   }
 
   #[test]
+  fn decode_emf_combines_stretch_blt_mask_with_stretch_dibits_source() {
+    let mut mask_info = bitmap_info(2, 2, 1, BI_RGB);
+    mask_info.extend_from_slice(&[
+      0, 0, 0, 0, // black
+      255, 255, 255, 0, // white
+    ]);
+    let mask_bits = vec![
+      0x40, 0, 0, 0, // bottom row: black, white, padding
+      0x40, 0, 0, 0, // top row: black, white, padding
+    ];
+    let source_bits = vec![
+      255, 0, 0, 0, 0, 0, 0, 0, // bottom row: blue, black
+      255, 0, 0, 0, 0, 0, 0, 0, // top row: blue, black
+    ];
+    let emf = metafile_with_records(vec![
+      stretch_blt_record(mask_info, mask_bits, 0x0088_00C6),
+      stretch_dibits_record(bitmap_info(2, 2, 32, BI_RGB), source_bits, 0x0066_0046),
+    ]);
+    assert!(emf_uses_binary_coverage_surface(&emf).unwrap());
+
+    let decoded = decode_metafile_as_raster_with_options(
+      &emf,
+      Some("image/x-emf"),
+      RenderOptions {
+        target_width_px: Some(4),
+        target_height_px: Some(2),
+        transparent_background: true,
+        ..RenderOptions::default()
+      },
+    )
+    .unwrap()
+    .unwrap();
+    let image = image::load_from_memory(&decoded.data).unwrap().to_rgba8();
+
+    assert_eq!(image.get_pixel(0, 0).0, [0, 0, 255, 255]);
+    assert_eq!(image.get_pixel(1, 0).0, [0, 0, 191, 255]);
+    assert_eq!(image.get_pixel(2, 0).0, [0, 0, 128, 255]);
+    assert_eq!(image.get_pixel(3, 0).0, [0, 0, 64, 255]);
+  }
+
+  #[test]
   fn decode_emf_blt_composes_against_the_caller_background() {
     let mut mask_info = bitmap_info(2, 2, 1, BI_RGB);
     mask_info.extend_from_slice(&[
@@ -11576,6 +11768,26 @@ mod tests {
     .unwrap();
 
     assert_eq!(rgba, [0, 0, 0, 255]);
+  }
+
+  #[test]
+  fn binary_coverage_surface_keeps_straight_rgb_without_soft_edges() {
+    let rgba = straight_rgba_with_binary_coverage(
+      &[0, 0, 0, 0, 0, 0, 255, 255, 255],
+      &[13, 8, 4, 255, 255, 255, 255, 255, 255],
+      &[0, 0, 0, 0, 0, 0, 255, 255, 255],
+      &[255, 255, 255, 255, 255, 255, 255, 255, 255],
+    )
+    .unwrap();
+
+    assert_eq!(
+      rgba,
+      [
+        0, 0, 0, 255, // ClearType edge: straight RGB with binary coverage
+        0, 0, 0, 0, // untouched background
+        255, 255, 255, 255, // an opaque white source pixel
+      ]
+    );
   }
 
   #[test]
