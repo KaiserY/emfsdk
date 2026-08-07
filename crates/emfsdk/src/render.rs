@@ -21,7 +21,7 @@ use crate::bitmap::{
   BitmapCompression, DeviceIndependentBitmap, DibColorTable, DibColorUsage, DibHeader,
 };
 use crate::common::{Reader, SdkEnumValue};
-use crate::emf::EmrPenLineStyle;
+use crate::emf::{EmfRecordData, EmfRecordRef, EmrAlphaBlend, EmrAlphaFormat, EmrPenLineStyle};
 use crate::emfplus::{
   EmfPlusBitmapPayload, EmfPlusBrushData, EmfPlusBrushRef, EmfPlusDrawArcData,
   EmfPlusDrawImageData, EmfPlusDrawImagePointsData, EmfPlusDrawPointsData,
@@ -30,8 +30,9 @@ use crate::emfplus::{
   EmfPlusObjectAssembler, EmfPlusObjectData, EmfPlusObjectRecordData, EmfPlusPathObject,
   EmfPlusPathPointType, EmfPlusPathPointTypeFlags, EmfPlusPathPointTypeValue,
   EmfPlusPathPointTypes, EmfPlusPenObject, EmfPlusPointData, EmfPlusRecord, EmfPlusRecordData,
-  EmfPlusRecordType, EmfPlusRegionNodeDataType, EmfPlusRotateWorldTransformData,
-  EmfPlusScaleWorldTransformData, EmfPlusTranslateWorldTransformData, EmfPlusUnitType,
+  EmfPlusRecordFlags, EmfPlusRecordType, EmfPlusRegionNodeDataType,
+  EmfPlusRotateWorldTransformData, EmfPlusScaleWorldTransformData,
+  EmfPlusTranslateWorldTransformData, EmfPlusUnitType,
 };
 use crate::wmf::{
   WmfBinaryRasterOperation, WmfBrushStyle, WmfEscapeData, WmfExtTextOutOptions, WmfMetafileRef,
@@ -40,6 +41,7 @@ use crate::wmf::{
 
 // record ids. The byte offsets below are record-relative, including the
 // 8-byte EMR header, as specified by [MS-EMF].
+#[cfg(test)]
 const EMF_HEADER_SIZE: usize = 108;
 const EMF_RECORD_HEADER_SIZE: usize = 8;
 const EMF_BOUNDS_LEFT_OFFSET: usize = 8;
@@ -102,6 +104,7 @@ const EMR_POLYLINE_TO16: u32 = 89;
 const EMR_POLYPOLYLINE16: u32 = 90;
 const EMR_POLYPOLYGON16: u32 = 91;
 const EMR_EXT_CREATE_PEN: u32 = 95;
+const EMR_ALPHA_BLEND: u32 = 114;
 const EMR_BITMAP_DEST_X_OFFSET: usize = 24;
 const EMR_BITMAP_DEST_Y_OFFSET: usize = 28;
 const EMR_BITMAP_SOURCE_WIDTH_OFFSET: usize = 40;
@@ -265,6 +268,13 @@ impl From<String> for RenderError {
 }
 
 pub type RenderResult<T> = std::result::Result<T, RenderError>;
+
+mod vector;
+
+pub use vector::{
+  MetafileVectorFill, MetafileVectorFillRule, MetafileVectorPoint, MetafileVectorScene,
+  extract_metafile_vector_scene, extract_metafile_vector_scene_with_options,
+};
 
 pub fn decode_metafile_as_raster(
   data: &[u8],
@@ -458,7 +468,7 @@ pub fn extract_metafile_text_runs_with_options(
   if !looks_like_metafile(data, content_type) {
     return Vec::new();
   }
-  if is_emf(data) && data.len() >= EMF_HEADER_SIZE {
+  if is_emf(data) {
     return extract_emf_text_runs(data);
   }
   if crate::wmf::looks_like_wmf(data) {
@@ -517,13 +527,15 @@ pub fn extract_metafile_bitmap_layers_with_options(
 }
 
 fn extract_emf_text_runs(data: &[u8]) -> Vec<MetafileTextRun> {
+  let Some(mut pos) = emf_header_record_size(data) else {
+    return Vec::new();
+  };
   let mut state = match EmfTextState::new(data) {
     Ok(state) => state,
     Err(_) => return Vec::new(),
   };
   let mut runs = Vec::new();
   let mut requires_raster_backdrop = false;
-  let mut pos = EMF_HEADER_SIZE;
   while pos + EMF_RECORD_HEADER_SIZE <= data.len() {
     let Ok(record_type) = read_u32(data, pos) else {
       break;
@@ -545,14 +557,10 @@ fn extract_emf_text_runs(data: &[u8]) -> Vec<MetafileTextRun> {
         state.window_org_y = read_i32(data, pos + 12).unwrap_or(state.window_org_y);
       }
       EMR_SET_WINDOW_EXT_EX if record_size >= 16 => {
-        state.window_ext_x = read_i32(data, pos + 8)
-          .unwrap_or(state.window_ext_x)
-          .abs()
-          .max(1);
-        state.window_ext_y = read_i32(data, pos + 12)
-          .unwrap_or(state.window_ext_y)
-          .abs()
-          .max(1);
+        state.window_ext_x =
+          nonzero_mapping_extent(read_i32(data, pos + 8).unwrap_or(state.window_ext_x));
+        state.window_ext_y =
+          nonzero_mapping_extent(read_i32(data, pos + 12).unwrap_or(state.window_ext_y));
       }
       EMR_SET_VIEWPORT_ORG_EX if record_size >= 16 => {
         state.viewport_org_x = read_i32(data, pos + 8).unwrap_or(state.viewport_org_x);
@@ -1437,9 +1445,9 @@ fn scale_wmf_extent(extent: i32, numerator: i16, denominator: i16) -> i32 {
 }
 
 fn nonzero_mapping_extent(extent: i32) -> i32 {
-  // [MS-WMF] §§2.3.5.28/30 store viewport and window extents as signed
-  // integers. Their sign participates in VExt/WExt and can reverse an axis;
-  // it is not a canvas-size magnitude.
+  // [MS-EMF] §§2.3.11.28/30 and [MS-WMF] §§2.3.5.28/30 store viewport and
+  // window extents as signed integers. Their sign participates in VExt/WExt
+  // and can reverse an axis; it is not a canvas-size magnitude.
   if extent == 0 { 1 } else { extent }
 }
 
@@ -1595,14 +1603,10 @@ fn decode_emf_as_raster(
   force_vector_replay: bool,
   text_surface: GdiTextSurface,
 ) -> Result<Option<DecodedMetafile>, String> {
-  if !is_emf(data) {
+  let Some(mut pos) = emf_header_record_size(data) else {
     return Ok(None);
-  }
-  if data.len() < EMF_HEADER_SIZE {
-    return Err("EMF header is truncated".into());
-  }
+  };
 
-  let mut pos = EMF_HEADER_SIZE;
   let mut bitmap_record = None;
   let mut bitmap_count = 0usize;
   let mut needs_vector_replay = false;
@@ -1677,6 +1681,7 @@ fn emf_record_needs_vector_replay(record_type: u32) -> bool {
       | EMR_POLYLINE_TO16
       | EMR_POLYPOLYLINE16
       | EMR_POLYPOLYGON16
+      | EMR_ALPHA_BLEND
   )
 }
 
@@ -1773,6 +1778,7 @@ impl EmfTransform {
 #[derive(Clone, Copy, Debug)]
 struct EmfPen {
   color: EmfColor,
+  alpha: u8,
   width: usize,
   transform_width: bool,
 }
@@ -1809,6 +1815,10 @@ struct EmfTextSnapshot {
 struct EmfTextState {
   width: usize,
   height: usize,
+  playback_origin_x: f32,
+  playback_origin_y: f32,
+  playback_scale_x: f32,
+  playback_scale_y: f32,
   window_org_x: i32,
   window_org_y: i32,
   window_ext_x: i32,
@@ -1828,19 +1838,23 @@ struct EmfTextState {
 
 impl EmfTextState {
   fn new(data: &[u8]) -> Result<Self, String> {
-    let (width, height) = emf_natural_canvas_size(data)?;
+    let geometry = emf_playback_geometry(data)?;
 
     Ok(Self {
-      width,
-      height,
+      width: geometry.width,
+      height: geometry.height,
+      playback_origin_x: geometry.origin_x,
+      playback_origin_y: geometry.origin_y,
+      playback_scale_x: geometry.scale_x,
+      playback_scale_y: geometry.scale_y,
       window_org_x: 0,
       window_org_y: 0,
-      window_ext_x: width as i32,
-      window_ext_y: height as i32,
+      window_ext_x: geometry.width as i32,
+      window_ext_y: geometry.height as i32,
       viewport_org_x: 0,
       viewport_org_y: 0,
-      viewport_ext_x: width as i32,
-      viewport_ext_y: height as i32,
+      viewport_ext_x: geometry.width as i32,
+      viewport_ext_y: geometry.height as i32,
       world_transform: EmfTransform::identity(),
       current_pos: EmfPoint { x: 0, y: 0 },
       fonts: std::collections::HashMap::new(),
@@ -1891,8 +1905,12 @@ impl EmfTextState {
     let scale_x = self.viewport_ext_x as f32 / nonzero_mapping_extent(self.window_ext_x) as f32;
     let scale_y = self.viewport_ext_y as f32 / nonzero_mapping_extent(self.window_ext_y) as f32;
     (
-      self.viewport_org_x as f32 + (x - self.window_org_x as f32) * scale_x,
-      self.viewport_org_y as f32 + (y - self.window_org_y as f32) * scale_y,
+      (self.viewport_org_x as f32 + (x - self.window_org_x as f32) * scale_x
+        - self.playback_origin_x)
+        * self.playback_scale_x,
+      (self.viewport_org_y as f32 + (y - self.window_org_y as f32) * scale_y
+        - self.playback_origin_y)
+        * self.playback_scale_y,
     )
   }
 
@@ -1909,8 +1927,8 @@ impl EmfTextState {
     let width = logical_width as f32;
     let scale_x = self.viewport_ext_x as f32 / nonzero_mapping_extent(self.window_ext_x) as f32;
     let scale_y = self.viewport_ext_y as f32 / nonzero_mapping_extent(self.window_ext_y) as f32;
-    let x = width * self.world_transform.m11 * scale_x;
-    let y = width * self.world_transform.m12 * scale_y;
+    let x = width * self.world_transform.m11 * scale_x * self.playback_scale_x;
+    let y = width * self.world_transform.m12 * scale_y * self.playback_scale_y;
     x.hypot(y)
   }
 
@@ -2043,6 +2061,10 @@ struct EmfVectorState {
   height: usize,
   natural_width: usize,
   natural_height: usize,
+  playback_origin_x: f32,
+  playback_origin_y: f32,
+  playback_scale_x: f32,
+  playback_scale_y: f32,
   output_scale_x: f32,
   output_scale_y: f32,
   window_org_x: i32,
@@ -2054,6 +2076,11 @@ struct EmfVectorState {
   viewport_ext_x: i32,
   viewport_ext_y: i32,
   world_transform: EmfTransform,
+  emf_plus_page_unit: EmfPlusUnitType,
+  emf_plus_page_scale: f32,
+  emf_plus_logical_dpi_x: f32,
+  emf_plus_logical_dpi_y: f32,
+  emf_plus_video_display: bool,
   brush_colors: std::collections::HashMap<u32, EmfColor>,
   pens: std::collections::HashMap<u32, Option<EmfPen>>,
   fonts: std::collections::HashMap<u32, EmfFont>,
@@ -2088,6 +2115,8 @@ struct EmfVectorSnapshot {
   viewport_ext_x: i32,
   viewport_ext_y: i32,
   world_transform: EmfTransform,
+  emf_plus_page_unit: EmfPlusUnitType,
+  emf_plus_page_scale: f32,
   current_brush: Option<EmfColor>,
   current_pen: Option<EmfPen>,
   current_font: Option<u32>,
@@ -2132,41 +2161,50 @@ enum EmfPlusRenderRegion {
 
 #[derive(Clone, Debug)]
 enum EmfPlusRenderBrush {
-  Solid(EmfColor),
+  Solid(EmfPlusRenderColor),
   Hatch {
-    fore: EmfColor,
-    back: EmfColor,
+    fore: EmfPlusRenderColor,
+    back: EmfPlusRenderColor,
     style: u32,
   },
   LinearGradient {
     rect: (f32, f32, f32, f32),
-    start: EmfColor,
-    end: EmfColor,
+    start: EmfPlusRenderColor,
+    end: EmfPlusRenderColor,
   },
   PathGradient {
     center: (f32, f32),
-    center_color: EmfColor,
-    surround: EmfColor,
+    center_color: EmfPlusRenderColor,
+    surround: EmfPlusRenderColor,
   },
   Texture(RasterPixels),
 }
 
+#[derive(Clone, Copy, Debug)]
+struct EmfPlusRenderColor {
+  color: EmfColor,
+  alpha: u8,
+}
+
 impl EmfPlusRenderBrush {
-  fn representative_color(&self) -> EmfColor {
+  fn representative_color(&self) -> EmfPlusRenderColor {
     match self {
       Self::Solid(color) => *color,
       Self::Hatch { fore, .. } => *fore,
-      Self::LinearGradient { start, end, .. } => average_color(*start, *end),
+      Self::LinearGradient { start, end, .. } => average_emf_plus_color(*start, *end),
       Self::PathGradient {
         center_color,
         surround,
         ..
-      } => average_color(*center_color, *surround),
-      Self::Texture(image) => average_image_color(image),
+      } => average_emf_plus_color(*center_color, *surround),
+      Self::Texture(image) => EmfPlusRenderColor {
+        color: average_image_color(image),
+        alpha: u8::MAX,
+      },
     }
   }
 
-  fn color_at(&self, x: i32, y: i32) -> EmfColor {
+  fn color_at(&self, x: i32, y: i32) -> EmfPlusRenderColor {
     match self {
       Self::Solid(color) => *color,
       Self::Hatch { fore, back, style } => {
@@ -2179,7 +2217,7 @@ impl EmfPlusRenderBrush {
       Self::LinearGradient { rect, start, end } => {
         let span = (rect.2 - rect.0).abs().max(1.0);
         let t = ((x as f32 - rect.0) / span).clamp(0.0, 1.0);
-        lerp_color(*start, *end, t)
+        lerp_emf_plus_color(*start, *end, t)
       }
       Self::PathGradient {
         center,
@@ -2187,19 +2225,25 @@ impl EmfPlusRenderBrush {
         surround,
       } => {
         let distance = ((x as f32 - center.0).hypot(y as f32 - center.1) / 256.0).clamp(0.0, 1.0);
-        lerp_color(*center_color, *surround, distance)
+        lerp_emf_plus_color(*center_color, *surround, distance)
       }
       Self::Texture(image) => {
         if image.width == 0 || image.height == 0 {
-          return EmfColor { r: 0, g: 0, b: 0 };
+          return EmfPlusRenderColor {
+            color: EmfColor { r: 0, g: 0, b: 0 },
+            alpha: u8::MAX,
+          };
         }
         let tx = x.rem_euclid(image.width as i32) as usize;
         let ty = y.rem_euclid(image.height as i32) as usize;
         let offset = (ty * image.width + tx) * RGB_BYTES_PER_PIXEL;
-        EmfColor {
-          r: image.rgb[offset],
-          g: image.rgb[offset + 1],
-          b: image.rgb[offset + 2],
+        EmfPlusRenderColor {
+          color: EmfColor {
+            r: image.rgb[offset],
+            g: image.rgb[offset + 1],
+            b: image.rgb[offset + 2],
+          },
+          alpha: u8::MAX,
         }
       }
     }
@@ -3056,7 +3100,9 @@ impl EmfVectorState {
     options: RenderOptions,
     text_surface: GdiTextSurface,
   ) -> Result<Self, String> {
-    let (natural_width, natural_height) = emf_natural_canvas_size(data)?;
+    let geometry = emf_playback_geometry(data)?;
+    let natural_width = geometry.width;
+    let natural_height = geometry.height;
     let (width, height) = options.resolved_canvas_size(natural_width, natural_height);
     let output_scale_x = width as f32 / natural_width.max(1) as f32;
     let output_scale_y = height as f32 / natural_height.max(1) as f32;
@@ -3071,6 +3117,10 @@ impl EmfVectorState {
       height,
       natural_width,
       natural_height,
+      playback_origin_x: geometry.origin_x,
+      playback_origin_y: geometry.origin_y,
+      playback_scale_x: geometry.scale_x,
+      playback_scale_y: geometry.scale_y,
       output_scale_x,
       output_scale_y,
       window_org_x: 0,
@@ -3082,12 +3132,21 @@ impl EmfVectorState {
       viewport_ext_x: natural_width as i32,
       viewport_ext_y: natural_height as i32,
       world_transform: EmfTransform::identity(),
+      // Classic EMF records are already expressed in the reference device's
+      // logical/device coordinate pipeline. EMF+ Header switches this to the
+      // GDI+ default UnitDisplay state before any EMF+ drawing record runs.
+      emf_plus_page_unit: EmfPlusUnitType::Pixel,
+      emf_plus_page_scale: 1.0,
+      emf_plus_logical_dpi_x: 96.0,
+      emf_plus_logical_dpi_y: 96.0,
+      emf_plus_video_display: true,
       brush_colors: std::collections::HashMap::new(),
       pens: std::collections::HashMap::new(),
       fonts: std::collections::HashMap::new(),
       current_brush: None,
       current_pen: Some(EmfPen {
         color: EmfColor { r: 0, g: 0, b: 0 },
+        alpha: u8::MAX,
         width: 1,
         transform_width: false,
       }),
@@ -3112,11 +3171,37 @@ impl EmfVectorState {
 
   fn map_point(&self, point: EmfPoint) -> (f32, f32) {
     let (x, y) = self.world_transform.apply(point);
+    let (page_scale_x, page_scale_y) = self.emf_plus_page_device_scale();
+    let x = x * page_scale_x;
+    let y = y * page_scale_y;
     let scale_x = self.viewport_ext_x as f32 / nonzero_mapping_extent(self.window_ext_x) as f32;
     let scale_y = self.viewport_ext_y as f32 / nonzero_mapping_extent(self.window_ext_y) as f32;
     (
-      (self.viewport_org_x as f32 + (x - self.window_org_x as f32) * scale_x) * self.output_scale_x,
-      (self.viewport_org_y as f32 + (y - self.window_org_y as f32) * scale_y) * self.output_scale_y,
+      (self.viewport_org_x as f32 + (x - self.window_org_x as f32) * scale_x
+        - self.playback_origin_x)
+        * self.playback_scale_x
+        * self.output_scale_x,
+      (self.viewport_org_y as f32 + (y - self.window_org_y as f32) * scale_y
+        - self.playback_origin_y)
+        * self.playback_scale_y
+        * self.output_scale_y,
+    )
+  }
+
+  fn emf_plus_page_device_scale(&self) -> (f32, f32) {
+    (
+      emf_plus_units_to_device_scale(
+        self.emf_plus_page_unit,
+        self.emf_plus_page_scale,
+        self.emf_plus_logical_dpi_x,
+        self.emf_plus_video_display,
+      ),
+      emf_plus_units_to_device_scale(
+        self.emf_plus_page_unit,
+        self.emf_plus_page_scale,
+        self.emf_plus_logical_dpi_y,
+        self.emf_plus_video_display,
+      ),
     )
   }
 
@@ -3125,9 +3210,14 @@ impl EmfVectorState {
       return pen;
     }
     let width = pen.width as f32;
+    let (page_scale_x, page_scale_y) = self.emf_plus_page_device_scale();
     let scale_x = self.viewport_ext_x as f32 / nonzero_mapping_extent(self.window_ext_x) as f32
+      * page_scale_x
+      * self.playback_scale_x
       * self.output_scale_x;
     let scale_y = self.viewport_ext_y as f32 / nonzero_mapping_extent(self.window_ext_y) as f32
+      * page_scale_y
+      * self.playback_scale_y
       * self.output_scale_y;
     let x_axis = (
       width * self.world_transform.m11 * scale_x,
@@ -3171,14 +3261,45 @@ impl EmfVectorState {
     self.rgb[offset + 2] = color.b;
   }
 
-  fn set_vector_pixel(&mut self, x: i32, y: i32, color: EmfColor) {
+  fn set_pixel_with_alpha(&mut self, x: i32, y: i32, color: EmfColor, alpha: u8) {
+    if alpha == u8::MAX {
+      self.set_pixel(x, y, color);
+      return;
+    }
+    if alpha == 0 {
+      return;
+    }
     let Some(destination) = self.pixel(x, y) else {
       return;
+    };
+    let blend = |source: u8, destination: u8| {
+      let alpha = u32::from(alpha);
+      ((u32::from(source) * alpha + u32::from(destination) * (255 - alpha) + 127) / 255) as u8
     };
     self.set_pixel(
       x,
       y,
+      EmfColor {
+        r: blend(color.r, destination.r),
+        g: blend(color.g, destination.g),
+        b: blend(color.b, destination.b),
+      },
+    );
+  }
+
+  fn set_vector_pixel(&mut self, x: i32, y: i32, color: EmfColor) {
+    self.set_vector_pixel_with_alpha(x, y, color, u8::MAX);
+  }
+
+  fn set_vector_pixel_with_alpha(&mut self, x: i32, y: i32, color: EmfColor, alpha: u8) {
+    let Some(destination) = self.pixel(x, y) else {
+      return;
+    };
+    self.set_pixel_with_alpha(
+      x,
+      y,
       apply_binary_raster_operation(color, destination, self.binary_raster_operation),
+      alpha,
     );
   }
 
@@ -3237,6 +3358,81 @@ impl EmfVectorState {
           raster_color(image, x as usize, y as usize)
         };
         self.set_pixel(left + x, top + y, color);
+      }
+    }
+  }
+
+  fn draw_alpha_blended_image(
+    &mut self,
+    dest_x: i32,
+    dest_y: i32,
+    dest_width: i32,
+    dest_height: i32,
+    image: &AlphaBlendRaster,
+    source_constant_alpha: u8,
+  ) {
+    if source_constant_alpha == 0 {
+      return;
+    }
+    let (mapped_left, mapped_top) = self.map_point(EmfPoint {
+      x: dest_x,
+      y: dest_y,
+    });
+    let (mapped_right, mapped_bottom) = self.map_point(EmfPoint {
+      x: dest_x + dest_width,
+      y: dest_y + dest_height,
+    });
+    let left = mapped_left.min(mapped_right).round() as i32;
+    let top = mapped_top.min(mapped_bottom).round() as i32;
+    let right = mapped_left.max(mapped_right).floor() as i32;
+    let bottom = mapped_top.max(mapped_bottom).floor() as i32;
+    let width = (right - left).max(1);
+    let height = (bottom - top).max(1);
+    let interpolate =
+      width as usize != image.pixels.width || height as usize != image.pixels.height;
+
+    for y in 0..height {
+      for x in 0..width {
+        let (color, source_alpha) = if interpolate {
+          (
+            bilinear_raster_color(
+              &image.pixels,
+              x as usize,
+              y as usize,
+              width as usize,
+              height as usize,
+            ),
+            image.source_alpha.as_deref().map(|alpha| {
+              bilinear_raster_plane_value(
+                alpha,
+                image.pixels.width,
+                image.pixels.height,
+                x as usize,
+                y as usize,
+                width as usize,
+                height as usize,
+              )
+            }),
+          )
+        } else {
+          let source_x = x as usize;
+          let source_y = y as usize;
+          (
+            raster_color(&image.pixels, source_x, source_y),
+            image
+              .source_alpha
+              .as_ref()
+              .map(|alpha| alpha[source_y * image.pixels.width + source_x]),
+          )
+        };
+        let Some(destination) = self.pixel(left + x, top + y) else {
+          continue;
+        };
+        self.set_pixel(
+          left + x,
+          top + y,
+          gdi_alpha_blend_color(destination, color, source_alpha, source_constant_alpha),
+        );
       }
     }
   }
@@ -3354,8 +3550,10 @@ impl EmfVectorState {
     bottom: i32,
     rop: WmfTernaryRasterOperationCode,
   ) {
-    let Some(brush) = self.current_brush else {
-      return;
+    let brush = match self.current_brush {
+      Some(brush) => brush,
+      None if rop.uses_pattern() || rop.uses_source() => return,
+      None => EmfColor { r: 0, g: 0, b: 0 },
     };
     let (mapped_left, mapped_top) = self.map_point(EmfPoint { x: left, y: top });
     let (mapped_right, mapped_bottom) = self.map_point(EmfPoint {
@@ -3749,6 +3947,8 @@ impl EmfVectorState {
       viewport_ext_x: self.viewport_ext_x,
       viewport_ext_y: self.viewport_ext_y,
       world_transform: self.world_transform,
+      emf_plus_page_unit: self.emf_plus_page_unit,
+      emf_plus_page_scale: self.emf_plus_page_scale,
       current_brush: self.current_brush,
       current_pen: self.current_pen,
       current_font: self.current_font,
@@ -3778,6 +3978,8 @@ impl EmfVectorState {
     self.viewport_ext_x = saved.viewport_ext_x;
     self.viewport_ext_y = saved.viewport_ext_y;
     self.world_transform = saved.world_transform;
+    self.emf_plus_page_unit = saved.emf_plus_page_unit;
+    self.emf_plus_page_scale = saved.emf_plus_page_scale;
     self.current_brush = saved.current_brush;
     self.current_pen = saved.current_pen;
     self.current_font = saved.current_font;
@@ -3841,9 +4043,12 @@ impl EmfVectorState {
     self.viewport_ext_x = self.natural_width.max(1) as i32;
     self.viewport_ext_y = self.natural_height.max(1) as i32;
     self.world_transform = EmfTransform::identity();
+    self.emf_plus_page_unit = EmfPlusUnitType::Pixel;
+    self.emf_plus_page_scale = 1.0;
     self.current_brush = None;
     self.current_pen = Some(EmfPen {
       color: EmfColor { r: 0, g: 0, b: 0 },
+      alpha: u8::MAX,
       width: 1,
       transform_width: false,
     });
@@ -3926,7 +4131,8 @@ impl EmfVectorState {
         if mask.as_ref().is_some_and(|mask| !mask[y * self.width + x]) {
           continue;
         }
-        self.set_pixel(x as i32, y as i32, brush.color_at(x as i32, y as i32));
+        let color = brush.color_at(x as i32, y as i32);
+        self.set_pixel_with_alpha(x as i32, y as i32, color.color, color.alpha);
       }
     }
   }
@@ -4146,7 +4352,8 @@ impl EmfVectorState {
     let height = self.height;
     visit_polygon_scanline_spans(&mapped, width, height, |y, start, end| {
       for x in start..end {
-        self.set_pixel(x as i32, y as i32, brush.color_at(x as i32, y as i32));
+        let color = brush.color_at(x as i32, y as i32);
+        self.set_pixel_with_alpha(x as i32, y as i32, color.color, color.alpha);
       }
     });
   }
@@ -4158,15 +4365,17 @@ impl EmfVectorState {
     if points.len() < 2 {
       return;
     }
+    let mut coverage = vec![false; self.width * self.height];
     for pair in points.windows(2) {
-      self.draw_line(pair[0], pair[1], pen);
+      self.mark_line_coverage(pair[0], pair[1], pen, &mut coverage);
     }
     if closed {
-      self.draw_line(points[points.len() - 1], points[0], pen);
+      self.mark_line_coverage(points[points.len() - 1], points[0], pen, &mut coverage);
     }
+    self.paint_pen_coverage(&coverage, pen);
   }
 
-  fn draw_line(&mut self, a: EmfPoint, b: EmfPoint, pen: EmfPen) {
+  fn mark_line_coverage(&self, a: EmfPoint, b: EmfPoint, pen: EmfPen, coverage: &mut [bool]) {
     if self.width == 0 || self.height == 0 {
       return;
     }
@@ -4201,8 +4410,15 @@ impl EmfVectorState {
     let dy = -(y1 - y0).abs();
     let sy = if y0 < y1 { 1 } else { -1 };
     let mut error = dx + dy;
+    let pen_radius = (pen.width.max(1) / 2) as i32;
     loop {
-      self.set_pen_pixel(x0, y0, pen);
+      for y in y0 - pen_radius..=y0 + pen_radius {
+        for x in x0 - pen_radius..=x0 + pen_radius {
+          if x >= 0 && y >= 0 && x < self.width as i32 && y < self.height as i32 {
+            coverage[y as usize * self.width + x as usize] = true;
+          }
+        }
+      }
       if x0 == x1 && y0 == y1 {
         break;
       }
@@ -4218,11 +4434,12 @@ impl EmfVectorState {
     }
   }
 
-  fn set_pen_pixel(&mut self, x: i32, y: i32, pen: EmfPen) {
-    let radius = (pen.width.max(1) / 2) as i32;
-    for yy in y - radius..=y + radius {
-      for xx in x - radius..=x + radius {
-        self.set_vector_pixel(xx, yy, pen.color);
+  fn paint_pen_coverage(&mut self, coverage: &[bool], pen: EmfPen) {
+    for y in 0..self.height {
+      for x in 0..self.width {
+        if coverage[y * self.width + x] {
+          self.set_vector_pixel_with_alpha(x as i32, y as i32, pen.color, pen.alpha);
+        }
       }
     }
   }
@@ -4319,6 +4536,7 @@ impl EmfVectorState {
             g: 255,
             b: 255,
           },
+          alpha: u8::MAX,
           width: 1,
           transform_width: false,
         })
@@ -4326,6 +4544,7 @@ impl EmfVectorState {
       BLACK_PEN => {
         self.current_pen = Some(EmfPen {
           color: EmfColor { r: 0, g: 0, b: 0 },
+          alpha: u8::MAX,
           width: 1,
           transform_width: false,
         })
@@ -4356,7 +4575,8 @@ fn decode_vector_emf_as_png(
   } else {
     EmfVectorState::new_with_options_and_text_surface(data, options, text_surface)?
   };
-  let mut pos = EMF_HEADER_SIZE;
+  let mut pos =
+    emf_header_record_size(data).ok_or_else(|| "invalid EMF header record".to_string())?;
   let mut emf_plus_playback = false;
   let mut emf_device_context = None;
 
@@ -4394,8 +4614,8 @@ fn decode_vector_emf_as_png(
         state.window_org_y = read_i32(data, pos + 12)?;
       }
       EMR_SET_WINDOW_EXT_EX if record_size >= 16 => {
-        state.window_ext_x = read_i32(data, pos + 8)?.abs().max(1);
-        state.window_ext_y = read_i32(data, pos + 12)?.abs().max(1);
+        state.window_ext_x = nonzero_mapping_extent(read_i32(data, pos + 8)?);
+        state.window_ext_y = nonzero_mapping_extent(read_i32(data, pos + 12)?);
       }
       EMR_SET_VIEWPORT_ORG_EX if record_size >= 16 => {
         state.viewport_org_x = read_i32(data, pos + 8)?;
@@ -4472,6 +4692,7 @@ fn decode_vector_emf_as_png(
               style,
               EmfPen {
                 color: read_color_ref(data, pos + 24)?,
+                alpha: u8::MAX,
                 width,
                 transform_width: false,
               },
@@ -4485,7 +4706,12 @@ fn decode_vector_emf_as_png(
           .brush_colors
           .insert(object_id, read_color_ref(data, pos + 16)?);
       }
-      EMR_EXT_CREATE_PEN if record_size >= 56 => {
+      // [MS-EMF] 2.3.7.9 permits an empty LogPenEx StyleEntry array.  The
+      // fixed record is therefore 52 bytes (8-byte EMR header, five DWORDs,
+      // and the 24-byte fixed LogPenEx), as emitted by Adobe in Apache POI's
+      // WithDrawing.xlsx.  Requiring one nonexistent style entry loses a
+      // legal PS_NULL pen and incorrectly outlines every following polygon.
+      EMR_EXT_CREATE_PEN if record_size >= 52 => {
         let object_id = read_u32(data, pos + 8)?;
         if object_id & ENHMETA_STOCK_OBJECT == 0 {
           let style = read_u32(data, pos + 28)?;
@@ -4496,6 +4722,7 @@ fn decode_vector_emf_as_png(
               style,
               EmfPen {
                 color: read_color_ref(data, pos + 40)?,
+                alpha: u8::MAX,
                 width,
                 transform_width: false,
               },
@@ -4701,29 +4928,46 @@ fn decode_vector_emf_as_png(
           replay_masked_blt_pair(data, pos, record_type, record_size, &mut state)?
         {
           consumed_following_record_size = next_record_size;
-        } else if let Some(target) = emf_bitmap_draw_target(data, pos, record_type, record_size)?
-          && let Some(image) = cropped_emf_bitmap(data, pos, record_type, record_size, target)?
-        {
-          if let Some(rop) = target.raster_operation {
-            state.draw_rgb_image_with_rop(
+        } else if let Some(target) = emf_bitmap_draw_target(data, pos, record_type, record_size)? {
+          if let Some(image) = cropped_emf_bitmap(data, pos, record_type, record_size, target)? {
+            if let Some(rop) = target.raster_operation {
+              state.draw_rgb_image_with_rop(
+                target.dest_x,
+                target.dest_y,
+                target.dest_width,
+                target.dest_height,
+                &image,
+                rop,
+              );
+            } else {
+              state.draw_rgb_image(
+                target.dest_x,
+                target.dest_y,
+                target.dest_width,
+                target.dest_height,
+                &image,
+              );
+            }
+          } else if let Some(rop) = target.raster_operation
+            && !rop.uses_source()
+          {
+            // [MS-EMF] 2.3.1.2 permits EMR_BITBLT to omit BitmapBuffer
+            // whenever its ternary operation does not read the source. GDI
+            // control previews use exactly this spelling for brush-backed
+            // PATCOPY rectangles: the destination and selected brush remain
+            // meaningful even though all four bitmap offsets and sizes are
+            // zero.
+            state.fill_rect_with_rop(
               target.dest_x,
               target.dest_y,
-              target.dest_width,
-              target.dest_height,
-              &image,
+              target.dest_x.saturating_add(target.dest_width),
+              target.dest_y.saturating_add(target.dest_height),
               rop,
-            );
-          } else {
-            state.draw_rgb_image(
-              target.dest_x,
-              target.dest_y,
-              target.dest_width,
-              target.dest_height,
-              &image,
             );
           }
         }
       }
+      EMR_ALPHA_BLEND => replay_emf_alpha_blend(data, pos, record_size, &mut state)?,
       EMR_COMMENT if record_size >= 16 => {
         if let Some(control) = process_emf_plus_comment(data, pos, record_size, &mut state)? {
           emf_plus_playback |= control.header;
@@ -4749,6 +4993,157 @@ fn emf_comment_is_emf_plus(data: &[u8], record_offset: usize, record_size: usize
   record_size >= 16
     && read_u32(data, record_offset + 8).is_ok_and(|data_size| data_size >= 4)
     && read_u32(data, record_offset + 12).is_ok_and(|identifier| identifier == EMR_COMMENT_EMFPLUS)
+}
+
+fn replay_emf_alpha_blend(
+  data: &[u8],
+  record_offset: usize,
+  record_size: usize,
+  state: &mut EmfVectorState,
+) -> Result<(), String> {
+  let record_end = record_offset
+    .checked_add(record_size)
+    .ok_or_else(|| "EMR_ALPHABLEND range overflows".to_string())?;
+  let payload = data
+    .get(record_offset + EMF_RECORD_HEADER_SIZE..record_end)
+    .ok_or_else(|| "EMR_ALPHABLEND points outside the metafile".to_string())?;
+  let record = EmfRecordRef {
+    record_type: EMR_ALPHA_BLEND,
+    data: payload,
+  };
+  let EmfRecordData::AlphaBlend(value) = record.parse_data().map_err(|error| error.to_string())?
+  else {
+    return Ok(());
+  };
+  let Some(image) = emf_alpha_blend_raster(&value)? else {
+    return Ok(());
+  };
+  state.draw_alpha_blended_image(
+    value.dest.x,
+    value.dest.y,
+    value.dest_size.cx,
+    value.dest_size.cy,
+    &image,
+    value.blend_function.source_constant_alpha,
+  );
+  Ok(())
+}
+
+fn emf_alpha_blend_raster(value: &EmrAlphaBlend) -> Result<Option<AlphaBlendRaster>, String> {
+  let Some(bitmap) = value.bitmap.as_ref() else {
+    return Ok(None);
+  };
+  let dib = bitmap
+    .device_independent_bitmap()
+    .map_err(|error| error.to_string())?;
+  let color_usage = value
+    .color_usage_kind()
+    .ok_or_else(|| "EMR_ALPHABLEND has an unsupported DIB color usage".to_string())?;
+  let Some(pixels) = device_independent_bitmap_to_rgb(&dib, color_usage, None)? else {
+    return Ok(None);
+  };
+  let source_alpha = match value.blend_function.alpha_format_kind() {
+    Some(EmrAlphaFormat::ConstantAlpha) => None,
+    Some(EmrAlphaFormat::SourceAlpha) => Some(dib_source_alpha_plane(&dib)?),
+    None => return Ok(None),
+  };
+
+  // XformSrc belongs to the source DC. Win32 maps the two logical source
+  // rectangle corners to device coordinates before validating and sampling
+  // the selected DIB; negative physical source extents make AlphaBlend fail.
+  let transform = EmfTransform {
+    m11: value.xform_source.m11,
+    m12: value.xform_source.m12,
+    m21: value.xform_source.m21,
+    m22: value.xform_source.m22,
+    dx: value.xform_source.dx,
+    dy: value.xform_source.dy,
+  };
+  let first = transform.apply(EmfPoint {
+    x: value.source.x,
+    y: value.source.y,
+  });
+  let second = transform.apply(EmfPoint {
+    x: value.source.x.saturating_add(value.source_size.cx),
+    y: value.source.y.saturating_add(value.source_size.cy),
+  });
+  if ![first.0, first.1, second.0, second.1]
+    .into_iter()
+    .all(f32::is_finite)
+  {
+    return Ok(None);
+  }
+  let left = first.0.round() as i32;
+  let top = first.1.round() as i32;
+  let right = second.0.round() as i32;
+  let bottom = second.1.round() as i32;
+  let Some(width) = right.checked_sub(left).filter(|width| *width > 0) else {
+    return Ok(None);
+  };
+  let Some(height) = bottom.checked_sub(top).filter(|height| *height > 0) else {
+    return Ok(None);
+  };
+
+  Ok(crop_alpha_blend_raster(
+    AlphaBlendRaster {
+      pixels,
+      source_alpha,
+    },
+    (left, top, width, height),
+  ))
+}
+
+fn dib_source_alpha_plane(dib: &DeviceIndependentBitmap) -> Result<Vec<u8>, String> {
+  let header = &dib.info.header;
+  if header.bit_count() != 32 {
+    return Err(format!(
+      "EMR_ALPHABLEND AC_SRC_ALPHA requires a 32-bpp source, got {} bpp",
+      header.bit_count()
+    ));
+  }
+  let width = usize::try_from(header.width())
+    .map_err(|_| "EMR_ALPHABLEND source width is negative".to_string())?;
+  let height = header.height_abs() as usize;
+  let stride = header
+    .scan_line_stride_bytes()
+    .map_err(|error| error.to_string())? as usize;
+  let required = stride
+    .checked_mul(height)
+    .ok_or_else(|| "EMR_ALPHABLEND source dimensions overflow".to_string())?;
+  if dib.bits.len() < required {
+    return Err(format!(
+      "EMR_ALPHABLEND source bits are truncated: need {required}, got {}",
+      dib.bits.len()
+    ));
+  }
+  let alpha_mask = match header {
+    DibHeader::V4(value) if value.alpha_mask != 0 => value.alpha_mask,
+    DibHeader::V5(value) if value.v4.alpha_mask != 0 => value.v4.alpha_mask,
+    // BLENDFUNCTION's AC_SRC_ALPHA contract is A8R8G8B8. A 40-byte
+    // BITMAPINFOHEADER has only the three RGB masks, so its remaining high
+    // byte is the alpha channel (the spelling used by Apache POI 58325_lt).
+    _ => 0xFF00_0000,
+  };
+  let mut alpha = vec![0; width * height];
+  for row in 0..height {
+    let source_row = if header.is_top_down() {
+      row
+    } else {
+      height - 1 - row
+    };
+    let source = &dib.bits[source_row * stride..source_row * stride + stride];
+    for column in 0..width {
+      let offset = column * BGRA_BYTES_PER_PIXEL;
+      let value = u32::from_le_bytes([
+        source[offset],
+        source[offset + 1],
+        source[offset + 2],
+        source[offset + 3],
+      ]);
+      alpha[row * width + column] = bitfield_channel(value, alpha_mask);
+    }
+  }
+  Ok(alpha)
 }
 
 fn cropped_emf_bitmap(
@@ -4844,10 +5239,57 @@ fn replay_masked_blt_pair(
 }
 
 #[derive(Clone, Debug)]
+struct AlphaBlendRaster {
+  pixels: RasterPixels,
+  /// Per-pixel alpha for AC_SRC_ALPHA. The RGB channels remain in the DIB's
+  /// premultiplied form, as required by Win32 BLENDFUNCTION playback.
+  source_alpha: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Debug)]
 struct RasterPixels {
   width: usize,
   height: usize,
   rgb: Vec<u8>,
+}
+
+fn crop_alpha_blend_raster(
+  image: AlphaBlendRaster,
+  (x, y, width, height): (i32, i32, i32, i32),
+) -> Option<AlphaBlendRaster> {
+  let (x, y, width, height) = (
+    usize::try_from(x).ok()?,
+    usize::try_from(y).ok()?,
+    usize::try_from(width).ok()?,
+    usize::try_from(height).ok()?,
+  );
+  let right = x.checked_add(width)?;
+  let bottom = y.checked_add(height)?;
+  if width == 0 || height == 0 || right > image.pixels.width || bottom > image.pixels.height {
+    return None;
+  }
+  if x == 0 && y == 0 && width == image.pixels.width && height == image.pixels.height {
+    return Some(image);
+  }
+
+  let mut rgb = Vec::with_capacity(width * height * RGB_BYTES_PER_PIXEL);
+  let mut source_alpha = image
+    .source_alpha
+    .as_ref()
+    .map(|_| Vec::with_capacity(width * height));
+  for row in y..bottom {
+    let rgb_start = (row * image.pixels.width + x) * RGB_BYTES_PER_PIXEL;
+    let rgb_end = rgb_start + width * RGB_BYTES_PER_PIXEL;
+    rgb.extend_from_slice(&image.pixels.rgb[rgb_start..rgb_end]);
+    if let (Some(source), Some(target)) = (&image.source_alpha, &mut source_alpha) {
+      let start = row * image.pixels.width + x;
+      target.extend_from_slice(&source[start..start + width]);
+    }
+  }
+  Some(AlphaBlendRaster {
+    pixels: RasterPixels { width, height, rgb },
+    source_alpha,
+  })
 }
 
 fn raster_color(image: &RasterPixels, x: usize, y: usize) -> EmfColor {
@@ -4934,6 +5376,76 @@ fn bilinear_raster_color(
     r: channel(top_left.r, top_right.r, bottom_left.r, bottom_right.r),
     g: channel(top_left.g, top_right.g, bottom_left.g, bottom_right.g),
     b: channel(top_left.b, top_right.b, bottom_left.b, bottom_right.b),
+  }
+}
+
+fn bilinear_raster_plane_value(
+  plane: &[u8],
+  source_width: usize,
+  source_height: usize,
+  x: usize,
+  y: usize,
+  target_width: usize,
+  target_height: usize,
+) -> u8 {
+  if source_width == 0
+    || source_height == 0
+    || target_width == 0
+    || target_height == 0
+    || plane.len() < source_width.saturating_mul(source_height)
+  {
+    return 0;
+  }
+  let source_coordinate = |target: usize, source_extent: usize, target_extent: usize| {
+    ((target as f32 + 0.5) * source_extent as f32 / target_extent as f32 - 0.5)
+      .clamp(0.0, source_extent.saturating_sub(1) as f32)
+  };
+  let source_x = source_coordinate(x, source_width, target_width);
+  let source_y = source_coordinate(y, source_height, target_height);
+  let x0 = source_x.floor() as usize;
+  let y0 = source_y.floor() as usize;
+  let x1 = (x0 + 1).min(source_width - 1);
+  let y1 = (y0 + 1).min(source_height - 1);
+  let fraction_x = source_x - x0 as f32;
+  let fraction_y = source_y - y0 as f32;
+  let top_left = plane[y0 * source_width + x0];
+  let top_right = plane[y0 * source_width + x1];
+  let bottom_left = plane[y1 * source_width + x0];
+  let bottom_right = plane[y1 * source_width + x1];
+  let top = f32::from(top_left) + (f32::from(top_right) - f32::from(top_left)) * fraction_x;
+  let bottom =
+    f32::from(bottom_left) + (f32::from(bottom_right) - f32::from(bottom_left)) * fraction_x;
+  (top + (bottom - top) * fraction_y)
+    .round()
+    .clamp(0.0, f32::from(u8::MAX)) as u8
+}
+
+fn gdi_alpha_blend_color(
+  destination: EmfColor,
+  source: EmfColor,
+  source_alpha: Option<u8>,
+  source_constant_alpha: u8,
+) -> EmfColor {
+  let blend = |destination: u8, source: u8| match source_alpha {
+    Some(source_alpha) => {
+      // AC_SRC_ALPHA stores premultiplied source channels. SrcConstantAlpha
+      // scales both those channels and the per-pixel alpha before SourceOver;
+      // multiplying the color by the effective alpha again would darken
+      // translucent artwork a second time.
+      let constant = u32::from(source_constant_alpha);
+      let source = (u32::from(source) * constant + 127) / 255;
+      let alpha = (u32::from(source_alpha) * constant + 127) / 255;
+      (source + (u32::from(destination) * (255 - alpha) + 127) / 255).min(255) as u8
+    }
+    None => {
+      let alpha = u32::from(source_constant_alpha);
+      ((u32::from(source) * alpha + u32::from(destination) * (255 - alpha) + 127) / 255) as u8
+    }
+  };
+  EmfColor {
+    r: blend(destination.r, source.r),
+    g: blend(destination.g, source.g),
+    b: blend(destination.b, source.b),
   }
 }
 
@@ -5117,6 +5629,10 @@ impl WmfRenderState {
         height,
         natural_width,
         natural_height,
+        playback_origin_x: 0.0,
+        playback_origin_y: 0.0,
+        playback_scale_x: 1.0,
+        playback_scale_y: 1.0,
         output_scale_x,
         output_scale_y,
         window_org_x,
@@ -5128,6 +5644,11 @@ impl WmfRenderState {
         viewport_ext_x: natural_width as i32,
         viewport_ext_y: natural_height as i32,
         world_transform: EmfTransform::identity(),
+        emf_plus_page_unit: EmfPlusUnitType::Pixel,
+        emf_plus_page_scale: 1.0,
+        emf_plus_logical_dpi_x: 96.0,
+        emf_plus_logical_dpi_y: 96.0,
+        emf_plus_video_display: true,
         brush_colors: std::collections::HashMap::new(),
         pens: std::collections::HashMap::new(),
         fonts: std::collections::HashMap::new(),
@@ -5138,6 +5659,7 @@ impl WmfRenderState {
         }),
         current_pen: Some(EmfPen {
           color: EmfColor { r: 0, g: 0, b: 0 },
+          alpha: u8::MAX,
           width: 1,
           transform_width: false,
         }),
@@ -5464,6 +5986,7 @@ fn decode_wmf_as_raster(
         } else {
           Some(EmfPen {
             color: color_ref_to_emf(value.pen.color_ref),
+            alpha: u8::MAX,
             width: i32::from(value.pen.width.x).unsigned_abs().max(1) as usize,
             transform_width: false,
           })
@@ -6208,6 +6731,7 @@ fn process_emf_plus_comment(
     let mut reader = Reader::new(std::io::Cursor::new(record_bytes));
     if let Ok(record) = EmfPlusRecord::read_from(&mut reader, record_bytes.len() as u64) {
       let record_kind = record.record_kind();
+      let record_flags = record.flags();
       control.header |= record_kind == Some(EmfPlusRecordType::Header);
       control.get_dc |= record_kind == Some(EmfPlusRecordType::GetDc);
       if record_kind == Some(EmfPlusRecordType::Object) {
@@ -6215,7 +6739,7 @@ fn process_emf_plus_comment(
           process_emf_plus_object(fragment, state)?;
         }
       } else if let Ok(parsed) = record.parse_data_relaxed() {
-        process_emf_plus_record(parsed, state)?;
+        process_emf_plus_record(parsed, record_flags, state)?;
       }
     }
     cursor += size;
@@ -6231,15 +6755,23 @@ struct EmfPlusCommentControl {
 
 fn process_emf_plus_record(
   record: EmfPlusRecordData<'_>,
+  flags: EmfPlusRecordFlags,
   state: &mut EmfVectorState,
 ) -> Result<(), String> {
   match record {
     EmfPlusRecordData::Object(value) => process_emf_plus_object(value, state)?,
+    EmfPlusRecordData::Header(value) => {
+      state.emf_plus_logical_dpi_x = value.logical_dpi_x.max(1) as f32;
+      state.emf_plus_logical_dpi_y = value.logical_dpi_y.max(1) as f32;
+      state.emf_plus_video_display = value.video_display();
+      state.emf_plus_page_unit = EmfPlusUnitType::Display;
+      state.emf_plus_page_scale = 1.0;
+    }
     EmfPlusRecordData::Clear(value) => {
-      let color = emf_plus_argb_to_color(value.color);
+      let color = emf_plus_argb_to_render_color(value.color);
       for y in 0..state.height {
         for x in 0..state.width {
-          state.set_pixel(x as i32, y as i32, color);
+          state.set_pixel_with_alpha(x as i32, y as i32, color.color, color.alpha);
         }
       }
     }
@@ -6371,7 +6903,7 @@ fn process_emf_plus_record(
           .iter()
           .filter_map(|glyph| char::from_u32(u32::from(*glyph)))
           .collect::<String>();
-        state.draw_text(first.x as i32, first.y as i32, &text, color, 12);
+        state.draw_text(first.x as i32, first.y as i32, &text, color.color, 12);
       }
     }
     EmfPlusRecordData::Save(value) => state.save_emf_plus_state(value.stack_index, false),
@@ -6434,15 +6966,13 @@ fn process_emf_plus_record(
     EmfPlusRecordData::SetPageTransform(value)
       if value.page_scale.is_finite() && value.page_scale > 0.0 =>
     {
-      multiply_emf_plus_transform(
-        EmfTransform {
-          m11: value.page_scale,
-          m22: value.page_scale,
-          ..EmfTransform::identity()
-        },
-        true,
-        state,
-      );
+      if let Some(page_unit) = flags.page_unit() {
+        // [MS-EMFPLUS] 2.3.9.5 defines a page-space-to-device-space
+        // property, not a world-transform mutation. GDI+ emits a complete
+        // replacement record whenever either PageUnit or PageScale changes.
+        state.emf_plus_page_unit = page_unit;
+        state.emf_plus_page_scale = value.page_scale;
+      }
     }
     EmfPlusRecordData::SetTsGraphics(value) => {
       state.world_transform = xform_to_transform(value.world_to_device);
@@ -6456,7 +6986,7 @@ fn process_emf_plus_object(
   value: EmfPlusObjectRecordData,
   state: &mut EmfVectorState,
 ) -> Result<(), String> {
-  match state.emf_plus_object_assembler.push(value) {
+  match state.emf_plus_object_assembler.push_relaxed(value) {
     Ok(Some(complete)) => process_complete_emf_plus_object(complete, state),
     Ok(None) => {}
     Err(_) => {
@@ -6467,7 +6997,7 @@ fn process_emf_plus_object(
 }
 
 fn process_complete_emf_plus_object(value: EmfPlusObjectRecordData, state: &mut EmfVectorState) {
-  let object = match value.parse_object_data() {
+  let object = match value.parse_object_data_relaxed() {
     Ok(EmfPlusObjectData::Brush(brush)) => {
       EmfPlusRenderObject::Brush(emf_plus_brush_object(&brush))
     }
@@ -6493,13 +7023,13 @@ fn process_complete_emf_plus_object(value: EmfPlusObjectRecordData, state: &mut 
 }
 
 fn emf_plus_brush_object(brush: &crate::emfplus::EmfPlusBrushObject) -> Option<EmfPlusRenderBrush> {
-  match brush.parse_brush_data().ok()? {
-    EmfPlusBrushData::Solid(value) => Some(EmfPlusRenderBrush::Solid(emf_plus_argb_to_color(
-      value.solid_color,
-    ))),
+  match brush.parse_brush_data_relaxed().ok()? {
+    EmfPlusBrushData::Solid(value) => Some(EmfPlusRenderBrush::Solid(
+      emf_plus_argb_to_render_color(value.solid_color),
+    )),
     EmfPlusBrushData::Hatch(value) => Some(EmfPlusRenderBrush::Hatch {
-      fore: emf_plus_argb_to_color(value.fore_color),
-      back: emf_plus_argb_to_color(value.back_color),
+      fore: emf_plus_argb_to_render_color(value.fore_color),
+      back: emf_plus_argb_to_render_color(value.back_color),
       style: value.hatch_style,
     }),
     EmfPlusBrushData::LinearGradient(value) => Some(EmfPlusRenderBrush::LinearGradient {
@@ -6509,18 +7039,18 @@ fn emf_plus_brush_object(brush: &crate::emfplus::EmfPlusBrushObject) -> Option<E
         value.rect.x + value.rect.width,
         value.rect.y + value.rect.height,
       ),
-      start: emf_plus_argb_to_color(value.start_color),
-      end: emf_plus_argb_to_color(value.end_color),
+      start: emf_plus_argb_to_render_color(value.start_color),
+      end: emf_plus_argb_to_render_color(value.end_color),
     }),
     EmfPlusBrushData::PathGradient(value) => Some(EmfPlusRenderBrush::PathGradient {
       center: (value.center_point.x, value.center_point.y),
-      center_color: emf_plus_argb_to_color(value.center_color),
+      center_color: emf_plus_argb_to_render_color(value.center_color),
       surround: value
         .surrounding_colors
         .first()
         .copied()
-        .map(emf_plus_argb_to_color)
-        .unwrap_or_else(|| emf_plus_argb_to_color(value.center_color)),
+        .map(emf_plus_argb_to_render_color)
+        .unwrap_or_else(|| emf_plus_argb_to_render_color(value.center_color)),
     }),
     EmfPlusBrushData::Texture(value) => value
       .parse_optional_data()
@@ -6534,10 +7064,12 @@ fn emf_plus_brush_object(brush: &crate::emfplus::EmfPlusBrushObject) -> Option<E
 }
 
 fn emf_plus_pen_object(pen: &EmfPlusPenObject) -> Option<EmfPen> {
-  let payload = pen.parse_pen_payload().ok()?;
+  let payload = pen.parse_pen_payload_relaxed().ok()?;
   let brush = payload.brush_object.as_ref()?;
+  let color = emf_plus_brush_object(brush)?.representative_color();
   Some(EmfPen {
-    color: emf_plus_brush_object(brush)?.representative_color(),
+    color: color.color,
+    alpha: color.alpha,
     width: payload.pen_data.pen_width.round().max(1.0) as usize,
     transform_width: payload.pen_data.pen_unit_kind() == Some(EmfPlusUnitType::World),
   })
@@ -6548,36 +7080,72 @@ fn emf_plus_brush_ref(
   state: &EmfVectorState,
 ) -> Option<EmfPlusRenderBrush> {
   match brush {
-    EmfPlusBrushRef::Color(color) => Some(EmfPlusRenderBrush::Solid(emf_plus_argb_to_color(color))),
+    EmfPlusBrushRef::Color(color) => Some(EmfPlusRenderBrush::Solid(
+      emf_plus_argb_to_render_color(color),
+    )),
     EmfPlusBrushRef::ObjectId(id) => match state.emf_plus_objects.get(id as usize)? {
       Some(EmfPlusRenderObject::Brush(brush)) => brush.clone(),
-      Some(EmfPlusRenderObject::Pen(Some(pen))) => Some(EmfPlusRenderBrush::Solid(pen.color)),
+      Some(EmfPlusRenderObject::Pen(Some(pen))) => {
+        Some(EmfPlusRenderBrush::Solid(EmfPlusRenderColor {
+          color: pen.color,
+          alpha: pen.alpha,
+        }))
+      }
       _ => None,
     },
   }
 }
 
-fn emf_plus_brush_ref_to_color(brush: EmfPlusBrushRef, state: &EmfVectorState) -> Option<EmfColor> {
+fn emf_plus_brush_ref_to_color(
+  brush: EmfPlusBrushRef,
+  state: &EmfVectorState,
+) -> Option<EmfPlusRenderColor> {
   emf_plus_brush_ref(brush, state).map(|brush| brush.representative_color())
 }
 
 fn emf_plus_pen(id: u8, state: &EmfVectorState) -> Option<EmfPen> {
   match state.emf_plus_objects.get(id as usize)? {
     Some(EmfPlusRenderObject::Pen(pen)) => pen.map(|pen| state.resolve_pen(pen)),
-    Some(EmfPlusRenderObject::Brush(Some(brush))) => Some(EmfPen {
-      color: brush.representative_color(),
-      width: 1,
-      transform_width: false,
-    }),
+    Some(EmfPlusRenderObject::Brush(Some(brush))) => {
+      let color = brush.representative_color();
+      Some(EmfPen {
+        color: color.color,
+        alpha: color.alpha,
+        width: 1,
+        transform_width: false,
+      })
+    }
     _ => None,
   }
 }
 
-fn emf_plus_argb_to_color(color: crate::EmfPlusArgb) -> EmfColor {
-  EmfColor {
-    r: color.red,
-    g: color.green,
-    b: color.blue,
+fn emf_plus_argb_to_render_color(color: crate::EmfPlusArgb) -> EmfPlusRenderColor {
+  EmfPlusRenderColor {
+    color: EmfColor {
+      r: color.red,
+      g: color.green,
+      b: color.blue,
+    },
+    alpha: color.alpha,
+  }
+}
+
+fn lerp_emf_plus_color(
+  start: EmfPlusRenderColor,
+  end: EmfPlusRenderColor,
+  t: f32,
+) -> EmfPlusRenderColor {
+  let t = t.clamp(0.0, 1.0);
+  EmfPlusRenderColor {
+    color: lerp_color(start.color, end.color, t),
+    alpha: (start.alpha as f32 + (end.alpha as f32 - start.alpha as f32) * t).round() as u8,
+  }
+}
+
+fn average_emf_plus_color(a: EmfPlusRenderColor, b: EmfPlusRenderColor) -> EmfPlusRenderColor {
+  EmfPlusRenderColor {
+    color: average_color(a.color, b.color),
+    alpha: ((u16::from(a.alpha) + u16::from(b.alpha)) / 2) as u8,
   }
 }
 
@@ -7060,7 +7628,7 @@ fn draw_emf_plus_string(value: EmfPlusDrawStringData, state: &mut EmfVectorState
     value.layout_rect.x.round() as i32,
     value.layout_rect.y.round() as i32 + height,
     &text,
-    color,
+    color.color,
     height,
   );
 }
@@ -8282,6 +8850,166 @@ fn emf_natural_canvas_size(data: &[u8]) -> Result<(usize, usize), String> {
   ))
 }
 
+#[derive(Clone, Copy, Debug)]
+struct EmfPlaybackGeometry {
+  width: usize,
+  height: usize,
+  origin_x: f32,
+  origin_y: f32,
+  scale_x: f32,
+  scale_y: f32,
+}
+
+fn emf_playback_geometry(data: &[u8]) -> Result<EmfPlaybackGeometry, String> {
+  let (width, height) = emf_natural_canvas_size(data)?;
+  let bounds_origin = (
+    read_i32(data, EMF_BOUNDS_LEFT_OFFSET)? as f32,
+    read_i32(data, EMF_BOUNDS_TOP_OFFSET)? as f32,
+  );
+  let frame_left = read_i32(data, EMF_FRAME_LEFT_OFFSET)?;
+  let frame_top = read_i32(data, EMF_FRAME_TOP_OFFSET)?;
+  let frame_right = read_i32(data, EMF_FRAME_RIGHT_OFFSET)?;
+  let frame_bottom = read_i32(data, EMF_FRAME_BOTTOM_OFFSET)?;
+  let device_width = read_i32(data, EMF_DEVICE_WIDTH_OFFSET)?.unsigned_abs();
+  let device_height = read_i32(data, EMF_DEVICE_HEIGHT_OFFSET)?.unsigned_abs();
+  let millimeters_width = read_i32(data, EMF_MILLIMETERS_WIDTH_OFFSET)?.unsigned_abs();
+  let millimeters_height = read_i32(data, EMF_MILLIMETERS_HEIGHT_OFFSET)?.unsigned_abs();
+  if frame_left == frame_right
+    || frame_top == frame_bottom
+    || device_width == 0
+    || device_height == 0
+    || millimeters_width == 0
+    || millimeters_height == 0
+  {
+    // Header.Bounds is only a last-resort playback surface when the physical
+    // Frame/reference-device tuple is unavailable. In that fallback case its
+    // nonzero origin must still map to the first destination pixel.
+    return Ok(EmfPlaybackGeometry {
+      width,
+      height,
+      origin_x: bounds_origin.0,
+      origin_y: bounds_origin.1,
+      scale_x: 1.0,
+      scale_y: 1.0,
+    });
+  }
+
+  let device_coordinate = |frame: i32, device: u32, millimeters: u32| {
+    frame as f64 * f64::from(device) / (f64::from(millimeters) * 100.0)
+  };
+  let origin_x = device_coordinate(frame_left, device_width, millimeters_width);
+  let origin_y = device_coordinate(frame_top, device_height, millimeters_height);
+  let extent_x = device_coordinate(
+    frame_right.saturating_sub(frame_left),
+    device_width,
+    millimeters_width,
+  );
+  let extent_y = device_coordinate(
+    frame_bottom.saturating_sub(frame_top),
+    device_height,
+    millimeters_height,
+  );
+
+  // PlayEnhMetaFile maps Header.Frame, expressed in 0.01 mm, onto the caller's
+  // destination rectangle. Keep that outer playback transform separate from
+  // the recorded world/page transforms. Header.Bounds encloses ink and is not
+  // a substitute for this translation (Wine enhmetafile.c; LibreOffice
+  // EmfPlusHelperData::mappingChanged).
+  Ok(EmfPlaybackGeometry {
+    width,
+    height,
+    origin_x: origin_x as f32,
+    origin_y: origin_y as f32,
+    scale_x: (width as f64 / extent_x) as f32,
+    scale_y: (height as f64 / extent_y) as f32,
+  })
+}
+
+fn emf_gdiplus_playback_geometry(data: &[u8]) -> Result<EmfPlaybackGeometry, String> {
+  let fallback = emf_playback_geometry(data)?;
+  let frame_left = read_i32(data, EMF_FRAME_LEFT_OFFSET)?;
+  let frame_top = read_i32(data, EMF_FRAME_TOP_OFFSET)?;
+  let frame_right = read_i32(data, EMF_FRAME_RIGHT_OFFSET)?;
+  let frame_bottom = read_i32(data, EMF_FRAME_BOTTOM_OFFSET)?;
+  let device_width = read_i32(data, EMF_DEVICE_WIDTH_OFFSET)?.unsigned_abs();
+  let device_height = read_i32(data, EMF_DEVICE_HEIGHT_OFFSET)?.unsigned_abs();
+  let millimeters_width = read_i32(data, EMF_MILLIMETERS_WIDTH_OFFSET)?.unsigned_abs();
+  let millimeters_height = read_i32(data, EMF_MILLIMETERS_HEIGHT_OFFSET)?.unsigned_abs();
+  if frame_left == frame_right
+    || frame_top == frame_bottom
+    || device_width == 0
+    || device_height == 0
+    || millimeters_width == 0
+    || millimeters_height == 0
+  {
+    return Ok(fallback);
+  }
+
+  let device_coordinate = |frame: i64, device: u32, millimeters: u32| {
+    frame as f64 * f64::from(device) / (f64::from(millimeters) * 100.0)
+  };
+  let origin_x = device_coordinate(i64::from(frame_left), device_width, millimeters_width).round();
+  let origin_y = device_coordinate(i64::from(frame_top), device_height, millimeters_height).round();
+  let width = device_coordinate(
+    i64::from(frame_right) - i64::from(frame_left),
+    device_width,
+    millimeters_width,
+  )
+  .abs()
+  .round()
+  .max(0.0) as usize
+    + 1;
+  let height = device_coordinate(
+    i64::from(frame_bottom) - i64::from(frame_top),
+    device_height,
+    millimeters_height,
+  )
+  .abs()
+  .round()
+  .max(0.0) as usize
+    + 1;
+
+  // GDI+ exposes Header.X/Y as the rounded reference-device frame origin and
+  // Header.Width/Height as the rounded frame extent plus one: the EMF frame
+  // is inclusive. Office's PDF metafile Forms retain that coordinate surface.
+  // This is distinct from PlayEnhMetaFile's outer destination transform used
+  // by raster replay. See libgdiplus/src/metafile.c:gdip_read_emf_header().
+  Ok(EmfPlaybackGeometry {
+    width,
+    height,
+    origin_x: origin_x as f32,
+    origin_y: origin_y as f32,
+    scale_x: 1.0,
+    scale_y: 1.0,
+  })
+}
+
+fn emf_plus_units_to_device_scale(
+  unit: EmfPlusUnitType,
+  page_scale: f32,
+  logical_dpi: f32,
+  video_display: bool,
+) -> f32 {
+  let dpi = logical_dpi.max(1.0);
+  let units_to_pixels = match unit {
+    EmfPlusUnitType::World | EmfPlusUnitType::Pixel => 1.0,
+    EmfPlusUnitType::Display if video_display => 1.0,
+    EmfPlusUnitType::Display => dpi / 100.0,
+    EmfPlusUnitType::Point => dpi / 72.0,
+    EmfPlusUnitType::Inch => dpi,
+    EmfPlusUnitType::Document => dpi / 300.0,
+    EmfPlusUnitType::Millimeter => dpi / 25.4,
+  };
+  if unit == EmfPlusUnitType::Display {
+    // GDI+ ignores PageScale for UnitDisplay. Windows does not emit Display
+    // or World in SetPageTransform, but accepting their playback semantics is
+    // useful for third-party producers.
+    units_to_pixels
+  } else {
+    units_to_pixels * page_scale
+  }
+}
+
 fn emf_physical_size(data: &[u8]) -> Option<MetafilePhysicalSize> {
   const HUNDREDTHS_OF_MILLIMETER_PER_INCH: f32 = 2_540.0;
   let frame_width = (i64::from(read_i32(data, EMF_FRAME_RIGHT_OFFSET).ok()?)
@@ -8303,9 +9031,16 @@ fn emf_physical_size(data: &[u8]) -> Option<MetafilePhysicalSize> {
 }
 
 fn is_emf(data: &[u8]) -> bool {
-  data.len() >= EMF_HEADER_SIZE
-    && matches!(read_u32(data, 0), Ok(1))
-    && matches!(read_u32(data, 4), Ok(size) if size as usize == EMF_HEADER_SIZE)
+  emf_header_record_size(data).is_some()
+}
+
+fn emf_header_record_size(data: &[u8]) -> Option<usize> {
+  if !crate::emf::looks_like_emf(data) {
+    return None;
+  }
+  let size = read_u32(data, 4).ok()? as usize;
+  (size >= crate::emf::EMF_HEADER_MIN_SIZE as usize && size.is_multiple_of(4) && size <= data.len())
+    .then_some(size)
 }
 
 fn extract_emr_ext_text_out_w(
@@ -8605,10 +9340,10 @@ fn apply_binary_raster_operation(
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::emf::EmrStretchBlt;
+  use crate::emf::{EmrAlphaBlend, EmrBitBlt, EmrBlendFunction, EmrStretchBlt};
   use crate::emfplus::{
-    EmfPlusGraphicsVersion, EmfPlusGraphicsVersionValue, EmfPlusHeaderData, EmfPlusRecordFlags,
-    EmfPlusRegionObject, EmfPlusStream,
+    EmfPlusGraphicsVersion, EmfPlusGraphicsVersionValue, EmfPlusHeaderData, EmfPlusRegionObject,
+    EmfPlusSetPageTransformData, EmfPlusStream,
   };
   use crate::wmf::{
     WmfColorRecord, WmfDibCreatePatternBrushRecord, WmfDibStretchBltRecord, WmfDibTarget,
@@ -8622,10 +9357,10 @@ mod tests {
     WmfHeader, WmfMetafile, WmfRecord, WmfRecordData, XForm,
   };
 
-  fn minimal_header_record() -> EmfRecord {
+  fn header_record(right: i32, bottom: i32) -> EmfRecord {
     let mut data = vec![0; 100];
-    data[8..12].copy_from_slice(&1i32.to_le_bytes());
-    data[12..16].copy_from_slice(&1i32.to_le_bytes());
+    data[8..12].copy_from_slice(&right.to_le_bytes());
+    data[12..16].copy_from_slice(&bottom.to_le_bytes());
     data[32..36].copy_from_slice(&crate::emf::EMF_SIGNATURE.to_le_bytes());
     EmfRecord::new(EMR_HEADER, data)
   }
@@ -8833,6 +9568,93 @@ mod tests {
     assert!((physical.height_pt - 45.269_29).abs() < 0.000_1);
     assert_eq!(physical.natural_width_px, 103);
     assert_eq!(physical.natural_height_px, 66);
+  }
+
+  #[test]
+  fn emf_replay_starts_after_a_variable_header_description() {
+    let mut emf = metafile_with_header_bounds(1, 1, vec![set_pixel_record(0, 0, 0x0000_00ff)]);
+    let description = [b'A', 0, b'p', 0, b'p', 0, 0, 0];
+    emf.splice(EMF_HEADER_SIZE..EMF_HEADER_SIZE, description);
+    let header_size = EMF_HEADER_SIZE + description.len();
+    let metafile_size = emf.len();
+    emf[4..8].copy_from_slice(&(header_size as u32).to_le_bytes());
+    emf[48..52].copy_from_slice(&(metafile_size as u32).to_le_bytes());
+    emf[60..64].copy_from_slice(&4u32.to_le_bytes());
+    emf[64..68].copy_from_slice(&(EMF_HEADER_SIZE as u32).to_le_bytes());
+
+    assert_eq!(emf_header_record_size(&emf), Some(header_size));
+    let decoded = decode_metafile_as_raster(&emf, Some("image/x-emf"))
+      .unwrap()
+      .unwrap();
+    let image = image::load_from_memory(&decoded.data).unwrap().to_rgb8();
+    assert_eq!(image.get_pixel(0, 0).0, [255, 0, 0]);
+  }
+
+  #[test]
+  fn emf_playback_maps_nonzero_frame_origin_to_the_output_surface() {
+    let mut emf = metafile_with_header_bounds(59, 39, vec![set_pixel_record(50, 30, 0x0000_00ff)]);
+    emf[EMF_BOUNDS_LEFT_OFFSET..EMF_BOUNDS_LEFT_OFFSET + 4].copy_from_slice(&50i32.to_le_bytes());
+    emf[EMF_BOUNDS_TOP_OFFSET..EMF_BOUNDS_TOP_OFFSET + 4].copy_from_slice(&30i32.to_le_bytes());
+    emf[EMF_FRAME_LEFT_OFFSET..EMF_FRAME_LEFT_OFFSET + 4].copy_from_slice(&1270i32.to_le_bytes());
+    emf[EMF_FRAME_TOP_OFFSET..EMF_FRAME_TOP_OFFSET + 4].copy_from_slice(&762i32.to_le_bytes());
+    emf[EMF_FRAME_RIGHT_OFFSET..EMF_FRAME_RIGHT_OFFSET + 4].copy_from_slice(&1524i32.to_le_bytes());
+    emf[EMF_FRAME_BOTTOM_OFFSET..EMF_FRAME_BOTTOM_OFFSET + 4]
+      .copy_from_slice(&1016i32.to_le_bytes());
+    emf[EMF_DEVICE_WIDTH_OFFSET..EMF_DEVICE_WIDTH_OFFSET + 4]
+      .copy_from_slice(&1000i32.to_le_bytes());
+    emf[EMF_DEVICE_HEIGHT_OFFSET..EMF_DEVICE_HEIGHT_OFFSET + 4]
+      .copy_from_slice(&1000i32.to_le_bytes());
+    emf[EMF_MILLIMETERS_WIDTH_OFFSET..EMF_MILLIMETERS_WIDTH_OFFSET + 4]
+      .copy_from_slice(&254i32.to_le_bytes());
+    emf[EMF_MILLIMETERS_HEIGHT_OFFSET..EMF_MILLIMETERS_HEIGHT_OFFSET + 4]
+      .copy_from_slice(&254i32.to_le_bytes());
+
+    let decoded =
+      decode_vector_emf_as_png(&emf, RenderOptions::default(), GdiTextSurface::Color).unwrap();
+    let image = image::load_from_memory(&decoded.data).unwrap().to_rgb8();
+
+    assert_eq!(image.dimensions(), (10, 10));
+    assert_eq!(image.get_pixel(0, 0).0, [255, 0, 0]);
+  }
+
+  #[test]
+  fn emf_plus_set_page_transform_replaces_page_state_and_preserves_world_state() {
+    let data = metafile_with_header_bounds(9, 9, Vec::new());
+    let mut state = EmfVectorState::new_with_options(&data, RenderOptions::default()).unwrap();
+    process_emf_plus_record(
+      EmfPlusRecordData::Header(EmfPlusHeaderData {
+        graphics_version: EmfPlusGraphicsVersion::from_graphics_version(
+          EmfPlusGraphicsVersionValue::Version1_1,
+        ),
+        emf_plus_flags: 1,
+        logical_dpi_x: 96,
+        logical_dpi_y: 120,
+      }),
+      EmfPlusRecordFlags::empty(),
+      &mut state,
+    )
+    .unwrap();
+    for page_scale in [2.0, 0.5] {
+      process_emf_plus_record(
+        EmfPlusRecordData::SetPageTransform(EmfPlusSetPageTransformData { page_scale }),
+        EmfPlusRecordFlags::from_bits_retain(EmfPlusUnitType::Pixel.raw() as u16),
+        &mut state,
+      )
+      .unwrap();
+    }
+
+    let (x, y) = state.map_point(EmfPoint { x: 4, y: 6 });
+    assert!((x - 2.0).abs() < f32::EPSILON);
+    assert!((y - 3.0).abs() < f32::EPSILON);
+    assert_eq!(state.emf_plus_page_unit, EmfPlusUnitType::Pixel);
+    assert!((state.emf_plus_page_scale - 0.5).abs() < f32::EPSILON);
+    assert!((state.world_transform.m11 - 1.0).abs() < f32::EPSILON);
+    assert!((state.world_transform.m22 - 1.0).abs() < f32::EPSILON);
+
+    assert!(
+      (emf_plus_units_to_device_scale(EmfPlusUnitType::Point, 1.5, 96.0, true) - 2.0).abs()
+        < f32::EPSILON
+    );
   }
 
   #[test]
@@ -9751,6 +10573,7 @@ mod tests {
 
     let pen = state.resolve_pen(EmfPen {
       color: EmfColor { r: 0, g: 0, b: 0 },
+      alpha: u8::MAX,
       width: 100,
       transform_width: true,
     });
@@ -9767,6 +10590,7 @@ mod tests {
         g: 255,
         b: 255,
       },
+      alpha: u8::MAX,
       width: 1,
       transform_width: false,
     };
@@ -9781,6 +10605,72 @@ mod tests {
     state.pens.insert(7, None);
     state.select_object(7);
     assert!(state.current_pen.is_none());
+  }
+
+  #[test]
+  fn emf_fixed_ext_create_null_pen_has_no_required_style_entry() {
+    let mut ext_pen = Vec::with_capacity(44);
+    ext_pen.extend_from_slice(&2u32.to_le_bytes());
+    ext_pen.extend_from_slice(&0u32.to_le_bytes()); // offBmi
+    ext_pen.extend_from_slice(&0u32.to_le_bytes()); // cbBmi
+    ext_pen.extend_from_slice(&0u32.to_le_bytes()); // offBits
+    ext_pen.extend_from_slice(&0u32.to_le_bytes()); // cbBits
+    ext_pen.extend_from_slice(&EmrPenLineStyle::Null.raw().to_le_bytes());
+    ext_pen.extend_from_slice(&0u32.to_le_bytes()); // Width
+    ext_pen.extend_from_slice(&0u32.to_le_bytes()); // BS_SOLID (ignored by PS_NULL)
+    ext_pen.extend_from_slice(&0u32.to_le_bytes()); // ColorRef
+    ext_pen.extend_from_slice(&0u32.to_le_bytes()); // BrushHatch
+    ext_pen.extend_from_slice(&0u32.to_le_bytes()); // NumStyleEntries
+    assert_eq!(ext_pen.len() + EMF_RECORD_HEADER_SIZE, 52);
+
+    let metafile = metafile_with_header_bounds(
+      9,
+      9,
+      vec![
+        create_solid_brush_record(1, 0x0000_00ff),
+        select_object_record(1),
+        EmfRecord::new(super::EMR_EXT_CREATE_PEN, ext_pen),
+        select_object_record(2),
+        triangle_polygon16_record(),
+      ],
+    );
+    let decoded = decode_metafile_as_raster(&metafile, Some("image/x-emf"))
+      .unwrap()
+      .unwrap();
+    let image = image::load_from_memory(&decoded.data).unwrap().to_rgb8();
+
+    assert!(image.pixels().any(|pixel| pixel.0 == [255, 0, 0]));
+    assert!(
+      image.pixels().all(|pixel| pixel.0 != [0, 0, 0]),
+      "a 52-byte PS_NULL pen must not fall back to the default black pen"
+    );
+
+    let scene = extract_metafile_vector_scene(&metafile, Some("image/x-emf"))
+      .unwrap()
+      .expect("solid fill scene");
+    assert_eq!(scene.fills.len(), 1);
+    assert_eq!(scene.fills[0].color, [255, 0, 0]);
+    assert_eq!(scene.fills[0].fill_rule, MetafileVectorFillRule::Alternate);
+    assert_eq!(scene.fills[0].subpaths.len(), 1);
+  }
+
+  #[test]
+  fn metafile_vector_scene_rejects_a_visible_polygon_pen() {
+    let metafile = metafile_with_header_bounds(
+      9,
+      9,
+      vec![
+        create_solid_brush_record(1, 0x0000_00ff),
+        select_object_record(1),
+        triangle_polygon16_record(),
+      ],
+    );
+
+    assert_eq!(
+      extract_metafile_vector_scene(&metafile, Some("image/x-emf")).unwrap(),
+      None,
+      "a fill-only scene must not silently discard the default black outline"
+    );
   }
 
   #[test]
@@ -9822,6 +10712,28 @@ mod tests {
         r: u8::MAX,
         g: u8::MAX,
         b: u8::MAX,
+      }
+    );
+  }
+
+  #[test]
+  fn emf_alpha_blend_scales_premultiplied_channels_only_once() {
+    assert_eq!(
+      gdi_alpha_blend_color(
+        EmfColor {
+          r: 255,
+          g: 255,
+          b: 255,
+        },
+        // A half-transparent red source is stored premultiplied as R=128.
+        EmfColor { r: 128, g: 0, b: 0 },
+        Some(128),
+        128,
+      ),
+      EmfColor {
+        r: 255,
+        g: 191,
+        b: 191,
       }
     );
   }
@@ -9882,13 +10794,112 @@ mod tests {
     .unwrap()
   }
 
+  fn alpha_blend_record(source_constant_alpha: u8) -> EmfRecord {
+    EmfRecordData::AlphaBlend(EmrAlphaBlend {
+      bounds: RectL {
+        left: 0,
+        top: 0,
+        right: 1,
+        bottom: 0,
+      },
+      dest: PointL { x: 0, y: 0 },
+      dest_size: SizeL { cx: 2, cy: 1 },
+      blend_function: EmrBlendFunction {
+        blend_operation: 0,
+        // [MS-EMF] says BlendFlags MUST be ignored. Adobe's real OLE icon
+        // preview sets this reserved byte to 0x80, so keep the counterexample
+        // in the renderer test instead of normalizing it away.
+        blend_flags: 0x80,
+        source_constant_alpha,
+        alpha_format: EmrAlphaFormat::SourceAlpha.raw(),
+      },
+      source: PointL { x: 0, y: 0 },
+      xform_source: XForm {
+        m11: 1.0,
+        m22: 1.0,
+        ..XForm::default()
+      },
+      background_color_source: ColorRef::default(),
+      color_usage: DibColorUsage::RgbColors.raw(),
+      source_size: SizeL { cx: 2, cy: 1 },
+      bitmap: Some(EmrBitmapBuffer {
+        undefined_space_before_bitmap_info: Vec::new(),
+        bitmap_info: bitmap_info(2, 1, 32, BI_RGB),
+        undefined_space_before_bitmap_bits: Vec::new(),
+        // Bottom-up BGRA: half-transparent premultiplied red, then a
+        // quarter-transparent premultiplied blue.
+        bitmap_bits: vec![0, 0, 128, 128, 64, 0, 0, 64],
+      }),
+      padding: Vec::new(),
+    })
+    .to_record()
+    .unwrap()
+  }
+
+  fn create_solid_brush_record(object_id: u32, color_ref: u32) -> EmfRecord {
+    let mut data = Vec::with_capacity(16);
+    data.extend_from_slice(&object_id.to_le_bytes());
+    data.extend_from_slice(&0u32.to_le_bytes());
+    data.extend_from_slice(&color_ref.to_le_bytes());
+    data.extend_from_slice(&0u32.to_le_bytes());
+    EmfRecord::new(super::EMR_CREATE_BRUSH_INDIRECT, data)
+  }
+
+  fn select_object_record(object_id: u32) -> EmfRecord {
+    EmfRecord::new(super::EMR_SELECT_OBJECT, object_id.to_le_bytes().to_vec())
+  }
+
+  fn triangle_polygon16_record() -> EmfRecord {
+    let mut data = vec![0; 20];
+    data[0..4].copy_from_slice(&2i32.to_le_bytes());
+    data[4..8].copy_from_slice(&2i32.to_le_bytes());
+    data[8..12].copy_from_slice(&7i32.to_le_bytes());
+    data[12..16].copy_from_slice(&7i32.to_le_bytes());
+    data[16..20].copy_from_slice(&3u32.to_le_bytes());
+    for (x, y) in [(2i16, 2i16), (7, 2), (4, 7)] {
+      data.extend_from_slice(&x.to_le_bytes());
+      data.extend_from_slice(&y.to_le_bytes());
+    }
+    EmfRecord::new(super::EMR_POLYGON16, data)
+  }
+
+  fn source_less_bit_blt_record(raster_operation: u32) -> EmfRecord {
+    EmfRecordData::BitBlt(EmrBitBlt {
+      bounds: RectL {
+        left: 0,
+        top: 0,
+        right: 1,
+        bottom: 1,
+      },
+      dest: PointL { x: 0, y: 0 },
+      dest_size: SizeL { cx: 1, cy: 1 },
+      raster_operation,
+      source: PointL::default(),
+      xform_source: XForm {
+        m11: 1.0,
+        m22: 1.0,
+        ..XForm::default()
+      },
+      background_color_source: ColorRef::default(),
+      color_usage: DibColorUsage::RgbColors.raw(),
+      bitmap: None,
+      padding: Vec::new(),
+    })
+    .to_record()
+    .unwrap()
+  }
+
   fn metafile_with(record: EmfRecord) -> Vec<u8> {
     metafile_with_records(vec![record])
   }
 
   fn metafile_with_records(records: Vec<EmfRecord>) -> Vec<u8> {
+    metafile_with_header_bounds(1, 1, records)
+  }
+
+  fn metafile_with_header_bounds(right: i32, bottom: i32, records: Vec<EmfRecord>) -> Vec<u8> {
     let mut all_records = Vec::with_capacity(records.len() + 2);
-    all_records.push(minimal_header_record());
+    all_records.push(header_record(right, bottom));
     all_records.extend(records);
     all_records.push(eof_record());
     EmfMetafile {
@@ -10021,6 +11032,63 @@ mod tests {
   }
 
   #[test]
+  fn emf_negative_window_extent_keeps_stretch_dibits_on_canvas() {
+    let extent_record = |record_type, x: i32, y: i32| {
+      let mut data = Vec::with_capacity(8);
+      data.extend_from_slice(&x.to_le_bytes());
+      data.extend_from_slice(&y.to_le_bytes());
+      EmfRecord::new(record_type, data)
+    };
+    let bits = vec![
+      0, 0, 255, 0, 255, 0, 0, 0, // bottom row: red, green, padding
+      255, 0, 0, 0, 255, 255, 0, 0, // top row: blue, yellow, padding
+    ];
+    let stretch = EmfRecordData::StretchDiBits(EmrStretchDiBits {
+      bounds: RectL {
+        left: 0,
+        top: 0,
+        right: 1,
+        bottom: 1,
+      },
+      dest: PointL { x: 0, y: 0 },
+      source: BitmapSourceBounds {
+        x: 0,
+        y: 0,
+        width: 2,
+        height: 2,
+      },
+      color_usage: DibColorUsage::RgbColors.raw(),
+      raster_operation: 0x00CC_0020,
+      dest_size: SizeL { cx: 2, cy: -2 },
+      bitmap: EmrBitmapBuffer {
+        undefined_space_before_bitmap_info: Vec::new(),
+        bitmap_info: bitmap_info(2, 2, 24, BI_RGB),
+        undefined_space_before_bitmap_bits: Vec::new(),
+        bitmap_bits: bits,
+      },
+      padding: Vec::new(),
+    })
+    .to_record()
+    .unwrap();
+    let emf = metafile_with_header_bounds(
+      1,
+      1,
+      vec![
+        extent_record(super::EMR_SET_VIEWPORT_EXT_EX, 2, 2),
+        extent_record(super::EMR_SET_WINDOW_EXT_EX, 2, -2),
+        stretch,
+      ],
+    );
+
+    let decoded =
+      decode_vector_emf_as_png(&emf, RenderOptions::default(), GdiTextSurface::Color).unwrap();
+    let image = image::load_from_memory(&decoded.data).unwrap().to_rgb8();
+
+    assert_eq!(image.dimensions(), (2, 2));
+    assert!(image.pixels().all(|pixel| pixel.0 != [255, 255, 255]));
+  }
+
+  #[test]
   fn decode_emf_replays_bitmap_with_later_vector_records() {
     let bits = vec![
       255, 255, 255, 255, 255, 255, 0, 0, // bottom row: white, white, padding
@@ -10037,6 +11105,45 @@ mod tests {
     assert_eq!(decoded.content_type, "image/png");
     let image = image::load_from_memory(&decoded.data).unwrap().to_rgb8();
     assert_eq!(image.get_pixel(0, 0).0, [255, 0, 0]);
+  }
+
+  #[test]
+  fn decode_emf_replays_alpha_blend_with_per_pixel_alpha() {
+    let emf = metafile_with_header_bounds(1, 0, vec![alpha_blend_record(255)]);
+    let decoded = decode_metafile_as_raster_with_options(
+      &emf,
+      Some("image/x-emf"),
+      RenderOptions {
+        target_width_px: Some(2),
+        target_height_px: Some(1),
+        max_pixels: Some(2),
+        ..RenderOptions::default()
+      },
+    )
+    .unwrap()
+    .unwrap();
+    let image = image::load_from_memory(&decoded.data).unwrap().to_rgb8();
+
+    assert_eq!(image.dimensions(), (2, 1));
+    assert_eq!(image.get_pixel(0, 0).0, [255, 127, 127]);
+    assert_eq!(image.get_pixel(1, 0).0, [191, 191, 255]);
+  }
+
+  #[test]
+  fn decode_emf_replays_source_less_pattern_bit_blt() {
+    let brush_id = 1;
+    let emf = metafile_with_records(vec![
+      create_solid_brush_record(brush_id, 0x0033_2211),
+      select_object_record(brush_id),
+      source_less_bit_blt_record(0x00F0_0021),
+    ]);
+
+    let decoded = decode_metafile_as_raster(&emf, Some("image/x-emf"))
+      .unwrap()
+      .unwrap();
+    let image = image::load_from_memory(&decoded.data).unwrap().to_rgb8();
+
+    assert_eq!(image.get_pixel(0, 0).0, [0x11, 0x22, 0x33]);
   }
 
   #[test]

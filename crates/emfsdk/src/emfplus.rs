@@ -1192,11 +1192,26 @@ impl EmfPlusObjectAssembler {
     &mut self,
     fragment: EmfPlusObjectRecordData,
   ) -> Result<Option<EmfPlusObjectRecordData>> {
+    self.push_with_validation(fragment, true)
+  }
+
+  pub(crate) fn push_relaxed(
+    &mut self,
+    fragment: EmfPlusObjectRecordData,
+  ) -> Result<Option<EmfPlusObjectRecordData>> {
+    self.push_with_validation(fragment, false)
+  }
+
+  fn push_with_validation(
+    &mut self,
+    fragment: EmfPlusObjectRecordData,
+    validate_semantics: bool,
+  ) -> Result<Option<EmfPlusObjectRecordData>> {
     validate_emf_plus_object_fragment(&fragment)?;
 
     if self.pending.is_none() {
       if !fragment.continues {
-        fragment.parse_object_data()?;
+        fragment.parse_object_data_with_validation(validate_semantics)?;
         return Ok(Some(fragment));
       }
       let total_object_size = fragment.total_object_size.ok_or_else(|| {
@@ -1268,7 +1283,7 @@ impl EmfPlusObjectAssembler {
       total_object_size: None,
       object_data: pending.object_data,
     };
-    complete.parse_object_data()?;
+    complete.parse_object_data_with_validation(validate_semantics)?;
     Ok(Some(complete))
   }
 
@@ -1309,6 +1324,17 @@ impl EmfPlusObjectRecordData {
   }
 
   pub fn parse_object_data(&self) -> Result<EmfPlusObjectData> {
+    self.parse_object_data_with_validation(true)
+  }
+
+  pub(crate) fn parse_object_data_relaxed(&self) -> Result<EmfPlusObjectData> {
+    self.parse_object_data_with_validation(false)
+  }
+
+  fn parse_object_data_with_validation(
+    &self,
+    validate_semantics: bool,
+  ) -> Result<EmfPlusObjectData> {
     if self.continues {
       return Ok(EmfPlusObjectData::Unknown {
         object_type_raw: self.object_type_raw,
@@ -1340,7 +1366,7 @@ impl EmfPlusObjectRecordData {
         read_emf_plus_path_object(&mut reader, data_len)?,
       )),
       Some(EmfPlusObjectType::Pen) if self.object_data.len() >= 8 => Ok(EmfPlusObjectData::Pen(
-        read_emf_plus_pen_object(&mut reader, data_len)?,
+        read_emf_plus_pen_object(&mut reader, data_len, validate_semantics)?,
       )),
       Some(EmfPlusObjectType::Region) if self.object_data.len() >= 8 => Ok(
         EmfPlusObjectData::Region(read_emf_plus_region_object(&mut reader, data_len)?),
@@ -1467,26 +1493,46 @@ impl EmfPlusBrushObject {
   }
 
   pub fn parse_brush_data(&self) -> Result<EmfPlusBrushData> {
+    self.parse_brush_data_with_validation(true)
+  }
+
+  pub(crate) fn parse_brush_data_relaxed(&self) -> Result<EmfPlusBrushData> {
+    self.parse_brush_data_with_validation(false)
+  }
+
+  fn parse_brush_data_with_validation(&self, validate_semantics: bool) -> Result<EmfPlusBrushData> {
     let mut reader = Reader::new(std::io::Cursor::new(self.brush_data.as_slice()));
     let data_len = self.brush_data.len() as u64;
     match self.brush_kind() {
-      Some(EmfPlusBrushType::SolidColor) if self.brush_data.len() >= 4 => Ok(
-        EmfPlusBrushData::Solid(read_emf_plus_solid_brush_data(&mut reader, data_len)?),
-      ),
-      Some(EmfPlusBrushType::HatchFill) if self.brush_data.len() >= 12 => Ok(
-        EmfPlusBrushData::Hatch(read_emf_plus_hatch_brush_data(&mut reader, data_len)?),
-      ),
-      Some(EmfPlusBrushType::TextureFill) if self.brush_data.len() >= 8 => Ok(
-        EmfPlusBrushData::Texture(read_emf_plus_texture_brush_data(&mut reader, data_len)?),
-      ),
+      Some(EmfPlusBrushType::SolidColor) if self.brush_data.len() >= 4 => {
+        Ok(EmfPlusBrushData::Solid(read_emf_plus_solid_brush_data(
+          &mut reader,
+          data_len,
+          validate_semantics,
+        )?))
+      }
+      Some(EmfPlusBrushType::HatchFill) if self.brush_data.len() >= 12 => {
+        Ok(EmfPlusBrushData::Hatch(read_emf_plus_hatch_brush_data(
+          &mut reader,
+          data_len,
+          validate_semantics,
+        )?))
+      }
+      Some(EmfPlusBrushType::TextureFill) if self.brush_data.len() >= 8 => {
+        Ok(EmfPlusBrushData::Texture(read_emf_plus_texture_brush_data(
+          &mut reader,
+          data_len,
+          validate_semantics,
+        )?))
+      }
       Some(EmfPlusBrushType::PathGradient) if self.brush_data.len() >= 24 => {
         Ok(EmfPlusBrushData::PathGradient(
-          read_emf_plus_path_gradient_brush_data(&mut reader, data_len)?,
+          read_emf_plus_path_gradient_brush_data(&mut reader, data_len, validate_semantics)?,
         ))
       }
       Some(EmfPlusBrushType::LinearGradient) if self.brush_data.len() >= 44 => {
         Ok(EmfPlusBrushData::LinearGradient(
-          read_emf_plus_linear_gradient_brush_data(&mut reader, data_len)?,
+          read_emf_plus_linear_gradient_brush_data(&mut reader, data_len, validate_semantics)?,
         ))
       }
       Some(_) => Err(Error::invalid(
@@ -2839,11 +2885,22 @@ impl EmfPlusPenObject {
   }
 
   pub fn parse_pen_payload(&self) -> Result<EmfPlusPenPayload> {
+    self.parse_pen_payload_with_validation(true)
+  }
+
+  pub(crate) fn parse_pen_payload_relaxed(&self) -> Result<EmfPlusPenPayload> {
+    self.parse_pen_payload_with_validation(false)
+  }
+
+  fn parse_pen_payload_with_validation(
+    &self,
+    validate_semantics: bool,
+  ) -> Result<EmfPlusPenPayload> {
     let mut reader = Reader::new(std::io::Cursor::new(
       self.pen_data_and_brush_object.as_slice(),
     ));
     let data_len = self.pen_data_and_brush_object.len() as u64;
-    let pen_data = read_emf_plus_pen_data(&mut reader, data_len)?;
+    let pen_data = read_emf_plus_pen_data(&mut reader, data_len, validate_semantics)?;
     let start = reader.position()?;
     if start >= data_len {
       return Err(Error::invalid(start, "EmfPlusPen BrushObject is missing"));
@@ -6446,19 +6503,23 @@ fn read_emf_plus_brush_object<R: std::io::Read + std::io::Seek>(
 fn read_emf_plus_solid_brush_data<R: std::io::Read + std::io::Seek>(
   reader: &mut Reader<R>,
   data_len: u64,
+  validate_semantics: bool,
 ) -> Result<EmfPlusSolidBrushData> {
   let solid_color = EmfPlusArgb::read_from(reader)?;
   let value = EmfPlusSolidBrushData {
     solid_color,
     trailing_data: read_remaining_vec(reader, data_len, "EmfPlusSolidBrushData trailing data")?,
   };
-  validate_solid_brush_data(&value)?;
+  if validate_semantics {
+    validate_solid_brush_data(&value)?;
+  }
   Ok(value)
 }
 
 fn read_emf_plus_hatch_brush_data<R: std::io::Read + std::io::Seek>(
   reader: &mut Reader<R>,
   data_len: u64,
+  validate_semantics: bool,
 ) -> Result<EmfPlusHatchBrushData> {
   let hatch_style = reader.read_u32()?;
   let fore_color = EmfPlusArgb::read_from(reader)?;
@@ -6469,13 +6530,16 @@ fn read_emf_plus_hatch_brush_data<R: std::io::Read + std::io::Seek>(
     back_color,
     trailing_data: read_remaining_vec(reader, data_len, "EmfPlusHatchBrushData trailing data")?,
   };
-  validate_hatch_brush_data(&value)?;
+  if validate_semantics {
+    validate_hatch_brush_data(&value)?;
+  }
   Ok(value)
 }
 
 fn read_emf_plus_linear_gradient_brush_data<R: std::io::Read + std::io::Seek>(
   reader: &mut Reader<R>,
   data_len: u64,
+  validate_semantics: bool,
 ) -> Result<EmfPlusLinearGradientBrushData> {
   let brush_data_flags = reader.read_u32()?;
   let wrap_mode = reader.read_i32()?;
@@ -6498,7 +6562,9 @@ fn read_emf_plus_linear_gradient_brush_data<R: std::io::Read + std::io::Seek>(
       "EmfPlusLinearGradientBrushData OptionalData",
     )?,
   };
-  validate_linear_gradient_brush_data(&value)?;
+  if validate_semantics {
+    validate_linear_gradient_brush_data(&value)?;
+  }
   Ok(value)
 }
 
@@ -6534,6 +6600,7 @@ fn read_emf_plus_linear_gradient_optional_data<R: std::io::Read + std::io::Seek>
 fn read_emf_plus_path_gradient_brush_data<R: std::io::Read + std::io::Seek>(
   reader: &mut Reader<R>,
   data_len: u64,
+  validate_semantics: bool,
 ) -> Result<EmfPlusPathGradientBrushData> {
   let brush_data_flags = reader.read_u32()?;
   let wrap_mode = reader.read_i32()?;
@@ -6565,7 +6632,9 @@ fn read_emf_plus_path_gradient_brush_data<R: std::io::Read + std::io::Seek>(
       "EmfPlusPathGradient BoundaryData and OptionalData",
     )?,
   };
-  validate_path_gradient_brush_data(&value)?;
+  if validate_semantics {
+    validate_path_gradient_brush_data(&value)?;
+  }
   Ok(value)
 }
 
@@ -6774,6 +6843,7 @@ fn read_emf_plus_palette_prefix<R: std::io::Read + std::io::Seek>(
 fn read_emf_plus_texture_brush_data<R: std::io::Read + std::io::Seek>(
   reader: &mut Reader<R>,
   data_len: u64,
+  validate_semantics: bool,
 ) -> Result<EmfPlusTextureBrushData> {
   let brush_data_flags = reader.read_u32()?;
   let wrap_mode = reader.read_i32()?;
@@ -6782,7 +6852,9 @@ fn read_emf_plus_texture_brush_data<R: std::io::Read + std::io::Seek>(
     wrap_mode,
     optional_data: read_remaining_vec(reader, data_len, "EmfPlusTextureBrushData OptionalData")?,
   };
-  validate_texture_brush_data(&value)?;
+  if validate_semantics {
+    validate_texture_brush_data(&value)?;
+  }
   Ok(value)
 }
 
@@ -7138,6 +7210,7 @@ fn read_path_point_types<R: std::io::Read + std::io::Seek>(
 fn read_emf_plus_pen_object<R: std::io::Read + std::io::Seek>(
   reader: &mut Reader<R>,
   data_len: u64,
+  validate_semantics: bool,
 ) -> Result<EmfPlusPenObject> {
   let version = EmfPlusGraphicsVersion {
     value: reader.read_u32()?,
@@ -7152,20 +7225,30 @@ fn read_emf_plus_pen_object<R: std::io::Read + std::io::Seek>(
       "EmfPlusPen PenData and BrushObject",
     )?,
   };
-  validate_pen_object(&value)?;
+  if validate_semantics {
+    validate_pen_object(&value)?;
+  } else {
+    value.parse_pen_payload_relaxed()?;
+  }
   Ok(value)
 }
 
 fn read_emf_plus_pen_data<R: std::io::Read + std::io::Seek>(
   reader: &mut Reader<R>,
   data_len: u64,
+  validate_semantics: bool,
 ) -> Result<EmfPlusPenData> {
   ensure_remaining(reader, data_len, 12, "EmfPlusPenData")?;
   let pen_data_flags = reader.read_u32()?;
   let pen_unit = reader.read_u32()?;
   let pen_width = reader.read_f32()?;
   let flags = EmfPlusPenDataFlags::from_bits_retain(pen_data_flags);
-  let optional_data = read_emf_plus_pen_optional_data(reader, data_len, flags)?;
+  validate_flag_bits(
+    pen_data_flags,
+    EmfPlusPenDataFlags::all().bits(),
+    "EmfPlusPenData PenDataFlags",
+  )?;
+  let optional_data = read_emf_plus_pen_optional_data(reader, data_len, flags, validate_semantics)?;
   let value = EmfPlusPenData {
     pen_data_flags,
     pen_unit,
@@ -7173,8 +7256,10 @@ fn read_emf_plus_pen_data<R: std::io::Read + std::io::Seek>(
     optional_data,
     trailing_data: Vec::new(),
   };
-  validate_pen_data(&value)?;
-  value.optional_data.validate_for_flags(flags)?;
+  if validate_semantics {
+    validate_pen_data(&value)?;
+    value.optional_data.validate_for_flags(flags)?;
+  }
   Ok(value)
 }
 
@@ -7182,6 +7267,7 @@ fn read_emf_plus_pen_optional_data<R: std::io::Read + std::io::Seek>(
   reader: &mut Reader<R>,
   data_len: u64,
   flags: EmfPlusPenDataFlags,
+  validate_semantics: bool,
 ) -> Result<EmfPlusPenOptionalData> {
   let mut optional_data = EmfPlusPenOptionalData::default();
   if flags.contains(EmfPlusPenDataFlags::TRANSFORM) {
@@ -7237,7 +7323,9 @@ fn read_emf_plus_pen_optional_data<R: std::io::Read + std::io::Seek>(
   }
   if flags.contains(EmfPlusPenDataFlags::COMPOUND_LINE) {
     let values = read_f32_array_with_u32_count(reader, data_len, "EmfPlusCompoundLineData")?;
-    validate_increasing_unit_interval_values(&values, "EmfPlusCompoundLineData")?;
+    if validate_semantics {
+      validate_increasing_unit_interval_values(&values, "EmfPlusCompoundLineData")?;
+    }
     optional_data.compound_line_data = Some(EmfPlusCompoundLineData {
       compound_line_data: values,
     });
@@ -15908,6 +15996,106 @@ mod tests {
       custom_line_cap_data: invalid_arrow_bytes,
     };
     assert!(invalid_arrow_cap_object.parse_cap_data().is_err());
+  }
+
+  #[test]
+  fn emf_plus_relaxed_pen_playback_keeps_a_structurally_locatable_brush() {
+    let mut pen_payload = Vec::new();
+    pen_payload.extend_from_slice(
+      &(EmfPlusPenDataFlags::MITER_LIMIT
+        | EmfPlusPenDataFlags::DASHED_LINE_CAP
+        | EmfPlusPenDataFlags::DASHED_LINE_OFFSET)
+        .bits()
+        .to_le_bytes(),
+    );
+    // ChemDraw's TestDrawLine.emf keeps the spec-defined PenData boundary,
+    // then writes a solid BrushObject with an invalid GraphicsVersion and two
+    // trailing DWORDs. LibreOffice deliberately consumes the first color at
+    // that boundary (#c01002, alpha 0xdb) and ignores the producer tail.
+    pen_payload.extend_from_slice(&EmfPlusUnitType::World.raw().to_le_bytes());
+    pen_payload.extend_from_slice(&50.0f32.to_le_bytes());
+    pen_payload.extend_from_slice(&f32::from_bits(2).to_le_bytes());
+    pen_payload.extend_from_slice(&EmfPlusDashedLineCapType::Round.raw().to_le_bytes());
+    pen_payload.extend_from_slice(&2.0f32.to_le_bytes());
+    pen_payload.extend_from_slice(&2u32.to_le_bytes());
+    pen_payload.extend_from_slice(&EmfPlusBrushType::SolidColor.raw().to_le_bytes());
+    pen_payload.extend_from_slice(&test_graphics_version().value.to_le_bytes());
+    pen_payload.extend_from_slice(&EmfPlusBrushType::SolidColor.raw().to_le_bytes());
+    pen_payload.extend_from_slice(&0xFF00_0000u32.to_le_bytes());
+    let pen = EmfPlusPenObject {
+      version: test_graphics_version(),
+      pen_type: 0,
+      pen_data_and_brush_object: pen_payload,
+    };
+
+    assert!(pen.validate_strict().is_err());
+    let parsed = pen.parse_pen_payload_relaxed().unwrap();
+    assert_eq!(parsed.pen_data.pen_unit, EmfPlusUnitType::World.raw());
+    assert_eq!(parsed.pen_data.pen_width, 50.0);
+    let brush = parsed.brush_object.unwrap();
+    assert!(brush.parse_brush_data().is_err());
+    assert_eq!(
+      brush.parse_brush_data_relaxed().unwrap(),
+      EmfPlusBrushData::Solid(EmfPlusSolidBrushData {
+        solid_color: EmfPlusArgb {
+          blue: 0x02,
+          green: 0x10,
+          red: 0xC0,
+          alpha: 0xDB,
+        },
+        trailing_data: [0u32.to_le_bytes(), 0xFF00_0000u32.to_le_bytes()].concat(),
+      })
+    );
+
+    let mut object_data = Vec::new();
+    object_data.extend_from_slice(&pen.version.value.to_le_bytes());
+    object_data.extend_from_slice(&pen.pen_type.to_le_bytes());
+    object_data.extend_from_slice(&pen.pen_data_and_brush_object);
+    let object = EmfPlusObjectRecordData {
+      object_id: 0,
+      object_type_raw: EmfPlusObjectType::Pen.raw() as u8,
+      continues: false,
+      total_object_size: None,
+      object_data,
+    };
+
+    assert!(matches!(
+      object.parse_object_data_relaxed().unwrap(),
+      EmfPlusObjectData::Pen(_)
+    ));
+    let mut assembler = EmfPlusObjectAssembler::default();
+    let complete = assembler.push_relaxed(object).unwrap().unwrap();
+    assert_eq!(complete.object_id, 0);
+    assert!(matches!(
+      complete.parse_object_data_relaxed().unwrap(),
+      EmfPlusObjectData::Pen(_)
+    ));
+  }
+
+  #[test]
+  fn emf_plus_libreoffice_draw_lines_record_parses_after_a_malformed_pen() {
+    // Exact EmfPlusDrawLines record from LibreOffice's TestDrawLine.emf. It
+    // immediately follows the producer-tolerant Pen object covered above.
+    let bytes = [
+      0x0D, 0x40, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00,
+      0x00, 0x29, 0xDC, 0xD1, 0x43, 0xF6, 0x08, 0xCA, 0x43, 0xC5, 0xE1, 0x29, 0x44, 0xEC, 0x11,
+      0x7E, 0x43,
+    ];
+    let mut reader = Reader::new(std::io::Cursor::new(bytes));
+    let record = EmfPlusRecord::read_from(&mut reader, bytes.len() as u64).unwrap();
+    let parsed = record.parse_data().unwrap();
+
+    let EmfPlusRecordData::DrawLines(lines) = parsed else {
+      panic!("expected EmfPlusDrawLines");
+    };
+    assert_eq!(lines.pen_id, 0);
+    assert!(!lines.close_shape);
+    let EmfPlusPointData::Float(points) = lines.points else {
+      panic!("expected floating-point line coordinates");
+    };
+    assert_eq!(points.len(), 2);
+    assert!((points[0].x - 419.72).abs() < 0.01);
+    assert!((points[1].y - 254.07).abs() < 0.01);
   }
 
   #[test]
