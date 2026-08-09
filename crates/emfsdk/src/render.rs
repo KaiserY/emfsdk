@@ -1471,9 +1471,16 @@ fn wmf_text_font(value: &crate::wmf::WmfFontObject) -> WmfTextFont {
     .iter()
     .position(|byte| *byte == 0)
     .unwrap_or(face_name.len())];
-  let family = crate::string::SdkEncoding::Windows1252
+  // Real-world META_CREATEFONTINDIRECT records use the selected LOGFONT
+  // charset for both their text and face-name bytes. In particular, Office's
+  // GB2312 records store localized names such as `宋体` in code page 936.
+  // LibreOffice's WMF reader follows the same charset-first conversion. A
+  // Windows-1252-first probe cannot detect this: every DBCS byte is valid in
+  // that single-byte encoding and becomes a different, non-existent family.
+  // Keep the spec-compatible ANSI fallback for unknown vendor charsets.
+  let family = crate::string::SdkEncoding::WmfCharset(value.char_set)
     .decode(face_name)
-    .or_else(|_| crate::string::SdkEncoding::WmfCharset(value.char_set).decode(face_name))
+    .or_else(|_| crate::string::SdkEncoding::Windows1252.decode(face_name))
     .ok()
     .map(|family| family.trim().to_string())
     .filter(|family| !family.is_empty());
@@ -1785,12 +1792,33 @@ impl EmfTransform {
   }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EmfPenWidthSpace {
+  /// The width has already been realized on the output device.
+  Device,
+  /// A WMF logical-object width, mapped as an x-scalar when the object is
+  /// created. [MS-WMF] 3.1.4.2 explicitly excludes the y-scalar.
+  LogicalX,
+  /// An EMF+ `UnitWorld` width, transformed by the active world-to-device
+  /// transform when the pen is used.
+  World,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct EmfPen {
   color: EmfColor,
   alpha: u8,
   width: usize,
-  transform_width: bool,
+  width_space: EmfPenWidthSpace,
+}
+
+fn wmf_pen_width(width: i16) -> (usize, EmfPenWidthSpace) {
+  let logical_width = i32::from(width).unsigned_abs() as usize;
+  if logical_width == 0 {
+    (1, EmfPenWidthSpace::Device)
+  } else {
+    (logical_width, EmfPenWidthSpace::LogicalX)
+  }
 }
 
 fn emf_pen_from_style(style: u32, pen: EmfPen) -> Option<EmfPen> {
@@ -2420,14 +2448,21 @@ impl RenderFontCache {
       Some(face.metrics(FontSize::new(height.max(1.0)), LocationRef::default()))
     });
     if alignment.contains(WmfTextAlignmentModeFlags::BOTTOM) {
-      reference_y + metrics.map_or(0.0, |metrics| metrics.descent)
+      reference_y + metrics.map_or(0.0, |metrics| gdi_realized_font_metric(metrics.descent))
     } else {
       // [MS-WMF] 2.1.2.3 defines the all-zero vertical mode as TA_TOP.
       // Its reference point is the top of the font alignment box, so the
       // baseline is one font ascent below it. `lfHeight` is not the ascent:
       // substituting the character-cell height loses the hhea/OS/2 metrics
-      // used by the GDI font mapper.
-      reference_y + metrics.map_or(height, |metrics| metrics.ascent)
+      // used by the GDI font mapper. NtGdiExtTextOutW consumes integer-device
+      // TEXTMETRIC ascent/descent values after the world-to-device transform;
+      // realize the scaled OpenType metric at that same boundary instead of
+      // carrying a fractional baseline into glyph scan conversion.
+      reference_y
+        + metrics.map_or_else(
+          || gdi_realized_font_metric(height),
+          |metrics| gdi_realized_font_metric(metrics.ascent),
+        )
     }
   }
 
@@ -2520,6 +2555,14 @@ impl RenderFontCache {
         .unwrap_or(advance);
     }
     Some(glyphs)
+  }
+}
+
+fn gdi_realized_font_metric(metric: f32) -> f32 {
+  if metric.is_sign_negative() {
+    -(-metric).round()
+  } else {
+    metric.round()
   }
 }
 
@@ -3151,7 +3194,7 @@ impl EmfVectorState {
         color: EmfColor { r: 0, g: 0, b: 0 },
         alpha: u8::MAX,
         width: 1,
-        transform_width: false,
+        width_space: EmfPenWidthSpace::Device,
       }),
       current_font: None,
       current_pos: EmfPoint { x: 0, y: 0 },
@@ -3209,7 +3252,7 @@ impl EmfVectorState {
   }
 
   fn resolve_pen(&self, mut pen: EmfPen) -> EmfPen {
-    if !pen.transform_width {
+    if pen.width_space == EmfPenWidthSpace::Device {
       return pen;
     }
     let width = pen.width as f32;
@@ -3230,13 +3273,17 @@ impl EmfVectorState {
       width * self.world_transform.m21 * scale_x,
       width * self.world_transform.m22 * scale_y,
     );
-    let width = x_axis.0.hypot(x_axis.1).max(y_axis.0.hypot(y_axis.1));
+    let width = match pen.width_space {
+      EmfPenWidthSpace::Device => unreachable!("device pen returned before width mapping"),
+      EmfPenWidthSpace::LogicalX => x_axis.0.hypot(x_axis.1),
+      EmfPenWidthSpace::World => x_axis.0.hypot(x_axis.1).max(y_axis.0.hypot(y_axis.1)),
+    };
     pen.width = if width.is_finite() {
       width.round().max(1.0) as usize
     } else {
       1
     };
-    pen.transform_width = false;
+    pen.width_space = EmfPenWidthSpace::Device;
     pen
   }
 
@@ -4078,7 +4125,7 @@ impl EmfVectorState {
       color: EmfColor { r: 0, g: 0, b: 0 },
       alpha: u8::MAX,
       width: 1,
-      transform_width: false,
+      width_space: EmfPenWidthSpace::Device,
     });
     self.current_font = None;
     self.current_pos = EmfPoint { x: 0, y: 0 };
@@ -4393,6 +4440,7 @@ impl EmfVectorState {
     if points.len() < 2 {
       return;
     }
+    let pen = self.resolve_pen(pen);
     let mut coverage = vec![false; self.width * self.height];
     for pair in points.windows(2) {
       self.mark_line_coverage(pair[0], pair[1], pen, &mut coverage);
@@ -4566,7 +4614,7 @@ impl EmfVectorState {
           },
           alpha: u8::MAX,
           width: 1,
-          transform_width: false,
+          width_space: EmfPenWidthSpace::Device,
         })
       }
       BLACK_PEN => {
@@ -4574,7 +4622,7 @@ impl EmfVectorState {
           color: EmfColor { r: 0, g: 0, b: 0 },
           alpha: u8::MAX,
           width: 1,
-          transform_width: false,
+          width_space: EmfPenWidthSpace::Device,
         })
       }
       NULL_PEN => self.current_pen = None,
@@ -4722,7 +4770,7 @@ fn decode_vector_emf_as_png(
                 color: read_color_ref(data, pos + 24)?,
                 alpha: u8::MAX,
                 width,
-                transform_width: false,
+                width_space: EmfPenWidthSpace::Device,
               },
             ),
           );
@@ -4752,7 +4800,7 @@ fn decode_vector_emf_as_png(
                 color: read_color_ref(data, pos + 40)?,
                 alpha: u8::MAX,
                 width,
-                transform_width: false,
+                width_space: EmfPenWidthSpace::Device,
               },
             ),
           );
@@ -5771,7 +5819,7 @@ impl WmfRenderState {
           color: EmfColor { r: 0, g: 0, b: 0 },
           alpha: u8::MAX,
           width: 1,
-          transform_width: false,
+          width_space: EmfPenWidthSpace::Device,
         }),
         current_font: None,
         current_pos: EmfPoint { x: 0, y: 0 },
@@ -6094,12 +6142,20 @@ fn decode_wmf_as_raster(
         let pen = if line_style == Some(WmfPenLineStyle::Null) {
           None
         } else {
-          Some(EmfPen {
+          let (width, width_space) = wmf_pen_width(value.pen.width.x);
+          let pen = EmfPen {
             color: color_ref_to_emf(value.pen.color_ref),
             alpha: u8::MAX,
-            width: i32::from(value.pen.width.x).unsigned_abs().max(1) as usize,
-            transform_width: false,
-          })
+            width,
+            // [MS-WMF] 2.2.1.4 ignores width.y; 3.1.4.2 requires a
+            // nonzero logical width to be realized as an x-scalar. Width 0
+            // is the mapping-mode-independent one-device-pixel hairline.
+            width_space,
+          };
+          // A WMF graphics object is realized under the mapping active when
+          // META_CREATEPENINDIRECT is played. Later mapping records must not
+          // retroactively resize the stored pen.
+          Some(state.canvas.resolve_pen(pen))
         };
         state.insert_object(WmfRenderObject::Pen(pen));
       }
@@ -7181,7 +7237,11 @@ fn emf_plus_pen_object(pen: &EmfPlusPenObject) -> Option<EmfPen> {
     color: color.color,
     alpha: color.alpha,
     width: payload.pen_data.pen_width.round().max(1.0) as usize,
-    transform_width: payload.pen_data.pen_unit_kind() == Some(EmfPlusUnitType::World),
+    width_space: if payload.pen_data.pen_unit_kind() == Some(EmfPlusUnitType::World) {
+      EmfPenWidthSpace::World
+    } else {
+      EmfPenWidthSpace::Device
+    },
   })
 }
 
@@ -7222,7 +7282,7 @@ fn emf_plus_pen(id: u8, state: &EmfVectorState) -> Option<EmfPen> {
         color: color.color,
         alpha: color.alpha,
         width: 1,
-        transform_width: false,
+        width_space: EmfPenWidthSpace::Device,
       })
     }
     _ => None,
@@ -8073,25 +8133,41 @@ fn straight_rgba_with_binary_coverage(
   if color_black.len() != color_white.len()
     || color_black.len() != mask_black.len()
     || color_white.len() != mask_white.len()
+    || !color_black.len().is_multiple_of(RGB_BYTES_PER_PIXEL)
   {
     return Err("metafile color and monochrome replay buffers have incompatible lengths".into());
   }
-  let color = straight_rgba_from_black_white(color_black, color_white)?;
-  let mask = straight_rgba_from_black_white(mask_black, mask_white)?;
-  let mut rgba = Vec::with_capacity(color.len());
-  for (color, mask) in color
-    .chunks_exact(BGRA_BYTES_PER_PIXEL)
-    .zip(mask.chunks_exact(BGRA_BYTES_PER_PIXEL))
+  let mut rgba = Vec::with_capacity(color_black.len() / RGB_BYTES_PER_PIXEL * BGRA_BYTES_PER_PIXEL);
+  for (((color_black, color_white), mask_black), mask_white) in color_black
+    .chunks_exact(RGB_BYTES_PER_PIXEL)
+    .zip(color_white.chunks_exact(RGB_BYTES_PER_PIXEL))
+    .zip(mask_black.chunks_exact(RGB_BYTES_PER_PIXEL))
+    .zip(mask_white.chunks_exact(RGB_BYTES_PER_PIXEL))
   {
-    if color[3] == 0 && mask[3] == 0 {
+    // The paired OLE replacement bitmap owns a one-bit destination mask.
+    // ClearType coverage is independent per RGB stripe, so a pixel is
+    // covered when any black/white-matte channel differs from the untouched
+    // 0/255 background pair. Reducing the three stripes to the scalar alpha
+    // used by ordinary transparent images would discard edge pixels whenever
+    // one stripe remains untouched.
+    let color_covered = color_black
+      .iter()
+      .zip(color_white)
+      .any(|(black, white)| white.saturating_sub(*black) != u8::MAX);
+    let mask_covered = mask_black
+      .iter()
+      .zip(mask_white)
+      .any(|(black, white)| white.saturating_sub(*black) != u8::MAX);
+    if !color_covered && !mask_covered {
       rgba.extend_from_slice(&[0, 0, 0, 0]);
-    } else if color[3] != 0 {
-      // Office keeps black/white-matte color recovery independent from the
-      // one-bit OLE replacement mask: source RGB is straight, while every
-      // covered destination pixel is opaque.
-      rgba.extend_from_slice(&[color[0], color[1], color[2], u8::MAX]);
+    } else if color_covered {
+      // Office stores the color replay over its black matte verbatim and
+      // attaches the binary replacement mask separately. This preserves the
+      // realized ClearType stripe values instead of unpremultiplying them as
+      // an ordinary soft-alpha image.
+      rgba.extend_from_slice(&[color_black[0], color_black[1], color_black[2], u8::MAX]);
     } else {
-      rgba.extend_from_slice(&[mask[0], mask[1], mask[2], u8::MAX]);
+      rgba.extend_from_slice(&[mask_black[0], mask_black[1], mask_black[2], u8::MAX]);
     }
   }
   Ok(rgba)
@@ -9500,6 +9576,14 @@ mod tests {
     WmfHeader, WmfMetafile, WmfRecord, WmfRecordData, XForm,
   };
 
+  #[test]
+  fn gdi_font_metrics_are_realized_on_the_integer_device_grid() {
+    assert_eq!(gdi_realized_font_metric(23.740_234), 24.0);
+    assert_eq!(gdi_realized_font_metric(19.009_277), 19.0);
+    assert_eq!(gdi_realized_font_metric(-5.6), -6.0);
+    assert_eq!(gdi_realized_font_metric(-5.4), -5.0);
+  }
+
   fn header_record(right: i32, bottom: i32) -> EmfRecord {
     let mut data = vec![0; 100];
     data[8..12].copy_from_slice(&right.to_le_bytes());
@@ -10718,11 +10802,80 @@ mod tests {
       color: EmfColor { r: 0, g: 0, b: 0 },
       alpha: u8::MAX,
       width: 100,
-      transform_width: true,
+      width_space: EmfPenWidthSpace::World,
     });
 
     assert_eq!(pen.width, 5);
-    assert!(!pen.transform_width);
+    assert_eq!(pen.width_space, EmfPenWidthSpace::Device);
+  }
+
+  #[test]
+  fn wmf_pen_width_is_realized_from_only_the_logical_x_scalar() {
+    let mut data = vec![0; EMF_HEADER_SIZE];
+    data[16..20].copy_from_slice(&2623i32.to_le_bytes());
+    data[20..24].copy_from_slice(&2591i32.to_le_bytes());
+    let mut state = EmfVectorState::new_with_options(
+      &data,
+      RenderOptions {
+        target_width_px: Some(227),
+        target_height_px: Some(225),
+        max_pixels: None,
+        transparent_background: false,
+        background_color: None,
+        monochrome_dib_palette_override: None,
+        filter_high_frequency_pattern_brushes: false,
+        suppress_text: false,
+        suppress_solid_pattern_rects: false,
+        suppress_bitmap_layers: false,
+        wmf_external_header: None,
+      },
+    )
+    .expect("minimal EMF bounds");
+    state.window_ext_x = 2624;
+    state.window_ext_y = 2592;
+    state.viewport_ext_x = 2624;
+    state.viewport_ext_y = 2592;
+
+    let (width, width_space) = wmf_pen_width(16);
+    let pen = state.resolve_pen(EmfPen {
+      color: EmfColor { r: 0, g: 0, b: 0 },
+      alpha: u8::MAX,
+      width,
+      width_space,
+    });
+    assert_eq!(pen.width, 1, "16 logical x units map to 1.38 pixels");
+
+    state.output_scale_y *= 20.0;
+    let y_scaled_pen = state.resolve_pen(EmfPen {
+      color: EmfColor { r: 0, g: 0, b: 0 },
+      alpha: u8::MAX,
+      width,
+      width_space,
+    });
+    assert_eq!(
+      y_scaled_pen.width, 1,
+      "y-only scaling does not change a WMF pen width"
+    );
+
+    state.output_scale_x = 0.2;
+    let x_scaled_pen = state.resolve_pen(EmfPen {
+      color: EmfColor { r: 0, g: 0, b: 0 },
+      alpha: u8::MAX,
+      width,
+      width_space,
+    });
+    assert_eq!(x_scaled_pen.width, 3);
+
+    let (hairline_width, hairline_space) = wmf_pen_width(0);
+    state.output_scale_x = 20.0;
+    let hairline = state.resolve_pen(EmfPen {
+      color: EmfColor { r: 0, g: 0, b: 0 },
+      alpha: u8::MAX,
+      width: hairline_width,
+      width_space: hairline_space,
+    });
+    assert_eq!(hairline.width, 1);
+    assert_eq!(hairline.width_space, EmfPenWidthSpace::Device);
   }
 
   #[test]
@@ -10735,7 +10888,7 @@ mod tests {
       },
       alpha: u8::MAX,
       width: 1,
-      transform_width: false,
+      width_space: EmfPenWidthSpace::Device,
     };
     assert!(emf_pen_from_style(EmrPenLineStyle::Solid.raw(), pen).is_some());
     assert!(emf_pen_from_style(EmrPenLineStyle::Null.raw(), pen).is_none());
@@ -11771,21 +11924,22 @@ mod tests {
   }
 
   #[test]
-  fn binary_coverage_surface_keeps_straight_rgb_without_soft_edges() {
+  fn binary_coverage_surface_keeps_black_matte_rgb_and_any_stripe() {
     let rgba = straight_rgba_with_binary_coverage(
-      &[0, 0, 0, 0, 0, 0, 255, 255, 255],
-      &[13, 8, 4, 255, 255, 255, 255, 255, 255],
-      &[0, 0, 0, 0, 0, 0, 255, 255, 255],
-      &[255, 255, 255, 255, 255, 255, 255, 255, 255],
+      &[0, 0, 0, 0, 0, 0, 255, 255, 255, 32, 0, 0],
+      &[13, 8, 4, 255, 255, 255, 255, 255, 255, 255, 127, 255],
+      &[0, 0, 0, 0, 0, 0, 255, 255, 255, 0, 0, 0],
+      &[255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
     )
     .unwrap();
 
     assert_eq!(
       rgba,
       [
-        0, 0, 0, 255, // ClearType edge: straight RGB with binary coverage
+        0, 0, 0, 255, // ClearType edge: black-matte RGB with binary coverage
         0, 0, 0, 0, // untouched background
         255, 255, 255, 255, // an opaque white source pixel
+        32, 0, 0, 255, // one covered stripe keeps the black-matte RGB sample
       ]
     );
   }
@@ -11902,6 +12056,36 @@ mod tests {
       wmf_text_font(&font).char_set,
       crate::wmf::WmfCharacterSet::Symbol.raw()
     );
+  }
+
+  #[test]
+  fn wmf_face_name_uses_declared_charset_with_ansi_fallback() {
+    let mut face_name = [0; 32];
+    face_name[..4].copy_from_slice(&[0xCB, 0xCE, 0xCC, 0xE5]);
+    let mut font = crate::wmf::WmfFontObject {
+      height: -12,
+      width: 0,
+      escapement: 0,
+      orientation: 0,
+      weight: 400,
+      italic: 0,
+      underline: 0,
+      strike_out: 0,
+      char_set: crate::wmf::WmfCharacterSet::Gb2312.raw(),
+      out_precision: 0,
+      clip_precision: 0,
+      quality: 0,
+      pitch_and_family: 0,
+      face_name,
+      face_name_bytes: 4,
+    };
+    assert_eq!(wmf_text_font(&font).family.as_deref(), Some("宋体"));
+
+    font.face_name = [0; 32];
+    font.face_name[..5].copy_from_slice(b"Arial");
+    font.face_name_bytes = 5;
+    font.char_set = 0xFE;
+    assert_eq!(wmf_text_font(&font).family.as_deref(), Some("Arial"));
   }
 
   #[test]
