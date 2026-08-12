@@ -9,6 +9,7 @@ use skrifa::outline::{
   DrawSettings, HintingInstance, HintingOptions, OutlinePen, SmoothMode, Target,
 };
 use skrifa::prelude::{FontRef, LocationRef, MetadataProvider, Size as FontSize};
+use skrifa::raw::types::Tag as FontTableTag;
 use std::collections::HashMap;
 use thiserror::Error;
 use tiny_skia::{
@@ -21,7 +22,9 @@ use crate::bitmap::{
   BitmapCompression, DeviceIndependentBitmap, DibColorTable, DibColorUsage, DibHeader,
 };
 use crate::common::{Reader, SdkEnumValue};
-use crate::emf::{EmfRecordData, EmfRecordRef, EmrAlphaBlend, EmrAlphaFormat, EmrPenLineStyle};
+use crate::emf::{
+  EmfRecordData, EmfRecordRef, EmrAlphaBlend, EmrAlphaFormat, EmrMapMode, EmrPenLineStyle,
+};
 use crate::emfplus::{
   EmfPlusBitmapPayload, EmfPlusBrushData, EmfPlusBrushRef, EmfPlusDrawArcData,
   EmfPlusDrawImageData, EmfPlusDrawImagePointsData, EmfPlusDrawPointsData,
@@ -69,10 +72,17 @@ const EMR_SET_WINDOW_ORG_EX: u32 = 10;
 const EMR_SET_VIEWPORT_EXT_EX: u32 = 11;
 const EMR_SET_VIEWPORT_ORG_EX: u32 = 12;
 const EMR_SET_PIXEL_V: u32 = 15;
+const EMR_SET_MAP_MODE: u32 = 17;
 const EMR_SET_ROP_2: u32 = 20;
 const EMR_SET_TEXT_ALIGN: u32 = 22;
 const EMR_SET_TEXT_COLOR: u32 = 24;
+const EMR_OFFSET_CLIP_RGN: u32 = 26;
 const EMR_MOVE_TO_EX: u32 = 27;
+const EMR_SET_META_RGN: u32 = 28;
+const EMR_EXCLUDE_CLIP_RECT: u32 = 29;
+const EMR_INTERSECT_CLIP_RECT: u32 = 30;
+const EMR_SCALE_VIEWPORT_EXT_EX: u32 = 31;
+const EMR_SCALE_WINDOW_EXT_EX: u32 = 32;
 const EMR_SAVE_DC: u32 = 33;
 const EMR_RESTORE_DC: u32 = 34;
 const EMR_SET_WORLD_TRANSFORM: u32 = 35;
@@ -105,6 +115,8 @@ const EMR_POLYPOLYLINE16: u32 = 90;
 const EMR_POLYPOLYGON16: u32 = 91;
 const EMR_EXT_CREATE_PEN: u32 = 95;
 const EMR_ALPHA_BLEND: u32 = 114;
+const EMR_SELECT_CLIP_PATH: u32 = 67;
+const EMR_EXT_SELECT_CLIP_RGN: u32 = 75;
 const EMR_BITMAP_DEST_X_OFFSET: usize = 24;
 const EMR_BITMAP_DEST_Y_OFFSET: usize = 28;
 const EMR_BITMAP_SOURCE_WIDTH_OFFSET: usize = 40;
@@ -504,10 +516,16 @@ pub fn extract_metafile_solid_rects_with_options(
   content_type: Option<&str>,
   options: RenderOptions,
 ) -> Vec<MetafileSolidRect> {
-  if !looks_like_metafile(data, content_type) || !crate::wmf::looks_like_wmf(data) {
+  if !looks_like_metafile(data, content_type) {
     return Vec::new();
   }
-  extract_wmf_solid_rects(data, options.wmf_external_header)
+  if is_emf(data) {
+    return extract_emf_solid_rects(data);
+  }
+  if crate::wmf::looks_like_wmf(data) {
+    return extract_wmf_solid_rects(data, options.wmf_external_header);
+  }
+  Vec::new()
 }
 
 /// Returns separable bitmap layers from WMF DIB records.
@@ -567,18 +585,27 @@ fn extract_emf_text_runs(data: &[u8]) -> Vec<MetafileTextRun> {
         state.window_org_y = read_i32(data, pos + 12).unwrap_or(state.window_org_y);
       }
       EMR_SET_WINDOW_EXT_EX if record_size >= 16 => {
-        state.window_ext_x =
-          nonzero_mapping_extent(read_i32(data, pos + 8).unwrap_or(state.window_ext_x));
-        state.window_ext_y =
-          nonzero_mapping_extent(read_i32(data, pos + 12).unwrap_or(state.window_ext_y));
+        if emf_mapping_extents_are_variable(state.map_mode) {
+          state.window_ext_x =
+            nonzero_mapping_extent(read_i32(data, pos + 8).unwrap_or(state.window_ext_x));
+          state.window_ext_y =
+            nonzero_mapping_extent(read_i32(data, pos + 12).unwrap_or(state.window_ext_y));
+        }
       }
       EMR_SET_VIEWPORT_ORG_EX if record_size >= 16 => {
         state.viewport_org_x = read_i32(data, pos + 8).unwrap_or(state.viewport_org_x);
         state.viewport_org_y = read_i32(data, pos + 12).unwrap_or(state.viewport_org_y);
       }
       EMR_SET_VIEWPORT_EXT_EX if record_size >= 16 => {
-        state.viewport_ext_x = read_i32(data, pos + 8).unwrap_or(state.viewport_ext_x);
-        state.viewport_ext_y = read_i32(data, pos + 12).unwrap_or(state.viewport_ext_y);
+        if emf_mapping_extents_are_variable(state.map_mode) {
+          state.viewport_ext_x = read_i32(data, pos + 8).unwrap_or(state.viewport_ext_x);
+          state.viewport_ext_y = read_i32(data, pos + 12).unwrap_or(state.viewport_ext_y);
+        }
+      }
+      EMR_SET_MAP_MODE if record_size >= 12 => {
+        if let Some(map_mode) = EmrMapMode::from_raw(read_u32(data, pos + 8).unwrap_or_default()) {
+          state.map_mode = map_mode;
+        }
       }
       EMR_SET_TEXT_ALIGN if record_size >= 12 => {
         state.text_alignment = WmfTextAlignmentModeFlags::from_bits_retain(
@@ -684,6 +711,424 @@ fn emf_record_uses_destination_raster(
     }
     _ => false,
   }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum EmfSolidRectClip {
+  Infinite,
+  Rect((f32, f32, f32, f32)),
+  Unsupported,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct EmfSolidRectSnapshot {
+  map_mode: EmrMapMode,
+  window_org_x: i32,
+  window_org_y: i32,
+  window_ext_x: i32,
+  window_ext_y: i32,
+  viewport_org_x: i32,
+  viewport_org_y: i32,
+  viewport_ext_x: i32,
+  viewport_ext_y: i32,
+  world_transform: EmfTransform,
+  current_solid_brush: Option<EmfColor>,
+  clip: EmfSolidRectClip,
+}
+
+struct EmfSolidRectState {
+  width: f32,
+  height: f32,
+  playback_origin_x: f32,
+  playback_origin_y: f32,
+  playback_scale_x: f32,
+  playback_scale_y: f32,
+  map_mode: EmrMapMode,
+  window_org_x: i32,
+  window_org_y: i32,
+  window_ext_x: i32,
+  window_ext_y: i32,
+  viewport_org_x: i32,
+  viewport_org_y: i32,
+  viewport_ext_x: i32,
+  viewport_ext_y: i32,
+  world_transform: EmfTransform,
+  brushes: HashMap<u32, Option<EmfColor>>,
+  current_solid_brush: Option<EmfColor>,
+  clip: EmfSolidRectClip,
+  saved: Vec<EmfSolidRectSnapshot>,
+}
+
+impl EmfSolidRectState {
+  fn new(data: &[u8]) -> Result<Self, String> {
+    let geometry = emf_playback_geometry(data)?;
+    Ok(Self {
+      width: geometry.width.max(1) as f32,
+      height: geometry.height.max(1) as f32,
+      playback_origin_x: geometry.origin_x,
+      playback_origin_y: geometry.origin_y,
+      playback_scale_x: geometry.scale_x,
+      playback_scale_y: geometry.scale_y,
+      map_mode: EmrMapMode::Text,
+      window_org_x: 0,
+      window_org_y: 0,
+      window_ext_x: geometry.width as i32,
+      window_ext_y: geometry.height as i32,
+      viewport_org_x: 0,
+      viewport_org_y: 0,
+      viewport_ext_x: geometry.width as i32,
+      viewport_ext_y: geometry.height as i32,
+      world_transform: EmfTransform::identity(),
+      brushes: HashMap::new(),
+      current_solid_brush: None,
+      clip: EmfSolidRectClip::Infinite,
+      saved: Vec::new(),
+    })
+  }
+
+  fn save(&mut self) {
+    self.saved.push(EmfSolidRectSnapshot {
+      map_mode: self.map_mode,
+      window_org_x: self.window_org_x,
+      window_org_y: self.window_org_y,
+      window_ext_x: self.window_ext_x,
+      window_ext_y: self.window_ext_y,
+      viewport_org_x: self.viewport_org_x,
+      viewport_org_y: self.viewport_org_y,
+      viewport_ext_x: self.viewport_ext_x,
+      viewport_ext_y: self.viewport_ext_y,
+      world_transform: self.world_transform,
+      current_solid_brush: self.current_solid_brush,
+      clip: self.clip,
+    });
+  }
+
+  fn restore(&mut self) {
+    let Some(saved) = self.saved.pop() else {
+      return;
+    };
+    self.map_mode = saved.map_mode;
+    self.window_org_x = saved.window_org_x;
+    self.window_org_y = saved.window_org_y;
+    self.window_ext_x = saved.window_ext_x;
+    self.window_ext_y = saved.window_ext_y;
+    self.viewport_org_x = saved.viewport_org_x;
+    self.viewport_org_y = saved.viewport_org_y;
+    self.viewport_ext_x = saved.viewport_ext_x;
+    self.viewport_ext_y = saved.viewport_ext_y;
+    self.world_transform = saved.world_transform;
+    self.current_solid_brush = saved.current_solid_brush;
+    self.clip = saved.clip;
+  }
+
+  fn select_object(&mut self, object_id: u32) {
+    match object_id {
+      WHITE_BRUSH => {
+        self.current_solid_brush = Some(EmfColor {
+          r: 255,
+          g: 255,
+          b: 255,
+        });
+      }
+      BLACK_BRUSH => self.current_solid_brush = Some(EmfColor { r: 0, g: 0, b: 0 }),
+      NULL_BRUSH => self.current_solid_brush = None,
+      // The three gray stock brushes are solid but device-dependent. Keep
+      // them in raster replay instead of inventing a portable RGB value.
+      value if matches!(value, 0x8000_0001..=0x8000_0003) => {
+        self.current_solid_brush = None;
+      }
+      _ => {
+        if let Some(color) = self.brushes.get(&object_id).copied() {
+          self.current_solid_brush = color;
+        }
+      }
+    }
+  }
+
+  fn map_point(&self, point: EmfPoint) -> (f32, f32) {
+    let (x, y) = self.world_transform.apply(point);
+    let (scale_x, scale_y) = emf_window_viewport_scale(
+      self.map_mode,
+      self.window_ext_x,
+      self.window_ext_y,
+      self.viewport_ext_x,
+      self.viewport_ext_y,
+    );
+    (
+      (self.viewport_org_x as f32 + (x - self.window_org_x as f32) * scale_x
+        - self.playback_origin_x)
+        * self.playback_scale_x,
+      (self.viewport_org_y as f32 + (y - self.window_org_y as f32) * scale_y
+        - self.playback_origin_y)
+        * self.playback_scale_y,
+    )
+  }
+
+  fn mapped_axis_aligned_rect(
+    &self,
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+  ) -> Option<(f32, f32, f32, f32)> {
+    let first = self.map_point(EmfPoint { x: left, y: top });
+    let x_edge = self.map_point(EmfPoint { x: right, y: top });
+    let y_edge = self.map_point(EmfPoint { x: left, y: bottom });
+    let opposite = self.map_point(EmfPoint {
+      x: right,
+      y: bottom,
+    });
+    if ![
+      first.0, first.1, x_edge.0, x_edge.1, y_edge.0, y_edge.1, opposite.0, opposite.1,
+    ]
+    .into_iter()
+    .all(f32::is_finite)
+    {
+      return None;
+    }
+
+    let epsilon = 0.01;
+    let x_delta = (x_edge.0 - first.0, x_edge.1 - first.1);
+    let y_delta = (y_edge.0 - first.0, y_edge.1 - first.1);
+    let axis_aligned = (x_delta.1.abs() <= epsilon && y_delta.0.abs() <= epsilon)
+      || (x_delta.0.abs() <= epsilon && y_delta.1.abs() <= epsilon);
+    let closes = (opposite.0 - (first.0 + x_delta.0 + y_delta.0)).abs() <= epsilon
+      && (opposite.1 - (first.1 + x_delta.1 + y_delta.1)).abs() <= epsilon;
+    if !axis_aligned || !closes {
+      return None;
+    }
+
+    Some((
+      first.0.min(x_edge.0).min(y_edge.0).min(opposite.0),
+      first.1.min(x_edge.1).min(y_edge.1).min(opposite.1),
+      first.0.max(x_edge.0).max(y_edge.0).max(opposite.0),
+      first.1.max(x_edge.1).max(y_edge.1).max(opposite.1),
+    ))
+  }
+
+  fn intersect_clip_rect(&mut self, left: i32, top: i32, right: i32, bottom: i32) {
+    let Some(rect) = self.mapped_axis_aligned_rect(left, top, right, bottom) else {
+      self.clip = EmfSolidRectClip::Unsupported;
+      return;
+    };
+    self.clip = match self.clip {
+      EmfSolidRectClip::Infinite => EmfSolidRectClip::Rect(rect),
+      EmfSolidRectClip::Rect(current) => EmfSolidRectClip::Rect(intersect_f32_rects(current, rect)),
+      EmfSolidRectClip::Unsupported => EmfSolidRectClip::Unsupported,
+    };
+  }
+
+  fn solid_rect(&self, x: i32, y: i32, width: i32, height: i32) -> Option<MetafileSolidRect> {
+    let color = self.current_solid_brush?;
+    let right = x.saturating_add(width);
+    let bottom = y.saturating_add(height);
+    let mut rect = self.mapped_axis_aligned_rect(x, y, right, bottom)?;
+    rect = match self.clip {
+      EmfSolidRectClip::Infinite => rect,
+      EmfSolidRectClip::Rect(clip) => intersect_f32_rects(rect, clip),
+      EmfSolidRectClip::Unsupported => return None,
+    };
+    let width = rect.2 - rect.0;
+    let height = rect.3 - rect.1;
+    if width <= 0.0 || height <= 0.0 {
+      return None;
+    }
+    Some(MetafileSolidRect {
+      x: rect.0 / self.width,
+      y: rect.1 / self.height,
+      width: width / self.width,
+      height: height / self.height,
+      color: [color.r, color.g, color.b],
+    })
+  }
+}
+
+fn intersect_f32_rects(
+  first: (f32, f32, f32, f32),
+  second: (f32, f32, f32, f32),
+) -> (f32, f32, f32, f32) {
+  let left = first.0.max(second.0);
+  let top = first.1.max(second.1);
+  let right = first.2.min(second.2).max(left);
+  let bottom = first.3.min(second.3).max(top);
+  (left, top, right, bottom)
+}
+
+fn scale_emf_extent(extent: i32, numerator: i32, denominator: i32) -> Option<i32> {
+  if denominator == 0 {
+    return None;
+  }
+  let scaled = i64::from(extent)
+    .checked_mul(i64::from(numerator))?
+    .checked_div(i64::from(denominator))?;
+  i32::try_from(scaled).ok().map(nonzero_mapping_extent)
+}
+
+fn extract_emf_solid_rects(data: &[u8]) -> Vec<MetafileSolidRect> {
+  let Some(mut pos) = emf_header_record_size(data) else {
+    return Vec::new();
+  };
+  let Ok(mut state) = EmfSolidRectState::new(data) else {
+    return Vec::new();
+  };
+  let mut rects = Vec::new();
+  while pos + EMF_RECORD_HEADER_SIZE <= data.len() {
+    let Ok(record_type) = read_u32(data, pos) else {
+      break;
+    };
+    let Ok(record_size) = read_u32(data, pos + 4) else {
+      break;
+    };
+    let record_size = record_size as usize;
+    if record_size < EMF_RECORD_HEADER_SIZE || pos + record_size > data.len() {
+      break;
+    }
+
+    match record_type {
+      EMR_SET_WINDOW_ORG_EX if record_size >= 16 => {
+        state.window_org_x = read_i32(data, pos + 8).unwrap_or(state.window_org_x);
+        state.window_org_y = read_i32(data, pos + 12).unwrap_or(state.window_org_y);
+      }
+      EMR_SET_WINDOW_EXT_EX if record_size >= 16 => {
+        if emf_mapping_extents_are_variable(state.map_mode) {
+          state.window_ext_x =
+            nonzero_mapping_extent(read_i32(data, pos + 8).unwrap_or(state.window_ext_x));
+          state.window_ext_y =
+            nonzero_mapping_extent(read_i32(data, pos + 12).unwrap_or(state.window_ext_y));
+        }
+      }
+      EMR_SET_VIEWPORT_ORG_EX if record_size >= 16 => {
+        state.viewport_org_x = read_i32(data, pos + 8).unwrap_or(state.viewport_org_x);
+        state.viewport_org_y = read_i32(data, pos + 12).unwrap_or(state.viewport_org_y);
+      }
+      EMR_SET_VIEWPORT_EXT_EX if record_size >= 16 => {
+        if emf_mapping_extents_are_variable(state.map_mode) {
+          state.viewport_ext_x =
+            nonzero_mapping_extent(read_i32(data, pos + 8).unwrap_or(state.viewport_ext_x));
+          state.viewport_ext_y =
+            nonzero_mapping_extent(read_i32(data, pos + 12).unwrap_or(state.viewport_ext_y));
+        }
+      }
+      EMR_SCALE_VIEWPORT_EXT_EX if record_size >= 24 => {
+        if emf_mapping_extents_are_variable(state.map_mode) {
+          let scaled_x = scale_emf_extent(
+            state.viewport_ext_x,
+            read_i32(data, pos + 8).unwrap_or(1),
+            read_i32(data, pos + 12).unwrap_or(1),
+          );
+          let scaled_y = scale_emf_extent(
+            state.viewport_ext_y,
+            read_i32(data, pos + 16).unwrap_or(1),
+            read_i32(data, pos + 20).unwrap_or(1),
+          );
+          let (Some(x), Some(y)) = (scaled_x, scaled_y) else {
+            return Vec::new();
+          };
+          state.viewport_ext_x = x;
+          state.viewport_ext_y = y;
+        }
+      }
+      EMR_SCALE_WINDOW_EXT_EX if record_size >= 24 => {
+        if emf_mapping_extents_are_variable(state.map_mode) {
+          let scaled_x = scale_emf_extent(
+            state.window_ext_x,
+            read_i32(data, pos + 8).unwrap_or(1),
+            read_i32(data, pos + 12).unwrap_or(1),
+          );
+          let scaled_y = scale_emf_extent(
+            state.window_ext_y,
+            read_i32(data, pos + 16).unwrap_or(1),
+            read_i32(data, pos + 20).unwrap_or(1),
+          );
+          let (Some(x), Some(y)) = (scaled_x, scaled_y) else {
+            return Vec::new();
+          };
+          state.window_ext_x = x;
+          state.window_ext_y = y;
+        }
+      }
+      EMR_SET_MAP_MODE if record_size >= 12 => {
+        if let Some(map_mode) = EmrMapMode::from_raw(read_u32(data, pos + 8).unwrap_or_default()) {
+          state.map_mode = map_mode;
+        }
+      }
+      EMR_SAVE_DC => state.save(),
+      EMR_RESTORE_DC => state.restore(),
+      EMR_SET_WORLD_TRANSFORM if record_size >= 32 => {
+        if let Ok(transform) = read_xform(data, pos + 8) {
+          state.world_transform = transform;
+        }
+      }
+      EMR_MODIFY_WORLD_TRANSFORM if record_size >= 36 => {
+        if let (Ok(transform), Ok(mode)) = (read_xform(data, pos + 8), read_u32(data, pos + 32)) {
+          state.world_transform = match mode {
+            MWT_IDENTITY => EmfTransform::identity(),
+            MWT_LEFTMULTIPLY => transform.multiply(state.world_transform),
+            MWT_RIGHTMULTIPLY => state.world_transform.multiply(transform),
+            MWT_SET => transform,
+            _ => state.world_transform,
+          };
+        }
+      }
+      EMR_INTERSECT_CLIP_RECT if record_size >= 24 => state.intersect_clip_rect(
+        read_i32(data, pos + 8).unwrap_or_default(),
+        read_i32(data, pos + 12).unwrap_or_default(),
+        read_i32(data, pos + 16).unwrap_or_default(),
+        read_i32(data, pos + 20).unwrap_or_default(),
+      ),
+      EMR_OFFSET_CLIP_RGN
+      | EMR_SET_META_RGN
+      | EMR_EXCLUDE_CLIP_RECT
+      | EMR_SELECT_CLIP_PATH
+      | EMR_EXT_SELECT_CLIP_RGN => {
+        state.clip = EmfSolidRectClip::Unsupported;
+      }
+      EMR_CREATE_BRUSH_INDIRECT if record_size >= 24 => {
+        let object_id = read_u32(data, pos + 8).unwrap_or(ENHMETA_STOCK_OBJECT);
+        if object_id & ENHMETA_STOCK_OBJECT == 0 {
+          let brush_style = read_u32(data, pos + 12)
+            .ok()
+            .and_then(|value| u16::try_from(value).ok())
+            .and_then(WmfBrushStyle::from_raw);
+          let color = (brush_style == Some(WmfBrushStyle::Solid))
+            .then(|| read_color_ref(data, pos + 16).ok())
+            .flatten();
+          state.brushes.insert(object_id, color);
+        }
+      }
+      EMR_SELECT_OBJECT if record_size >= 12 => {
+        state.select_object(read_u32(data, pos + 8).unwrap_or_default());
+      }
+      EMR_DELETE_OBJECT if record_size >= 12 => {
+        state
+          .brushes
+          .remove(&read_u32(data, pos + 8).unwrap_or_default());
+      }
+      EMR_BIT_BLT if record_size >= 100 => {
+        let rop = read_u32(data, pos + EMR_BLT_ROP_OFFSET)
+          .ok()
+          .map(emf_ternary_raster_operation);
+        let no_source = read_u32(data, pos + EMR_BLT_INFO_SIZE_OFFSET).ok() == Some(0)
+          && read_u32(data, pos + EMR_BLT_BITS_SIZE_OFFSET).ok() == Some(0);
+        if rop == Some(WmfTernaryRasterOperationCode::PATCOPY)
+          && no_source
+          && let Some(rect) = state.solid_rect(
+            read_i32(data, pos + EMR_BITMAP_DEST_X_OFFSET).unwrap_or_default(),
+            read_i32(data, pos + EMR_BITMAP_DEST_Y_OFFSET).unwrap_or_default(),
+            read_i32(data, pos + EMR_BLT_DEST_WIDTH_OFFSET).unwrap_or_default(),
+            read_i32(data, pos + EMR_BLT_DEST_HEIGHT_OFFSET).unwrap_or_default(),
+          )
+        {
+          rects.push(rect);
+        }
+      }
+      EMR_EOF => break,
+      _ => {}
+    }
+
+    pos += record_size;
+  }
+  rects
 }
 
 #[derive(Clone)]
@@ -1461,6 +1906,32 @@ fn nonzero_mapping_extent(extent: i32) -> i32 {
   if extent == 0 { 1 } else { extent }
 }
 
+fn emf_mapping_extents_are_variable(map_mode: EmrMapMode) -> bool {
+  matches!(map_mode, EmrMapMode::Isotropic | EmrMapMode::Anisotropic)
+}
+
+fn emf_window_viewport_scale(
+  map_mode: EmrMapMode,
+  window_ext_x: i32,
+  window_ext_y: i32,
+  viewport_ext_x: i32,
+  viewport_ext_y: i32,
+) -> (f32, f32) {
+  if emf_mapping_extents_are_variable(map_mode) {
+    (
+      viewport_ext_x as f32 / nonzero_mapping_extent(window_ext_x) as f32,
+      viewport_ext_y as f32 / nonzero_mapping_extent(window_ext_y) as f32,
+    )
+  } else {
+    // [MS-EMF] 2.1.21 and 2.3.11.7-8: fixed-scale mapping modes do
+    // not accept window/viewport extent changes. In particular, the default
+    // MM_TEXT maps one logical unit to one device pixel. Physical-unit fixed
+    // modes have their own page-to-device conversion, independent of these
+    // extents.
+    (1.0, 1.0)
+  }
+}
+
 fn mapping_extent_magnitude(extent: i32) -> i32 {
   extent.saturating_abs().max(1)
 }
@@ -1829,6 +2300,7 @@ fn emf_pen_from_style(style: u32, pen: EmfPen) -> Option<EmfPen> {
 struct EmfFont {
   height: i32,
   family: Option<String>,
+  char_set: u8,
   weight: u16,
   italic: bool,
   quality: u8,
@@ -1836,6 +2308,7 @@ struct EmfFont {
 
 #[derive(Clone, Copy)]
 struct EmfTextSnapshot {
+  map_mode: EmrMapMode,
   window_org_x: i32,
   window_org_y: i32,
   window_ext_x: i32,
@@ -1857,6 +2330,7 @@ struct EmfTextState {
   playback_origin_y: f32,
   playback_scale_x: f32,
   playback_scale_y: f32,
+  map_mode: EmrMapMode,
   window_org_x: i32,
   window_org_y: i32,
   window_ext_x: i32,
@@ -1885,6 +2359,7 @@ impl EmfTextState {
       playback_origin_y: geometry.origin_y,
       playback_scale_x: geometry.scale_x,
       playback_scale_y: geometry.scale_y,
+      map_mode: EmrMapMode::Text,
       window_org_x: 0,
       window_org_y: 0,
       window_ext_x: geometry.width as i32,
@@ -1905,6 +2380,7 @@ impl EmfTextState {
 
   fn save(&mut self) {
     self.saved.push(EmfTextSnapshot {
+      map_mode: self.map_mode,
       window_org_x: self.window_org_x,
       window_org_y: self.window_org_y,
       window_ext_x: self.window_ext_x,
@@ -1924,6 +2400,7 @@ impl EmfTextState {
     let Some(snapshot) = self.saved.pop() else {
       return;
     };
+    self.map_mode = snapshot.map_mode;
     self.window_org_x = snapshot.window_org_x;
     self.window_org_y = snapshot.window_org_y;
     self.window_ext_x = snapshot.window_ext_x;
@@ -1940,8 +2417,13 @@ impl EmfTextState {
 
   fn map_point(&self, point: EmfPoint) -> (f32, f32) {
     let (x, y) = self.world_transform.apply(point);
-    let scale_x = self.viewport_ext_x as f32 / nonzero_mapping_extent(self.window_ext_x) as f32;
-    let scale_y = self.viewport_ext_y as f32 / nonzero_mapping_extent(self.window_ext_y) as f32;
+    let (scale_x, scale_y) = emf_window_viewport_scale(
+      self.map_mode,
+      self.window_ext_x,
+      self.window_ext_y,
+      self.viewport_ext_x,
+      self.viewport_ext_y,
+    );
     (
       (self.viewport_org_x as f32 + (x - self.window_org_x as f32) * scale_x
         - self.playback_origin_x)
@@ -1963,8 +2445,13 @@ impl EmfTextState {
 
   fn map_horizontal_distance(&self, logical_width: i64) -> f32 {
     let width = logical_width as f32;
-    let scale_x = self.viewport_ext_x as f32 / nonzero_mapping_extent(self.window_ext_x) as f32;
-    let scale_y = self.viewport_ext_y as f32 / nonzero_mapping_extent(self.window_ext_y) as f32;
+    let (scale_x, scale_y) = emf_window_viewport_scale(
+      self.map_mode,
+      self.window_ext_x,
+      self.window_ext_y,
+      self.viewport_ext_x,
+      self.viewport_ext_y,
+    );
     let x = width * self.world_transform.m11 * scale_x * self.playback_scale_x;
     let y = width * self.world_transform.m12 * scale_y * self.playback_scale_y;
     x.hypot(y)
@@ -2022,7 +2509,7 @@ impl EmfTextState {
       .map(|font| WmfTextFont {
         height: font.height,
         family: font.family.clone(),
-        char_set: 0,
+        char_set: font.char_set,
         weight: font.weight,
         italic: font.italic,
         quality: font.quality,
@@ -2105,6 +2592,7 @@ struct EmfVectorState {
   playback_scale_y: f32,
   output_scale_x: f32,
   output_scale_y: f32,
+  map_mode: EmrMapMode,
   window_org_x: i32,
   window_org_y: i32,
   window_ext_x: i32,
@@ -2120,9 +2608,11 @@ struct EmfVectorState {
   emf_plus_logical_dpi_y: f32,
   emf_plus_video_display: bool,
   brush_colors: std::collections::HashMap<u32, EmfColor>,
+  solid_brushes: std::collections::HashSet<u32>,
   pens: std::collections::HashMap<u32, Option<EmfPen>>,
   fonts: std::collections::HashMap<u32, EmfFont>,
   current_brush: Option<EmfColor>,
+  current_brush_is_solid: bool,
   current_pen: Option<EmfPen>,
   current_font: Option<u32>,
   current_pos: EmfPoint,
@@ -2144,6 +2634,7 @@ struct EmfVectorState {
 
 #[derive(Clone, Debug)]
 struct EmfVectorSnapshot {
+  map_mode: EmrMapMode,
   window_org_x: i32,
   window_org_y: i32,
   window_ext_x: i32,
@@ -2156,6 +2647,7 @@ struct EmfVectorSnapshot {
   emf_plus_page_unit: EmfPlusUnitType,
   emf_plus_page_scale: f32,
   current_brush: Option<EmfColor>,
+  current_brush_is_solid: bool,
   current_pen: Option<EmfPen>,
   current_font: Option<u32>,
   current_pos: EmfPoint,
@@ -2170,6 +2662,7 @@ struct EmfDeviceContextBridge {
   snapshot: EmfVectorSnapshot,
   saved_states: Vec<EmfVectorSnapshot>,
   brush_colors: std::collections::HashMap<u32, EmfColor>,
+  solid_brushes: std::collections::HashSet<u32>,
   pens: std::collections::HashMap<u32, Option<EmfPen>>,
   fonts: std::collections::HashMap<u32, EmfFont>,
 }
@@ -2315,6 +2808,100 @@ struct RenderFontCache {
   hinting_instances: HashMap<RenderHintingKey, HintingInstance>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GdiVerticalDeviceMetrics {
+  ascent: i32,
+  descent: i32,
+}
+
+fn vdmx_vertical_device_metrics(
+  table: &[u8],
+  ppem: u16,
+  char_set: u8,
+) -> Option<GdiVerticalDeviceMetrics> {
+  const ANSI_CHARSET: u8 = 0;
+  const HEADER_SIZE: usize = 6;
+  const RATIO_SIZE: usize = 4;
+  const GROUP_HEADER_SIZE: usize = 4;
+  const ENTRY_SIZE: usize = 6;
+
+  let read_u16 = |offset: usize| {
+    table
+      .get(offset..offset + 2)
+      .map(|bytes| u16::from_be_bytes([bytes[0], bytes[1]]))
+  };
+  let version = read_u16(0)?;
+  if version > 1 || read_u16(2)? == 0 {
+    return None;
+  }
+  let ratio_count = usize::from(read_u16(4)?);
+  let ratio_bytes = ratio_count.checked_mul(RATIO_SIZE)?;
+  let offsets_start = HEADER_SIZE.checked_add(ratio_bytes)?;
+  let offsets_end = offsets_start.checked_add(ratio_count.checked_mul(2)?)?;
+  if offsets_end > table.len() {
+    return None;
+  }
+
+  let mut group_offset = None;
+  for index in 0..ratio_count {
+    let ratio_offset = HEADER_SIZE + index * RATIO_SIZE;
+    let ratio = table.get(ratio_offset..ratio_offset + RATIO_SIZE)?;
+    let char_set_matches = match version {
+      // Version 0 uses 1 for the Windows ANSI subset; 0 is the complete
+      // symbol/dingbat repertoire. Microsoft specifies that Windows ignores
+      // non-ANSI-subset entries for ANSI_CHARSET.
+      0 => {
+        (ratio[0] == 1 && char_set == ANSI_CHARSET) || (ratio[0] == 0 && char_set != ANSI_CHARSET)
+      }
+      // Version 1 uses 1 for the complete repertoire; 0 is additionally
+      // available to ANSI_CHARSET consumers.
+      1 => ratio[0] == 1 || (ratio[0] == 0 && char_set == ANSI_CHARSET),
+      _ => false,
+    };
+    if !char_set_matches {
+      continue;
+    }
+    let aspect_matches = (ratio[1] == 0 && ratio[2] == 0 && ratio[3] == 0)
+      || (ratio[1] == 1 && ratio[2] <= 1 && ratio[3] >= 1);
+    if aspect_matches {
+      group_offset = Some(usize::from(read_u16(offsets_start + index * 2)?));
+      break;
+    }
+  }
+
+  let group_offset = group_offset?;
+  let record_count = usize::from(read_u16(group_offset)?);
+  let start_ppem = *table.get(group_offset + 2)?;
+  let end_ppem = *table.get(group_offset + 3)?;
+  if ppem < u16::from(start_ppem) || ppem > u16::from(end_ppem) {
+    return None;
+  }
+  let entries_start = group_offset.checked_add(GROUP_HEADER_SIZE)?;
+  let entries_end = entries_start.checked_add(record_count.checked_mul(ENTRY_SIZE)?)?;
+  if entries_end > table.len() {
+    return None;
+  }
+  for index in 0..record_count {
+    let entry_offset = entries_start + index * ENTRY_SIZE;
+    let entry_ppem = read_u16(entry_offset)?;
+    if entry_ppem > ppem {
+      break;
+    }
+    if entry_ppem == ppem {
+      let y_max = i32::from(read_u16(entry_offset + 2)? as i16);
+      let y_min = i32::from(read_u16(entry_offset + 4)? as i16);
+      if y_max <= 0 || y_min > 0 {
+        return None;
+      }
+      return Some(GdiVerticalDeviceMetrics {
+        ascent: y_max,
+        descent: y_min.saturating_abs(),
+      });
+    }
+  }
+  None
+}
+
 /// Destination class used by GDI when selecting a glyph bitmap format.
 ///
 /// Wine's DIB driver forces `GGO_BITMAP` for destinations with at most eight
@@ -2445,10 +3032,32 @@ impl RenderFontCache {
     }
     let metrics = self.resolve_face(font).and_then(|face_data| {
       let face = FontRef::from_index(face_data.font_data.as_ref(), face_data.face_index).ok()?;
-      Some(face.metrics(FontSize::new(height.max(1.0)), LocationRef::default()))
+      // The OpenType VDMX table records the hinted yMax/yMin that Windows
+      // uses for device Font Height. Wine's load_VDMX follows the negative
+      // LOGFONT path by selecting the exact device ppem; positive lfHeight
+      // uses a separate cell-height search and deliberately retains the
+      // linear-metric fallback here.
+      let device_metrics = (font.height < 0)
+        .then(|| {
+          let ppem = height.round().clamp(1.0, f32::from(u16::MAX)) as u16;
+          face
+            .table_data(FontTableTag::new(b"VDMX"))
+            .and_then(|table| vdmx_vertical_device_metrics(table.as_bytes(), ppem, font.char_set))
+        })
+        .flatten();
+      Some((
+        face.metrics(FontSize::new(height.max(1.0)), LocationRef::default()),
+        device_metrics,
+      ))
     });
     if alignment.contains(WmfTextAlignmentModeFlags::BOTTOM) {
-      reference_y + metrics.map_or(0.0, |metrics| gdi_realized_font_metric(metrics.descent))
+      reference_y
+        + metrics.map_or(0.0, |(metrics, device_metrics)| {
+          device_metrics.map_or_else(
+            || gdi_realized_font_metric(metrics.descent),
+            |metrics| metrics.descent as f32,
+          )
+        })
     } else {
       // [MS-WMF] 2.1.2.3 defines the all-zero vertical mode as TA_TOP.
       // Its reference point is the top of the font alignment box, so the
@@ -2461,7 +3070,12 @@ impl RenderFontCache {
       reference_y
         + metrics.map_or_else(
           || gdi_realized_font_metric(height),
-          |metrics| gdi_realized_font_metric(metrics.ascent),
+          |(metrics, device_metrics)| {
+            device_metrics.map_or_else(
+              || gdi_realized_font_metric(metrics.ascent),
+              |metrics| metrics.ascent as f32,
+            )
+          },
         )
     }
   }
@@ -3169,6 +3783,7 @@ impl EmfVectorState {
       playback_scale_y: geometry.scale_y,
       output_scale_x,
       output_scale_y,
+      map_mode: EmrMapMode::Text,
       window_org_x: 0,
       window_org_y: 0,
       window_ext_x: natural_width as i32,
@@ -3187,9 +3802,11 @@ impl EmfVectorState {
       emf_plus_logical_dpi_y: 96.0,
       emf_plus_video_display: true,
       brush_colors: std::collections::HashMap::new(),
+      solid_brushes: std::collections::HashSet::new(),
       pens: std::collections::HashMap::new(),
       fonts: std::collections::HashMap::new(),
       current_brush: None,
+      current_brush_is_solid: false,
       current_pen: Some(EmfPen {
         color: EmfColor { r: 0, g: 0, b: 0 },
         alpha: u8::MAX,
@@ -3220,8 +3837,13 @@ impl EmfVectorState {
     let (page_scale_x, page_scale_y) = self.emf_plus_page_device_scale();
     let x = x * page_scale_x;
     let y = y * page_scale_y;
-    let scale_x = self.viewport_ext_x as f32 / nonzero_mapping_extent(self.window_ext_x) as f32;
-    let scale_y = self.viewport_ext_y as f32 / nonzero_mapping_extent(self.window_ext_y) as f32;
+    let (scale_x, scale_y) = emf_window_viewport_scale(
+      self.map_mode,
+      self.window_ext_x,
+      self.window_ext_y,
+      self.viewport_ext_x,
+      self.viewport_ext_y,
+    );
     (
       (self.viewport_org_x as f32 + (x - self.window_org_x as f32) * scale_x
         - self.playback_origin_x)
@@ -3257,14 +3879,15 @@ impl EmfVectorState {
     }
     let width = pen.width as f32;
     let (page_scale_x, page_scale_y) = self.emf_plus_page_device_scale();
-    let scale_x = self.viewport_ext_x as f32 / nonzero_mapping_extent(self.window_ext_x) as f32
-      * page_scale_x
-      * self.playback_scale_x
-      * self.output_scale_x;
-    let scale_y = self.viewport_ext_y as f32 / nonzero_mapping_extent(self.window_ext_y) as f32
-      * page_scale_y
-      * self.playback_scale_y
-      * self.output_scale_y;
+    let (extent_scale_x, extent_scale_y) = emf_window_viewport_scale(
+      self.map_mode,
+      self.window_ext_x,
+      self.window_ext_y,
+      self.viewport_ext_x,
+      self.viewport_ext_y,
+    );
+    let scale_x = extent_scale_x * page_scale_x * self.playback_scale_x * self.output_scale_x;
+    let scale_y = extent_scale_y * page_scale_y * self.playback_scale_y * self.output_scale_y;
     let x_axis = (
       width * self.world_transform.m11 * scale_x,
       width * self.world_transform.m12 * scale_y,
@@ -3706,14 +4329,15 @@ impl EmfVectorState {
     let mapped_x = x * self.world_transform.m11 + y * self.world_transform.m21;
     let mapped_y = x * self.world_transform.m12 + y * self.world_transform.m22;
     let (page_scale_x, page_scale_y) = self.emf_plus_page_device_scale();
-    let scale_x = self.viewport_ext_x as f32 / nonzero_mapping_extent(self.window_ext_x) as f32
-      * page_scale_x
-      * self.playback_scale_x
-      * self.output_scale_x;
-    let scale_y = self.viewport_ext_y as f32 / nonzero_mapping_extent(self.window_ext_y) as f32
-      * page_scale_y
-      * self.playback_scale_y
-      * self.output_scale_y;
+    let (extent_scale_x, extent_scale_y) = emf_window_viewport_scale(
+      self.map_mode,
+      self.window_ext_x,
+      self.window_ext_y,
+      self.viewport_ext_x,
+      self.viewport_ext_y,
+    );
+    let scale_x = extent_scale_x * page_scale_x * self.playback_scale_x * self.output_scale_x;
+    let scale_y = extent_scale_y * page_scale_y * self.playback_scale_y * self.output_scale_y;
     (mapped_x * scale_x, mapped_y * scale_y)
   }
 
@@ -4013,6 +4637,7 @@ impl EmfVectorState {
 
   fn snapshot(&self) -> EmfVectorSnapshot {
     EmfVectorSnapshot {
+      map_mode: self.map_mode,
       window_org_x: self.window_org_x,
       window_org_y: self.window_org_y,
       window_ext_x: self.window_ext_x,
@@ -4025,6 +4650,7 @@ impl EmfVectorState {
       emf_plus_page_unit: self.emf_plus_page_unit,
       emf_plus_page_scale: self.emf_plus_page_scale,
       current_brush: self.current_brush,
+      current_brush_is_solid: self.current_brush_is_solid,
       current_pen: self.current_pen,
       current_font: self.current_font,
       current_pos: self.current_pos,
@@ -4044,6 +4670,7 @@ impl EmfVectorState {
   }
 
   fn restore_snapshot(&mut self, saved: EmfVectorSnapshot) {
+    self.map_mode = saved.map_mode;
     self.window_org_x = saved.window_org_x;
     self.window_org_y = saved.window_org_y;
     self.window_ext_x = saved.window_ext_x;
@@ -4056,6 +4683,7 @@ impl EmfVectorState {
     self.emf_plus_page_unit = saved.emf_plus_page_unit;
     self.emf_plus_page_scale = saved.emf_plus_page_scale;
     self.current_brush = saved.current_brush;
+    self.current_brush_is_solid = saved.current_brush_is_solid;
     self.current_pen = saved.current_pen;
     self.current_font = saved.current_font;
     self.current_pos = saved.current_pos;
@@ -4101,6 +4729,7 @@ impl EmfVectorState {
       snapshot: self.snapshot(),
       saved_states: std::mem::take(&mut self.saved_states),
       brush_colors: std::mem::take(&mut self.brush_colors),
+      solid_brushes: std::mem::take(&mut self.solid_brushes),
       pens: std::mem::take(&mut self.pens),
       fonts: std::mem::take(&mut self.fonts),
     };
@@ -4109,6 +4738,7 @@ impl EmfVectorState {
     // context. GDI mapping and SaveDC state start in device coordinates;
     // they must not inherit the EMF+ world transform or graphics-state
     // stack. The active clip is deliberately retained for the borrowed DC.
+    self.map_mode = EmrMapMode::Text;
     self.window_org_x = 0;
     self.window_org_y = 0;
     self.window_ext_x = self.natural_width.max(1) as i32;
@@ -4121,6 +4751,7 @@ impl EmfVectorState {
     self.emf_plus_page_unit = EmfPlusUnitType::Pixel;
     self.emf_plus_page_scale = 1.0;
     self.current_brush = None;
+    self.current_brush_is_solid = false;
     self.current_pen = Some(EmfPen {
       color: EmfColor { r: 0, g: 0, b: 0 },
       alpha: u8::MAX,
@@ -4139,6 +4770,7 @@ impl EmfVectorState {
     self.restore_snapshot(bridge.snapshot);
     self.saved_states = bridge.saved_states;
     self.brush_colors = bridge.brush_colors;
+    self.solid_brushes = bridge.solid_brushes;
     self.pens = bridge.pens;
     self.fonts = bridge.fonts;
   }
@@ -4601,10 +5233,21 @@ impl EmfVectorState {
           r: 255,
           g: 255,
           b: 255,
-        })
+        });
+        self.current_brush_is_solid = true;
       }
-      BLACK_BRUSH => self.current_brush = Some(EmfColor { r: 0, g: 0, b: 0 }),
-      NULL_BRUSH => self.current_brush = None,
+      BLACK_BRUSH => {
+        self.current_brush = Some(EmfColor { r: 0, g: 0, b: 0 });
+        self.current_brush_is_solid = true;
+      }
+      NULL_BRUSH => {
+        self.current_brush = None;
+        self.current_brush_is_solid = false;
+      }
+      0x8000_0001..=0x8000_0003 => {
+        // Stock gray brush colors are device-dependent. Rasterize them.
+        self.current_brush_is_solid = false;
+      }
       WHITE_PEN => {
         self.current_pen = Some(EmfPen {
           color: EmfColor {
@@ -4629,6 +5272,7 @@ impl EmfVectorState {
       _ => {
         if let Some(brush) = self.brush_colors.get(&object_id).copied() {
           self.current_brush = Some(brush);
+          self.current_brush_is_solid = self.solid_brushes.contains(&object_id);
         }
         if let Some(pen) = self.pens.get(&object_id).copied() {
           self.current_pen = pen;
@@ -4690,16 +5334,25 @@ fn decode_vector_emf_as_png(
         state.window_org_y = read_i32(data, pos + 12)?;
       }
       EMR_SET_WINDOW_EXT_EX if record_size >= 16 => {
-        state.window_ext_x = nonzero_mapping_extent(read_i32(data, pos + 8)?);
-        state.window_ext_y = nonzero_mapping_extent(read_i32(data, pos + 12)?);
+        if emf_mapping_extents_are_variable(state.map_mode) {
+          state.window_ext_x = nonzero_mapping_extent(read_i32(data, pos + 8)?);
+          state.window_ext_y = nonzero_mapping_extent(read_i32(data, pos + 12)?);
+        }
       }
       EMR_SET_VIEWPORT_ORG_EX if record_size >= 16 => {
         state.viewport_org_x = read_i32(data, pos + 8)?;
         state.viewport_org_y = read_i32(data, pos + 12)?;
       }
       EMR_SET_VIEWPORT_EXT_EX if record_size >= 16 => {
-        state.viewport_ext_x = read_i32(data, pos + 8)?;
-        state.viewport_ext_y = read_i32(data, pos + 12)?;
+        if emf_mapping_extents_are_variable(state.map_mode) {
+          state.viewport_ext_x = read_i32(data, pos + 8)?;
+          state.viewport_ext_y = read_i32(data, pos + 12)?;
+        }
+      }
+      EMR_SET_MAP_MODE if record_size >= 12 => {
+        if let Some(map_mode) = EmrMapMode::from_raw(read_u32(data, pos + 8)?) {
+          state.map_mode = map_mode;
+        }
       }
       EMR_SET_PIXEL_V if record_size >= 20 => {
         let (x, y) = state.map_point(EmfPoint {
@@ -4781,6 +5434,15 @@ fn decode_vector_emf_as_png(
         state
           .brush_colors
           .insert(object_id, read_color_ref(data, pos + 16)?);
+        let brush_style = read_u32(data, pos + 12)
+          .ok()
+          .and_then(|value| u16::try_from(value).ok())
+          .and_then(WmfBrushStyle::from_raw);
+        if brush_style == Some(WmfBrushStyle::Solid) {
+          state.solid_brushes.insert(object_id);
+        } else {
+          state.solid_brushes.remove(&object_id);
+        }
       }
       // [MS-EMF] 2.3.7.9 permits an empty LogPenEx StyleEntry array.  The
       // fixed record is therefore 52 bytes (8-byte EMR header, five DWORDs,
@@ -4819,6 +5481,7 @@ fn decode_vector_emf_as_png(
       EMR_DELETE_OBJECT if record_size >= 12 => {
         let object_id = read_u32(data, pos + 8)?;
         state.brush_colors.remove(&object_id);
+        state.solid_brushes.remove(&object_id);
         state.pens.remove(&object_id);
         state.fonts.remove(&object_id);
         if state.current_font == Some(object_id) {
@@ -5033,13 +5696,18 @@ fn decode_vector_emf_as_png(
             // PATCOPY rectangles: the destination and selected brush remain
             // meaningful even though all four bitmap offsets and sizes are
             // zero.
-            state.fill_rect_with_rop(
-              target.dest_x,
-              target.dest_y,
-              target.dest_x.saturating_add(target.dest_width),
-              target.dest_y.saturating_add(target.dest_height),
-              rop,
-            );
+            let lifted_solid_rect = options.suppress_solid_pattern_rects
+              && rop == WmfTernaryRasterOperationCode::PATCOPY
+              && state.current_brush_is_solid;
+            if !lifted_solid_rect {
+              state.fill_rect_with_rop(
+                target.dest_x,
+                target.dest_y,
+                target.dest_x.saturating_add(target.dest_width),
+                target.dest_y.saturating_add(target.dest_height),
+                rop,
+              );
+            }
           }
         }
       }
@@ -5793,6 +6461,10 @@ impl WmfRenderState {
         playback_scale_y: 1.0,
         output_scale_x,
         output_scale_y,
+        // WMF owns its mapping state in WmfRenderState. Keep this shared
+        // canvas on the variable-extent path so META_SETWINDOWEXT and the
+        // caller-supplied viewport retain their existing mapping.
+        map_mode: EmrMapMode::Anisotropic,
         window_org_x,
         window_org_y,
         window_ext_x: nonzero_mapping_extent(window_ext_x),
@@ -5808,6 +6480,7 @@ impl WmfRenderState {
         emf_plus_logical_dpi_y: 96.0,
         emf_plus_video_display: true,
         brush_colors: std::collections::HashMap::new(),
+        solid_brushes: std::collections::HashSet::new(),
         pens: std::collections::HashMap::new(),
         fonts: std::collections::HashMap::new(),
         current_brush: Some(EmfColor {
@@ -5815,6 +6488,7 @@ impl WmfRenderState {
           g: 255,
           b: 255,
         }),
+        current_brush_is_solid: true,
         current_pen: Some(EmfPen {
           color: EmfColor { r: 0, g: 0, b: 0 },
           alpha: u8::MAX,
@@ -7970,7 +8644,7 @@ fn emf_current_font(state: &EmfVectorState) -> WmfTextFont {
     .map(|font| WmfTextFont {
       height: font.height,
       family: font.family.clone(),
-      char_set: 0,
+      char_set: font.char_set,
       weight: font.weight,
       italic: font.italic,
       quality: font.quality,
@@ -9462,6 +10136,7 @@ fn read_logfont_object(
   const LOGFONT_HEIGHT_OFFSET: usize = LOGFONT_OFFSET;
   const LOGFONT_WEIGHT_OFFSET: usize = LOGFONT_OFFSET + 16;
   const LOGFONT_ITALIC_OFFSET: usize = LOGFONT_OFFSET + 20;
+  const LOGFONT_CHAR_SET_OFFSET: usize = LOGFONT_OFFSET + 23;
   const LOGFONT_QUALITY_OFFSET: usize = LOGFONT_OFFSET + 26;
   const LOGFONT_FACE_NAME_OFFSET: usize = LOGFONT_OFFSET + 28;
   let face_end = LOGFONT_FACE_NAME_OFFSET.checked_add(LOGFONT_FACE_NAME_CHARS * 2)?;
@@ -9474,6 +10149,7 @@ fn read_logfont_object(
     .ok()?
     .clamp(0, 1000) as u16;
   let italic = *data.get(record_offset + LOGFONT_ITALIC_OFFSET)? != 0;
+  let char_set = *data.get(record_offset + LOGFONT_CHAR_SET_OFFSET)?;
   let quality = *data.get(record_offset + LOGFONT_QUALITY_OFFSET)?;
   let face_bytes = data.get(
     record_offset + LOGFONT_FACE_NAME_OFFSET
@@ -9491,6 +10167,7 @@ fn read_logfont_object(
     EmfFont {
       height,
       family: (!family.is_empty()).then_some(family),
+      char_set,
       weight,
       italic,
       quality,
@@ -9559,7 +10236,7 @@ fn apply_binary_raster_operation(
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::emf::{EmrAlphaBlend, EmrBitBlt, EmrBlendFunction, EmrStretchBlt};
+  use crate::emf::{EmrAlphaBlend, EmrBitBlt, EmrBlendFunction, EmrMapMode, EmrStretchBlt};
   use crate::emfplus::{
     EmfPlusGraphicsVersion, EmfPlusGraphicsVersionValue, EmfPlusHeaderData, EmfPlusRegionObject,
     EmfPlusSetPageTransformData, EmfPlusStream,
@@ -9601,6 +10278,20 @@ mod tests {
       super::EMR_SET_TEXT_ALIGN,
       u32::from(alignment.bits()).to_le_bytes().to_vec(),
     )
+  }
+
+  fn set_map_mode_record(map_mode: EmrMapMode) -> EmfRecord {
+    EmfRecord::new(
+      super::EMR_SET_MAP_MODE,
+      map_mode.raw().to_le_bytes().to_vec(),
+    )
+  }
+
+  fn extent_record(record_type: u32, x: i32, y: i32) -> EmfRecord {
+    let mut data = Vec::with_capacity(8);
+    data.extend_from_slice(&x.to_le_bytes());
+    data.extend_from_slice(&y.to_le_bytes());
+    EmfRecord::new(record_type, data)
   }
 
   fn move_to_ex_record(x: i32, y: i32) -> EmfRecord {
@@ -9885,12 +10576,71 @@ mod tests {
   }
 
   #[test]
+  fn vdmx_selects_exact_ansi_one_to_one_device_metrics() {
+    let mut table = Vec::new();
+    table.extend_from_slice(&0u16.to_be_bytes()); // version
+    table.extend_from_slice(&1u16.to_be_bytes()); // groups
+    table.extend_from_slice(&1u16.to_be_bytes()); // ratios
+    table.extend_from_slice(&[1, 1, 1, 1]); // ANSI subset, 1:1 device
+    table.extend_from_slice(&12u16.to_be_bytes()); // group offset
+    table.extend_from_slice(&1u16.to_be_bytes()); // records
+    table.extend_from_slice(&[12, 14]); // supported ppem range
+    table.extend_from_slice(&13u16.to_be_bytes());
+    table.extend_from_slice(&14i16.to_be_bytes());
+    table.extend_from_slice(&(-3i16).to_be_bytes());
+
+    assert_eq!(
+      vdmx_vertical_device_metrics(&table, 13, crate::wmf::WmfCharacterSet::Ansi.raw(),),
+      Some(GdiVerticalDeviceMetrics {
+        ascent: 14,
+        descent: 3,
+      })
+    );
+    // VDMX records are sparse: an in-range ppem without an exact record must
+    // retain the linearly scaled font metrics.
+    assert_eq!(
+      vdmx_vertical_device_metrics(&table, 12, crate::wmf::WmfCharacterSet::Ansi.raw(),),
+      None
+    );
+  }
+
+  #[test]
+  fn vdmx_rejects_charset_aspect_and_truncated_mismatches() {
+    let make_table = |ratio: [u8; 4]| {
+      let mut table = Vec::new();
+      table.extend_from_slice(&0u16.to_be_bytes());
+      table.extend_from_slice(&1u16.to_be_bytes());
+      table.extend_from_slice(&1u16.to_be_bytes());
+      table.extend_from_slice(&ratio);
+      table.extend_from_slice(&12u16.to_be_bytes());
+      table.extend_from_slice(&1u16.to_be_bytes());
+      table.extend_from_slice(&[13, 13]);
+      table.extend_from_slice(&13u16.to_be_bytes());
+      table.extend_from_slice(&14i16.to_be_bytes());
+      table.extend_from_slice(&(-3i16).to_be_bytes());
+      table
+    };
+    let ansi = crate::wmf::WmfCharacterSet::Ansi.raw();
+    let symbol = crate::wmf::WmfCharacterSet::Symbol.raw();
+    let ansi_table = make_table([1, 1, 1, 1]);
+    let wrong_aspect = make_table([1, 4, 3, 3]);
+
+    assert_eq!(vdmx_vertical_device_metrics(&ansi_table, 13, symbol), None);
+    assert_eq!(vdmx_vertical_device_metrics(&wrong_aspect, 13, ansi), None);
+    assert_eq!(
+      vdmx_vertical_device_metrics(&ansi_table[..ansi_table.len() - 1], 13, ansi),
+      None
+    );
+  }
+
+  #[test]
   fn emf_logfont_preserves_visible_text_face_properties() {
     let mut record = vec![0; 104];
     record[8..12].copy_from_slice(&7u32.to_le_bytes());
     record[12..16].copy_from_slice(&(-11i32).to_le_bytes());
     record[28..32].copy_from_slice(&700i32.to_le_bytes());
     record[32] = 1;
+    record[35] = crate::wmf::WmfCharacterSet::Greek.raw();
     record[38] = crate::wmf::WmfFontQuality::ClearType.raw();
     for (index, unit) in "Segoe UI".encode_utf16().enumerate() {
       let offset = 40 + index * 2;
@@ -9903,6 +10653,7 @@ mod tests {
     assert_eq!(font.family.as_deref(), Some("Segoe UI"));
     assert_eq!(font.weight, 700);
     assert!(font.italic);
+    assert_eq!(font.char_set, crate::wmf::WmfCharacterSet::Greek.raw());
     assert_eq!(font.quality, crate::wmf::WmfFontQuality::ClearType.raw());
   }
 
@@ -9997,6 +10748,50 @@ mod tests {
     assert!((runs[0].y * height as f32 - 20.0).abs() < 0.000_1);
     assert!((runs[1].x * width as f32 - 26.0).abs() < 0.000_1);
     assert!((runs[1].y * height as f32 - 20.0).abs() < 0.000_1);
+  }
+
+  #[test]
+  fn emf_text_mode_ignores_extents_while_anisotropic_applies_them() {
+    let mapped_metafile = |map_mode: Option<EmrMapMode>, record| {
+      let mut records = Vec::new();
+      if let Some(map_mode) = map_mode {
+        records.push(set_map_mode_record(map_mode));
+      }
+      records.push(extent_record(super::EMR_SET_WINDOW_EXT_EX, 4, 4));
+      records.push(extent_record(super::EMR_SET_VIEWPORT_EXT_EX, 20, 20));
+      records.push(record);
+      metafile_with_header_bounds(19, 19, records)
+    };
+
+    let text_pixels = mapped_metafile(None, set_pixel_record(2, 3, 0x0000_00ff));
+    let anisotropic_pixels = mapped_metafile(
+      Some(EmrMapMode::Anisotropic),
+      set_pixel_record(2, 3, 0x0000_00ff),
+    );
+    let decode = |data: &[u8]| {
+      let decoded =
+        decode_vector_emf_as_png(data, RenderOptions::default(), GdiTextSurface::Color).unwrap();
+      image::load_from_memory(&decoded.data).unwrap().to_rgb8()
+    };
+    let text_image = decode(&text_pixels);
+    let anisotropic_image = decode(&anisotropic_pixels);
+
+    assert_eq!(text_image.dimensions(), (20, 20));
+    assert_eq!(text_image.get_pixel(2, 3).0, [255, 0, 0]);
+    assert_eq!(text_image.get_pixel(10, 15).0, [255, 255, 255]);
+    assert_eq!(anisotropic_image.get_pixel(2, 3).0, [255, 255, 255]);
+    assert_eq!(anisotropic_image.get_pixel(10, 15).0, [255, 0, 0]);
+
+    let text_runs = mapped_metafile(None, ext_text_out_w_record(2, 3, "A"));
+    let anisotropic_runs = mapped_metafile(
+      Some(EmrMapMode::Anisotropic),
+      ext_text_out_w_record(2, 3, "A"),
+    );
+    let text_x = extract_metafile_text_runs(&text_runs, Some("image/x-emf"))[0].x;
+    let anisotropic_x = extract_metafile_text_runs(&anisotropic_runs, Some("image/x-emf"))[0].x;
+
+    assert!((text_x * 20.0 - 2.0).abs() < 0.000_1);
+    assert!((anisotropic_x * 20.0 - 10.0).abs() < 0.000_1);
   }
 
   #[test]
@@ -11141,9 +11936,13 @@ mod tests {
   }
 
   fn create_solid_brush_record(object_id: u32, color_ref: u32) -> EmfRecord {
+    create_brush_record(object_id, WmfBrushStyle::Solid, color_ref)
+  }
+
+  fn create_brush_record(object_id: u32, brush_style: WmfBrushStyle, color_ref: u32) -> EmfRecord {
     let mut data = Vec::with_capacity(16);
     data.extend_from_slice(&object_id.to_le_bytes());
-    data.extend_from_slice(&0u32.to_le_bytes());
+    data.extend_from_slice(&u32::from(brush_style.raw()).to_le_bytes());
     data.extend_from_slice(&color_ref.to_le_bytes());
     data.extend_from_slice(&0u32.to_le_bytes());
     EmfRecord::new(super::EMR_CREATE_BRUSH_INDIRECT, data)
@@ -11168,15 +11967,28 @@ mod tests {
   }
 
   fn source_less_bit_blt_record(raster_operation: u32) -> EmfRecord {
+    source_less_bit_blt_rect_record(0, 0, 1, 1, raster_operation)
+  }
+
+  fn source_less_bit_blt_rect_record(
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    raster_operation: u32,
+  ) -> EmfRecord {
     EmfRecordData::BitBlt(EmrBitBlt {
       bounds: RectL {
-        left: 0,
-        top: 0,
-        right: 1,
-        bottom: 1,
+        left: x,
+        top: y,
+        right: x.saturating_add(width),
+        bottom: y.saturating_add(height),
       },
-      dest: PointL { x: 0, y: 0 },
-      dest_size: SizeL { cx: 1, cy: 1 },
+      dest: PointL { x, y },
+      dest_size: SizeL {
+        cx: width,
+        cy: height,
+      },
       raster_operation,
       source: PointL::default(),
       xform_source: XForm {
@@ -11337,12 +12149,6 @@ mod tests {
 
   #[test]
   fn emf_negative_window_extent_keeps_stretch_dibits_on_canvas() {
-    let extent_record = |record_type, x: i32, y: i32| {
-      let mut data = Vec::with_capacity(8);
-      data.extend_from_slice(&x.to_le_bytes());
-      data.extend_from_slice(&y.to_le_bytes());
-      EmfRecord::new(record_type, data)
-    };
     let bits = vec![
       0, 0, 255, 0, 255, 0, 0, 0, // bottom row: red, green, padding
       255, 0, 0, 0, 255, 255, 0, 0, // top row: blue, yellow, padding
@@ -11378,6 +12184,7 @@ mod tests {
       1,
       1,
       vec![
+        set_map_mode_record(EmrMapMode::Anisotropic),
         extent_record(super::EMR_SET_VIEWPORT_EXT_EX, 2, 2),
         extent_record(super::EMR_SET_WINDOW_EXT_EX, 2, -2),
         stretch,
@@ -11448,6 +12255,84 @@ mod tests {
     let image = image::load_from_memory(&decoded.data).unwrap().to_rgb8();
 
     assert_eq!(image.get_pixel(0, 0).0, [0x11, 0x22, 0x33]);
+  }
+
+  #[test]
+  fn emf_solid_patcopy_rects_can_be_lifted_without_suppressing_other_graphics() {
+    let brush_id = 1;
+    let emf = metafile_with_header_bounds(
+      7,
+      7,
+      vec![
+        create_solid_brush_record(brush_id, 0x0000_00ff),
+        select_object_record(brush_id),
+        source_less_bit_blt_rect_record(2, 3, 4, 2, 0x00F0_0021),
+        set_pixel_record(0, 0, 0x00ff_0000),
+      ],
+    );
+
+    assert_eq!(
+      extract_metafile_solid_rects(&emf, Some("image/x-emf")),
+      vec![MetafileSolidRect {
+        x: 0.25,
+        y: 0.375,
+        width: 0.5,
+        height: 0.25,
+        color: [255, 0, 0],
+      }]
+    );
+
+    let decode = |suppress_solid_pattern_rects| {
+      let decoded = decode_metafile_as_raster_with_options(
+        &emf,
+        Some("image/x-emf"),
+        RenderOptions {
+          suppress_solid_pattern_rects,
+          ..RenderOptions::default()
+        },
+      )
+      .unwrap()
+      .unwrap();
+      image::load_from_memory(&decoded.data).unwrap().to_rgb8()
+    };
+    let painted = decode(false);
+    let lifted = decode(true);
+
+    assert_eq!(painted.get_pixel(2, 3).0, [255, 0, 0]);
+    assert_eq!(lifted.get_pixel(2, 3).0, [255, 255, 255]);
+    assert_eq!(painted.get_pixel(0, 0).0, [0, 0, 255]);
+    assert_eq!(lifted.get_pixel(0, 0).0, [0, 0, 255]);
+  }
+
+  #[test]
+  fn emf_solid_rect_lifting_rejects_pattern_brushes_and_other_rops() {
+    let brush_id = 1;
+    let patterned = metafile_with_records(vec![
+      create_brush_record(brush_id, WmfBrushStyle::Hatched, 0x0000_00ff),
+      select_object_record(brush_id),
+      source_less_bit_blt_record(0x00F0_0021),
+    ]);
+    let other_rop = metafile_with_records(vec![
+      create_solid_brush_record(brush_id, 0x0000_00ff),
+      select_object_record(brush_id),
+      source_less_bit_blt_record(WmfTernaryRasterOperationCode::PATINVERT.canonical_raw()),
+    ]);
+
+    assert!(extract_metafile_solid_rects(&patterned, Some("image/x-emf")).is_empty());
+    assert!(extract_metafile_solid_rects(&other_rop, Some("image/x-emf")).is_empty());
+
+    let decoded = decode_metafile_as_raster_with_options(
+      &patterned,
+      Some("image/x-emf"),
+      RenderOptions {
+        suppress_solid_pattern_rects: true,
+        ..RenderOptions::default()
+      },
+    )
+    .unwrap()
+    .unwrap();
+    let image = image::load_from_memory(&decoded.data).unwrap().to_rgb8();
+    assert_eq!(image.get_pixel(0, 0).0, [255, 0, 0]);
   }
 
   #[test]
