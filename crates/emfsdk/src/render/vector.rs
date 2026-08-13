@@ -1,21 +1,24 @@
 //! Strict vector lifting for classic solid-fill metafile streams.
 //!
 //! This interpreter is intentionally all-or-nothing. It returns a scene only
-//! when every record that can paint is representable as a solid closed path;
-//! callers retain the complete raster replay for every other metafile. That
-//! keeps vector output faithful without treating a partially understood record
-//! stream as complete.
+//! when every record that can paint is either representable as a solid closed
+//! path or was explicitly suppressed after an independent layer extractor
+//! lifted it. Callers retain the complete raster replay for every other
+//! metafile. That keeps vector output faithful without treating a partially
+//! understood record stream as complete.
 
 use std::collections::HashMap;
 
 use crate::common::SdkEnumValue;
 use crate::emf::{
   EmfMetafileRef, EmfRecordData, EmrComment, EmrMapMode, EmrModifyWorldTransformMode,
-  EmrPolygonFillMode, EmrPublicComment, EmrRegionMode, EmrStockObject,
+  EmrPenLineStyle, EmrPenType, EmrPolygonFillMode, EmrPublicComment, EmrRegionMode, EmrStockObject,
 };
+use crate::emfplus::EmfPlusRecordData;
 use crate::types::{ColorRef, PointL, PointS, XForm};
 use crate::wmf::{
-  WmfBrushStyle, WmfMapMode, WmfMetafileRef, WmfPenLineStyle, WmfPolyFillMode, WmfRecordData,
+  WmfBinaryRasterOperation, WmfBrushStyle, WmfMapMode, WmfMetafileRef, WmfPenLineStyle,
+  WmfPolyFillMode, WmfRecordData, WmfTernaryRasterOperationCode,
 };
 
 use super::{
@@ -65,10 +68,14 @@ pub fn extract_metafile_vector_scene(
   extract_metafile_vector_scene_with_options(data, content_type, RenderOptions::default())
 }
 
-/// Extracts a vector scene when the entire visible stream is a supported
-/// classic solid-fill subset.
+/// Extracts a vector scene when the entire remaining visible stream is a
+/// supported classic solid-fill subset.
 ///
 /// `Ok(None)` is a normal completeness fallback, not a malformed-file error.
+/// Suppression options are accepted only for records whose visible output is
+/// independently lifted; a cosmetic line may disappear with its following
+/// `PATCOPY` rectangle only when their one-device-pixel geometry and color
+/// prove that the later opaque rectangle completely covers the line.
 /// For non-placeable WMF streams, `options.wmf_external_header` supplies the
 /// same `METAFILEPICT` playback rectangle used by raster replay.
 pub fn extract_metafile_vector_scene_with_options(
@@ -81,7 +88,7 @@ pub fn extract_metafile_vector_scene_with_options(
   }
 
   let result = if is_emf(data) {
-    extract_emf_scene(data)
+    extract_emf_scene(data, options)
   } else {
     extract_wmf_scene(data, options)
   };
@@ -98,7 +105,8 @@ enum VectorBrush {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum VectorPen {
   Null,
-  Visible,
+  SolidCosmetic([u8; 3]),
+  Unsupported,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -187,6 +195,40 @@ impl VectorMapping {
       / self.surface_height;
     (x.is_finite() && y.is_finite()).then_some(MetafileVectorPoint { x, y })
   }
+
+  fn reset_for_emf_device_context(mut self) -> Self {
+    let width = self.surface_width.max(1.0).round() as i32;
+    let height = self.surface_height.max(1.0).round() as i32;
+    self.window_org_x = 0;
+    self.window_org_y = 0;
+    self.window_ext_x = width;
+    self.window_ext_y = height;
+    self.viewport_org_x = 0;
+    self.viewport_org_y = 0;
+    self.viewport_ext_x = width;
+    self.viewport_ext_y = height;
+    self.world_transform = EmfTransform::identity();
+    self
+  }
+
+  fn is_identity_device_mapping(self) -> bool {
+    let width = self.surface_width.max(1.0).round() as i32;
+    let height = self.surface_height.max(1.0).round() as i32;
+    self.window_org_x == 0
+      && self.window_org_y == 0
+      && self.window_ext_x == width
+      && self.window_ext_y == height
+      && self.viewport_org_x == 0
+      && self.viewport_org_y == 0
+      && self.viewport_ext_x == width
+      && self.viewport_ext_y == height
+      && self.world_transform.m11 == 1.0
+      && self.world_transform.m12 == 0.0
+      && self.world_transform.m21 == 0.0
+      && self.world_transform.m22 == 1.0
+      && self.world_transform.dx == 0.0
+      && self.world_transform.dy == 0.0
+  }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -194,6 +236,7 @@ struct VectorGraphicsState {
   mapping: VectorMapping,
   brush: VectorBrush,
   pen: VectorPen,
+  binary_raster_operation: Option<WmfBinaryRasterOperation>,
   fill_rule: MetafileVectorFillRule,
   current_pos: EmfPoint,
 }
@@ -211,7 +254,8 @@ impl VectorInterpreter {
         mapping,
         // Win32 initializes a memory DC with WHITE_BRUSH and BLACK_PEN.
         brush: VectorBrush::Solid([255; 3]),
-        pen: VectorPen::Visible,
+        pen: VectorPen::SolidCosmetic([0; 3]),
+        binary_raster_operation: Some(WmfBinaryRasterOperation::CopyPen),
         fill_rule: MetafileVectorFillRule::Alternate,
         current_pos: EmfPoint { x: 0, y: 0 },
       },
@@ -277,14 +321,162 @@ impl VectorInterpreter {
   }
 }
 
-fn extract_emf_scene(data: &[u8]) -> Result<Option<MetafileVectorScene>, String> {
+struct VectorEmfDeviceContextBridge {
+  graphics: VectorGraphicsState,
+  saved: Vec<VectorGraphicsState>,
+  objects: HashMap<u32, VectorObject>,
+}
+
+fn begin_vector_emf_device_context(
+  interpreter: &mut VectorInterpreter,
+  objects: &mut HashMap<u32, VectorObject>,
+) -> VectorEmfDeviceContextBridge {
+  let bridge = VectorEmfDeviceContextBridge {
+    graphics: interpreter.graphics,
+    saved: std::mem::take(&mut interpreter.saved),
+    objects: std::mem::take(objects),
+  };
+  interpreter.graphics = VectorGraphicsState {
+    mapping: interpreter.graphics.mapping.reset_for_emf_device_context(),
+    brush: VectorBrush::Unsupported,
+    pen: VectorPen::SolidCosmetic([0; 3]),
+    binary_raster_operation: Some(WmfBinaryRasterOperation::CopyPen),
+    fill_rule: MetafileVectorFillRule::Alternate,
+    current_pos: EmfPoint { x: 0, y: 0 },
+  };
+  bridge
+}
+
+fn end_vector_emf_device_context(
+  bridge: VectorEmfDeviceContextBridge,
+  interpreter: &mut VectorInterpreter,
+  objects: &mut HashMap<u32, VectorObject>,
+) {
+  interpreter.graphics = bridge.graphics;
+  interpreter.saved = bridge.saved;
+  *objects = bridge.objects;
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct VectorEmfPlusControl {
+  header: bool,
+  get_dc: bool,
+}
+
+fn nonpainting_emf_plus_control(
+  records: &[crate::emfplus::EmfPlusRecord],
+) -> Result<Option<VectorEmfPlusControl>, String> {
+  let mut control = VectorEmfPlusControl::default();
+  for record in records {
+    let parsed = record
+      .as_ref()
+      .parse_data_relaxed()
+      .map_err(|error| error.to_string())?;
+    match parsed {
+      EmfPlusRecordData::Header(_) => control.header = true,
+      EmfPlusRecordData::GetDc => control.get_dc = true,
+      EmfPlusRecordData::Eof
+      | EmfPlusRecordData::SetPixelOffsetMode(_)
+      | EmfPlusRecordData::SetAntiAliasMode(_)
+      | EmfPlusRecordData::SetCompositingQuality(_)
+      | EmfPlusRecordData::SetPageTransform(_)
+      | EmfPlusRecordData::SetInterpolationMode(_)
+      | EmfPlusRecordData::SetWorldTransform(_) => {}
+      _ => return Ok(None),
+    }
+  }
+  Ok(Some(control))
+}
+
+fn is_lifted_emf_solid_patcopy(value: &crate::emf::EmrBitBlt, brush: VectorBrush) -> bool {
+  matches!(brush, VectorBrush::Solid(_))
+    && value.raster_operation_code() == WmfTernaryRasterOperationCode::PATCOPY
+    && value.bitmap.is_none()
+    && value.dest_size.cx > 0
+    && value.dest_size.cy > 0
+}
+
+fn emf_line_is_covered_by_following_patcopy(
+  start: EmfPoint,
+  end: EmfPoint,
+  graphics: VectorGraphicsState,
+  value: &crate::emf::EmrBitBlt,
+) -> bool {
+  let (VectorPen::SolidCosmetic(pen_color), VectorBrush::Solid(brush_color)) =
+    (graphics.pen, graphics.brush)
+  else {
+    return false;
+  };
+  if pen_color != brush_color
+    || graphics.binary_raster_operation != Some(WmfBinaryRasterOperation::CopyPen)
+    || !graphics.mapping.is_identity_device_mapping()
+    || !is_lifted_emf_solid_patcopy(value, graphics.brush)
+  {
+    return false;
+  }
+
+  let horizontal = start.y == end.y
+    && end.x > start.x
+    && value.dest.x == start.x
+    && value.dest.y == start.y
+    && value.dest_size.cx == end.x - start.x
+    && value.dest_size.cy == 1;
+  let vertical = start.x == end.x
+    && end.y > start.y
+    && value.dest.x == start.x
+    && value.dest.y == start.y
+    && value.dest_size.cx == 1
+    && value.dest_size.cy == end.y - start.y;
+  horizontal || vertical
+}
+
+fn emf_line_can_be_covered_by_patcopy(
+  start: EmfPoint,
+  end: EmfPoint,
+  graphics: VectorGraphicsState,
+) -> bool {
+  matches!(graphics.pen, VectorPen::SolidCosmetic(_))
+    && graphics.binary_raster_operation == Some(WmfBinaryRasterOperation::CopyPen)
+    && graphics.mapping.is_identity_device_mapping()
+    && ((start.y == end.y && end.x > start.x) || (start.x == end.x && end.y > start.y))
+}
+
+fn extract_emf_scene(
+  data: &[u8],
+  options: RenderOptions,
+) -> Result<Option<MetafileVectorScene>, String> {
   let metafile = EmfMetafileRef::from_bytes(data).map_err(|error| error.to_string())?;
   let mut interpreter = VectorInterpreter::new(VectorMapping::emf(data)?);
   let mut objects = HashMap::<u32, VectorObject>::new();
   let mut saw_eof = false;
+  let mut saw_intersect_clip = false;
+  let decomposed_stream = options.suppress_text && options.suppress_solid_pattern_rects;
+  let mut emf_plus_playback = false;
+  let mut emf_device_context = None;
+  let mut pending_line = None;
+  let mut records = metafile.records();
 
-  for record in metafile.records() {
+  while let Some(record) = records.next() {
     let record = record.parse_data().map_err(|error| error.to_string())?;
+    let is_emf_plus_comment = matches!(&record, EmfRecordData::Comment(EmrComment::EmfPlus { .. }));
+    if is_emf_plus_comment && let Some(bridge) = emf_device_context.take() {
+      end_vector_emf_device_context(bridge, &mut interpreter, &mut objects);
+    }
+    if emf_plus_playback
+      && emf_device_context.is_none()
+      && !is_emf_plus_comment
+      && !matches!(&record, EmfRecordData::Eof(_))
+    {
+      continue;
+    }
+    if pending_line.is_some()
+      && !matches!(
+        &record,
+        EmfRecordData::SelectObject(_) | EmfRecordData::BitBlt(_)
+      )
+    {
+      return Ok(None);
+    }
     let supported = match record {
       EmfRecordData::Header(_) => true,
       EmfRecordData::Eof(_) => {
@@ -360,6 +552,10 @@ fn extract_emf_scene(data: &[u8]) -> Result<Option<MetafileVectorScene>, String>
         interpreter.graphics.fill_rule = rule;
         true
       }
+      EmfRecordData::SetRop2(value) => {
+        interpreter.graphics.binary_raster_operation = value.binary_raster_operation_kind();
+        interpreter.graphics.binary_raster_operation.is_some()
+      }
       EmfRecordData::SaveDc => {
         interpreter.save();
         true
@@ -385,26 +581,29 @@ fn extract_emf_scene(data: &[u8]) -> Result<Option<MetafileVectorScene>, String>
         true
       }
       EmfRecordData::CreatePen(value) => {
-        objects.insert(
-          value.object_index,
-          VectorObject::Pen(
-            if value.pen_line_style_kind() == Some(crate::emf::EmrPenLineStyle::Null) {
-              VectorPen::Null
-            } else {
-              VectorPen::Visible
-            },
-          ),
-        );
+        let pen = match value.pen_line_style_kind() {
+          Some(EmrPenLineStyle::Null) => VectorPen::Null,
+          Some(EmrPenLineStyle::Solid)
+            if value.pen_type_kind() == Some(EmrPenType::Cosmetic)
+              && value.width.x == 0
+              && value.width.y == 0
+              && value.pen_reserved_bits() == 0 =>
+          {
+            VectorPen::SolidCosmetic(color(value.color))
+          }
+          _ => VectorPen::Unsupported,
+        };
+        objects.insert(value.object_index, VectorObject::Pen(pen));
         true
       }
       EmfRecordData::ExtCreatePen(value) => {
         objects.insert(
           value.object_index,
           VectorObject::Pen(
-            if value.pen_line_style_kind() == Some(crate::emf::EmrPenLineStyle::Null) {
+            if value.pen_line_style_kind() == Some(EmrPenLineStyle::Null) {
               VectorPen::Null
             } else {
-              VectorPen::Visible
+              VectorPen::Unsupported
             },
           ),
         );
@@ -437,8 +636,19 @@ fn extract_emf_scene(data: &[u8]) -> Result<Option<MetafileVectorScene>, String>
         true
       }
       EmfRecordData::LineTo(value) => {
-        let supported = interpreter.graphics.pen == VectorPen::Null;
-        interpreter.graphics.current_pos = point_l(value.point);
+        let start = interpreter.graphics.current_pos;
+        let end = point_l(value.point);
+        let supported = if interpreter.graphics.pen == VectorPen::Null {
+          true
+        } else if options.suppress_solid_pattern_rects
+          && emf_line_can_be_covered_by_patcopy(start, end, interpreter.graphics)
+        {
+          pending_line = Some((start, end, interpreter.graphics));
+          true
+        } else {
+          false
+        };
+        interpreter.graphics.current_pos = end;
         supported
       }
       EmfRecordData::Polyline(_) | EmfRecordData::Polyline16(_) => {
@@ -475,8 +685,43 @@ fn extract_emf_scene(data: &[u8]) -> Result<Option<MetafileVectorScene>, String>
         let polygons = split_emf_polygons_s(&value.counts, &value.points);
         interpreter.emit_polygons(&polygons)
       }
+      EmfRecordData::IntersectClipRect(_) if decomposed_stream => {
+        saw_intersect_clip = true;
+        true
+      }
       EmfRecordData::ExtSelectClipRgn(value) => {
         value.region_data.is_empty() && value.region_mode_kind() == Some(EmrRegionMode::Copy)
+      }
+      EmfRecordData::ExtTextOutA(_)
+      | EmfRecordData::ExtTextOutW(_)
+      | EmfRecordData::PolyTextOutA(_)
+      | EmfRecordData::PolyTextOutW(_)
+        if options.suppress_text =>
+      {
+        true
+      }
+      EmfRecordData::BitBlt(value) if options.suppress_solid_pattern_rects => {
+        if let Some((start, end, mut graphics)) = pending_line.take() {
+          graphics.brush = interpreter.graphics.brush;
+          emf_line_is_covered_by_following_patcopy(start, end, graphics, &value)
+        } else {
+          is_lifted_emf_solid_patcopy(&value, interpreter.graphics.brush)
+        }
+      }
+      EmfRecordData::Comment(EmrComment::EmfPlus { records, .. }) if decomposed_stream => {
+        match nonpainting_emf_plus_control(&records)? {
+          Some(control) => {
+            emf_plus_playback |= control.header;
+            if emf_plus_playback && control.get_dc {
+              emf_device_context = Some(begin_vector_emf_device_context(
+                &mut interpreter,
+                &mut objects,
+              ));
+            }
+            true
+          }
+          None => false,
+        }
       }
       EmfRecordData::Comment(EmrComment::EmfPlus { .. }) => false,
       EmfRecordData::Comment(
@@ -497,7 +742,6 @@ fn extract_emf_scene(data: &[u8]) -> Result<Option<MetafileVectorScene>, String>
       EmfRecordData::SetBrushOrgEx(_)
       | EmfRecordData::SetMapperFlags(_)
       | EmfRecordData::SetBkMode(_)
-      | EmfRecordData::SetRop2(_)
       | EmfRecordData::SetStretchBltMode(_)
       | EmfRecordData::SetTextAlign(_)
       | EmfRecordData::SetColorAdjustment(_)
@@ -519,6 +763,9 @@ fn extract_emf_scene(data: &[u8]) -> Result<Option<MetafileVectorScene>, String>
     }
   }
 
+  if pending_line.is_some() || (saw_intersect_clip && !interpreter.fills.is_empty()) {
+    return Ok(None);
+  }
   Ok(saw_eof.then(|| interpreter.finish()))
 }
 
@@ -633,7 +880,7 @@ fn extract_wmf_scene(
             if value.pen.pen_line_style_kind() == Some(WmfPenLineStyle::Null) {
               VectorPen::Null
             } else {
-              VectorPen::Visible
+              VectorPen::Unsupported
             },
           ),
         );
@@ -732,9 +979,8 @@ fn select_emf_object(
     Some(EmrStockObject::DkGrayBrush) => VectorObject::Brush(VectorBrush::Solid([64; 3])),
     Some(EmrStockObject::BlackBrush) => VectorObject::Brush(VectorBrush::Solid([0; 3])),
     Some(EmrStockObject::NullBrush) => VectorObject::Brush(VectorBrush::Null),
-    Some(EmrStockObject::WhitePen | EmrStockObject::BlackPen) => {
-      VectorObject::Pen(VectorPen::Visible)
-    }
+    Some(EmrStockObject::WhitePen) => VectorObject::Pen(VectorPen::SolidCosmetic([255; 3])),
+    Some(EmrStockObject::BlackPen) => VectorObject::Pen(VectorPen::SolidCosmetic([0; 3])),
     Some(EmrStockObject::NullPen) => VectorObject::Pen(VectorPen::Null),
     Some(
       EmrStockObject::OemFixedFont

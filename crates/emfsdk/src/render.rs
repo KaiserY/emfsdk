@@ -11765,6 +11765,87 @@ mod tests {
   }
 
   #[test]
+  fn emf_decomposed_scene_accepts_only_a_line_fully_covered_by_lifted_patcopy() {
+    const GRID_COLOR: u32 = 0x00dd_dcda;
+    let metafile = metafile_with_header_bounds(
+      9,
+      9,
+      vec![
+        create_cosmetic_pen_record(1, GRID_COLOR),
+        create_solid_brush_record(2, GRID_COLOR),
+        select_object_record(1),
+        select_object_record(2),
+        move_to_ex_record(0, 4),
+        line_to_record(8, 4),
+        select_object_record(crate::emf::EmrStockObject::BlackPen.raw()),
+        source_less_bit_blt_rect_record(
+          0,
+          4,
+          8,
+          1,
+          WmfTernaryRasterOperationCode::PATCOPY.canonical_raw(),
+        ),
+      ],
+    );
+
+    assert_eq!(
+      extract_metafile_vector_scene(&metafile, Some("image/x-emf")).unwrap(),
+      None,
+      "ordinary playback must retain the visible cosmetic line and PATCOPY"
+    );
+    assert_eq!(
+      extract_metafile_vector_scene_with_options(
+        &metafile,
+        Some("image/x-emf"),
+        RenderOptions {
+          suppress_solid_pattern_rects: true,
+          ..RenderOptions::default()
+        },
+      )
+      .unwrap(),
+      Some(MetafileVectorScene::default()),
+      "the later opaque PATCOPY is the complete visible replacement for the matching line"
+    );
+
+    for (brush_color, rect_width, rect_height) in
+      [(0x00dd_dcdb, 8, 1), (GRID_COLOR, 7, 1), (GRID_COLOR, 8, 2)]
+    {
+      let counterexample = metafile_with_header_bounds(
+        9,
+        9,
+        vec![
+          create_cosmetic_pen_record(1, GRID_COLOR),
+          create_solid_brush_record(2, brush_color),
+          select_object_record(1),
+          select_object_record(2),
+          move_to_ex_record(0, 4),
+          line_to_record(8, 4),
+          source_less_bit_blt_rect_record(
+            0,
+            4,
+            rect_width,
+            rect_height,
+            WmfTernaryRasterOperationCode::PATCOPY.canonical_raw(),
+          ),
+        ],
+      );
+      assert_eq!(
+        extract_metafile_vector_scene_with_options(
+          &counterexample,
+          Some("image/x-emf"),
+          RenderOptions {
+            suppress_solid_pattern_rects: true,
+            ..RenderOptions::default()
+          },
+        )
+        .unwrap(),
+        None,
+        "a mismatched color or rectangle cannot prove that PATCOPY covers the line"
+      );
+    }
+  }
+
+  #[test]
   fn emf_binary_raster_operations_follow_rop2_boolean_semantics() {
     let pen = EmfColor {
       r: 0b1010_1010,
@@ -11939,6 +12020,16 @@ mod tests {
     create_brush_record(object_id, WmfBrushStyle::Solid, color_ref)
   }
 
+  fn create_cosmetic_pen_record(object_id: u32, color_ref: u32) -> EmfRecord {
+    let mut data = Vec::with_capacity(20);
+    data.extend_from_slice(&object_id.to_le_bytes());
+    data.extend_from_slice(&EmrPenLineStyle::Solid.raw().to_le_bytes());
+    data.extend_from_slice(&0i32.to_le_bytes());
+    data.extend_from_slice(&0i32.to_le_bytes());
+    data.extend_from_slice(&color_ref.to_le_bytes());
+    EmfRecord::new(super::EMR_CREATE_PEN, data)
+  }
+
   fn create_brush_record(object_id: u32, brush_style: WmfBrushStyle, color_ref: u32) -> EmfRecord {
     let mut data = Vec::with_capacity(16);
     data.extend_from_slice(&object_id.to_le_bytes());
@@ -11950,6 +12041,13 @@ mod tests {
 
   fn select_object_record(object_id: u32) -> EmfRecord {
     EmfRecord::new(super::EMR_SELECT_OBJECT, object_id.to_le_bytes().to_vec())
+  }
+
+  fn line_to_record(x: i32, y: i32) -> EmfRecord {
+    let mut data = Vec::with_capacity(8);
+    data.extend_from_slice(&x.to_le_bytes());
+    data.extend_from_slice(&y.to_le_bytes());
+    EmfRecord::new(super::EMR_LINE_TO, data)
   }
 
   fn triangle_polygon16_record() -> EmfRecord {
