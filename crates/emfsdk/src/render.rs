@@ -1,7 +1,7 @@
 use fontique::{
   Attributes as FontAttributes, Collection as FontCollection,
   CollectionOptions as FontCollectionOptions, FontStyle, FontWeight, FontWidth, GenericFamily,
-  QueryFamily, QueryStatus, SourceCache,
+  QueryFamily, QueryStatus, SourceCache, Synthesis as FontSynthesis,
 };
 use image::codecs::png::PngEncoder;
 use image::{ColorType, ImageEncoder};
@@ -13,10 +13,10 @@ use skrifa::raw::types::Tag as FontTableTag;
 use std::collections::HashMap;
 use thiserror::Error;
 use tiny_skia::{
-  FillRule as TinySkiaFillRule, Mask as TinySkiaMask, Path as TinySkiaPath,
-  PathBuilder as TinySkiaPathBuilder, PathSegment as TinySkiaPathSegment, Point as TinySkiaPoint,
-  Transform as TinySkiaTransform,
+  Path as TinySkiaPath, PathBuilder as TinySkiaPathBuilder, PathSegment as TinySkiaPathSegment,
+  Point as TinySkiaPoint, Stroke as TinySkiaStroke, Transform as TinySkiaTransform,
 };
+use zeno::{Command as ZenoCommand, Mask as ZenoMask, Point as ZenoPoint};
 
 use crate::bitmap::{
   BitmapCompression, DeviceIndependentBitmap, DibColorTable, DibColorUsage, DibHeader,
@@ -201,6 +201,49 @@ pub struct RenderOptions {
   pub target_width_px: Option<u32>,
   pub target_height_px: Option<u32>,
   pub max_pixels: Option<u32>,
+  /// ClearType contrast used when GDI text is replayed into a color DIB.
+  ///
+  /// Windows exposes this as `SPI_GETFONTSMOOTHINGCONTRAST` in the range
+  /// 1000..=2200. The value divided by 1000 is the device-space gamma used
+  /// by GDI; out-of-range values are clamped to that documented range.
+  /// `None` preserves linear byte blending for callers without a captured
+  /// Windows rendering profile.
+  pub font_smoothing_contrast: Option<u16>,
+  /// Optional width of the host's metafile playback rectangle in device units.
+  ///
+  /// This is deliberately independent from [`Self::target_width_px`]. Office
+  /// fixed output can allocate an `N`-pixel bitmap, replay through a GDI+
+  /// destination rectangle with a different endpoint, and clip the result to
+  /// the allocated surface. Standalone playback defaults to the canvas width.
+  pub playback_width_px: Option<u32>,
+  /// Optional height of the host's metafile playback rectangle in device units.
+  ///
+  /// See [`Self::playback_width_px`]. Standalone playback defaults to the
+  /// canvas height.
+  pub playback_height_px: Option<u32>,
+  /// Optional playback width used only while GDI realizes metafile fonts.
+  ///
+  /// Most hosts use the ordinary playback rectangle above. A host that
+  /// allocates an `N`-pixel surface but exposes a different device endpoint
+  /// to the GDI font mapper can provide that endpoint independently without
+  /// moving or rescaling the remaining metafile records.
+  pub text_playback_width_px: Option<u32>,
+  /// Optional playback height used only while GDI realizes metafile fonts.
+  ///
+  /// `None` inherits [`Self::playback_height_px`].
+  pub text_playback_height_px: Option<u32>,
+  /// Optional playback width used while a monochrome destination realizes
+  /// metafile fonts.
+  ///
+  /// Transparent GDI+ playback can realize its color bitmap and one-bit
+  /// coverage surface through different destination endpoints. `None`
+  /// inherits [`Self::text_playback_width_px`] so ordinary callers retain one
+  /// shared font-mapper rectangle.
+  pub monochrome_text_playback_width_px: Option<u32>,
+  /// Optional monochrome font-playback height.
+  ///
+  /// `None` inherits [`Self::text_playback_height_px`].
+  pub monochrome_text_playback_height_px: Option<u32>,
   /// Preserve an unpainted destination as transparent output.
   ///
   /// GDI raster operations still require concrete destination samples. The
@@ -265,6 +308,33 @@ impl RenderOptions {
     let height = resolve_axis(self.target_height_px, natural_height);
     clamp_canvas_size(width, height, self.max_pixels)
   }
+
+  fn output_scale(
+    self,
+    playback_extent: Option<u32>,
+    canvas_extent: usize,
+    natural_extent: usize,
+  ) -> f32 {
+    playback_extent.unwrap_or(canvas_extent as u32) as f32 / natural_extent.max(1) as f32
+  }
+
+  fn text_playback_width(self, surface: GdiTextSurface) -> Option<u32> {
+    match surface {
+      GdiTextSurface::Color => self.text_playback_width_px,
+      GdiTextSurface::Monochrome => self
+        .monochrome_text_playback_width_px
+        .or(self.text_playback_width_px),
+    }
+  }
+
+  fn text_playback_height(self, surface: GdiTextSurface) -> Option<u32> {
+    match surface {
+      GdiTextSurface::Color => self.text_playback_height_px,
+      GdiTextSurface::Monochrome => self
+        .monochrome_text_playback_height_px
+        .or(self.text_playback_height_px),
+    }
+  }
 }
 
 #[derive(Debug, Error)]
@@ -308,8 +378,15 @@ pub fn decode_metafile_as_raster_with_options(
     return decode_transparent_metafile_as_raster(data, content_type, options).map_err(Into::into);
   }
 
-  decode_opaque_metafile_as_raster(data, content_type, options, false, GdiTextSurface::Color)
-    .map_err(Into::into)
+  decode_opaque_metafile_as_raster(
+    data,
+    content_type,
+    options,
+    false,
+    GdiTextSurface::Color,
+    GdiPlusDcMode::Direct,
+  )
+  .map_err(Into::into)
 }
 
 /// Returns the physical playback frame recorded by an EMF header.
@@ -333,12 +410,19 @@ fn decode_opaque_metafile_as_raster(
   options: RenderOptions,
   force_vector_replay: bool,
   text_surface: GdiTextSurface,
+  gdi_plus_dc_mode: GdiPlusDcMode,
 ) -> Result<Option<DecodedMetafile>, String> {
-  if let Some(raster) = decode_emf_as_raster(data, options, force_vector_replay, text_surface)? {
+  if let Some(raster) = decode_emf_as_raster(
+    data,
+    options,
+    force_vector_replay,
+    text_surface,
+    gdi_plus_dc_mode,
+  )? {
     return Ok(Some(raster));
   }
 
-  if let Some(raster) = decode_wmf_as_raster(data, options, text_surface)? {
+  if let Some(raster) = decode_wmf_as_raster(data, options, text_surface, gdi_plus_dc_mode)? {
     return Ok(Some(raster));
   }
 
@@ -357,6 +441,13 @@ fn decode_transparent_metafile_as_raster(
   let mut white_options = options;
   white_options.transparent_background = false;
   white_options.background_color = Some([255; 3]);
+  let mut key_options = options;
+  key_options.transparent_background = false;
+  key_options.background_color = Some([
+    GDI_PLUS_DC_BACKGROUND_KEY.r,
+    GDI_PLUS_DC_BACKGROUND_KEY.g,
+    GDI_PLUS_DC_BACKGROUND_KEY.b,
+  ]);
 
   let Some(color_black) = decode_opaque_metafile_as_raster(
     data,
@@ -364,6 +455,7 @@ fn decode_transparent_metafile_as_raster(
     black_options,
     true,
     GdiTextSurface::Color,
+    GdiPlusDcMode::Scratch,
   )?
   else {
     return Ok(None);
@@ -374,6 +466,7 @@ fn decode_transparent_metafile_as_raster(
     white_options,
     true,
     GdiTextSurface::Color,
+    GdiPlusDcMode::Scratch,
   )?
   .ok_or_else(|| "metafile white-background replay produced no raster".to_string())?;
   let mask_black = decode_opaque_metafile_as_raster(
@@ -382,6 +475,7 @@ fn decode_transparent_metafile_as_raster(
     black_options,
     true,
     GdiTextSurface::Monochrome,
+    GdiPlusDcMode::Scratch,
   )?
   .ok_or_else(|| "metafile monochrome black-background replay produced no raster".to_string())?;
   let mask_white = decode_opaque_metafile_as_raster(
@@ -390,24 +484,48 @@ fn decode_transparent_metafile_as_raster(
     white_options,
     true,
     GdiTextSurface::Monochrome,
+    GdiPlusDcMode::Scratch,
   )?
   .ok_or_else(|| "metafile monochrome white-background replay produced no raster".to_string())?;
+  let color_key = if uses_binary_coverage_surface {
+    Some(
+      decode_opaque_metafile_as_raster(
+        data,
+        content_type,
+        key_options,
+        true,
+        GdiTextSurface::Color,
+        GdiPlusDcMode::Scratch,
+      )?
+      .ok_or_else(|| "metafile scratch-key-background replay produced no raster".to_string())?,
+    )
+  } else {
+    None
+  };
   let color_black = decoded_png_to_rgb(&color_black)?;
   let color_white = decoded_png_to_rgb(&color_white)?;
   let mask_black = decoded_png_to_rgb(&mask_black)?;
   let mask_white = decoded_png_to_rgb(&mask_white)?;
+  let color_key = color_key.as_ref().map(decoded_png_to_rgb).transpose()?;
   if color_black.width != color_white.width
     || color_black.height != color_white.height
     || color_black.width != mask_black.width
     || color_black.height != mask_black.height
     || color_black.width != mask_white.width
     || color_black.height != mask_white.height
+    || color_key
+      .as_ref()
+      .is_some_and(|key| color_black.width != key.width || color_black.height != key.height)
   {
     return Err("metafile black/white replays have different dimensions".to_string());
   }
 
   let rgba = if uses_binary_coverage_surface {
     straight_rgba_with_binary_coverage(
+      &color_key
+        .as_ref()
+        .ok_or_else(|| "metafile scratch-key replay is missing".to_string())?
+        .rgb,
       &color_black.rgb,
       &color_white.rgb,
       &mask_black.rgb,
@@ -432,6 +550,14 @@ pub struct MetafileTextRun {
   pub text: String,
   pub x: f32,
   pub y: f32,
+  /// Clockwise baseline rotation in the normalized, top-left-origin playback
+  /// coordinate system.
+  ///
+  /// WMF `LOGFONT.lfEscapement` is counter-clockwise in tenths of a degree;
+  /// mapping it through the device axes produces this directly renderable
+  /// angle. The character orientation follows the escapement in WMF's
+  /// compatible graphics mode.
+  pub rotation_degrees: f32,
   pub font_size: Option<f32>,
   pub font_family: Option<String>,
   pub bold: bool,
@@ -1144,6 +1270,7 @@ struct WmfTextSnapshot {
   current_pos_x: i32,
   current_pos_y: i32,
   current_font_height: i32,
+  current_font_escapement: i32,
   current_font_family: Option<String>,
   current_font_char_set: u8,
   current_font_weight: u16,
@@ -1156,6 +1283,7 @@ struct WmfTextSnapshot {
 #[derive(Clone, Debug)]
 struct WmfTextFont {
   height: i32,
+  escapement: i32,
   family: Option<String>,
   char_set: u8,
   weight: u16,
@@ -1178,6 +1306,7 @@ struct WmfTextState {
   current_pos_y: i32,
   objects: Vec<Option<WmfTextFont>>,
   current_font_height: i32,
+  current_font_escapement: i32,
   current_font_family: Option<String>,
   current_font_char_set: u8,
   current_font_weight: u16,
@@ -1209,6 +1338,7 @@ impl WmfTextState {
       current_pos_y: 0,
       objects: vec![None; metafile.header.number_of_objects as usize],
       current_font_height: 12,
+      current_font_escapement: 0,
       current_font_family: None,
       current_font_char_set: crate::wmf::WmfCharacterSet::Ansi.raw(),
       current_font_weight: 400,
@@ -1225,6 +1355,7 @@ impl WmfTextState {
   fn insert_object(&mut self, font: Option<WmfTextFont>) {
     let object = font.unwrap_or(WmfTextFont {
       height: 0,
+      escapement: 0,
       family: None,
       char_set: crate::wmf::WmfCharacterSet::Ansi.raw(),
       weight: 400,
@@ -1243,6 +1374,7 @@ impl WmfTextState {
       && font.height != 0
     {
       self.current_font_height = font.height.abs().max(7);
+      self.current_font_escapement = font.escapement;
       self.current_font_family = font.family.clone();
       self.current_font_char_set = font.char_set;
       self.current_font_weight = font.weight;
@@ -1265,6 +1397,7 @@ impl WmfTextState {
       current_pos_x: self.current_pos_x,
       current_pos_y: self.current_pos_y,
       current_font_height: self.current_font_height,
+      current_font_escapement: self.current_font_escapement,
       current_font_family: self.current_font_family.clone(),
       current_font_char_set: self.current_font_char_set,
       current_font_weight: self.current_font_weight,
@@ -1290,6 +1423,7 @@ impl WmfTextState {
     self.current_pos_x = snapshot.current_pos_x;
     self.current_pos_y = snapshot.current_pos_y;
     self.current_font_height = snapshot.current_font_height;
+    self.current_font_escapement = snapshot.current_font_escapement;
     self.current_font_family = snapshot.current_font_family;
     self.current_font_char_set = snapshot.current_font_char_set;
     self.current_font_weight = snapshot.current_font_weight;
@@ -1334,18 +1468,35 @@ impl WmfTextState {
     } else {
       (i32::from(x), i32::from(y))
     };
-    let aligned_x = if self
+    // [MS-WMF] 2.2.1.2 defines Escapement as the device-x angle of the
+    // baseline. Wine's ExtTextOut playback realizes that baseline as
+    // (cos(theta), -sin(theta)) before mapping it through the window and
+    // viewport extents. LibreOffice likewise installs lfEscapement as the
+    // imported font orientation. Keep alignment and Dx movement on that same
+    // axis instead of silently treating rotated WMF text as horizontal.
+    let escapement_radians = (self.current_font_escapement as f32 / 10.0).to_radians();
+    let logical_axis_x = escapement_radians.cos();
+    let logical_axis_y = -escapement_radians.sin();
+    let mapped_axis_x = logical_axis_x * scale_x;
+    let mapped_axis_y = logical_axis_y * scale_y;
+    let mapped_axis_length = mapped_axis_x.hypot(mapped_axis_y);
+    let rotation_degrees = if mapped_axis_length > f32::EPSILON {
+      mapped_axis_y.atan2(mapped_axis_x).to_degrees()
+    } else {
+      0.0
+    };
+    let alignment_shift = if self
       .text_alignment
       .contains(WmfTextAlignmentModeFlags::CENTER)
     {
-      reference_x.saturating_sub(logical_width.unwrap_or_default() / 2)
+      logical_width.unwrap_or_default() / 2
     } else if self
       .text_alignment
       .contains(WmfTextAlignmentModeFlags::RIGHT)
     {
-      reference_x.saturating_sub(logical_width.unwrap_or_default())
+      logical_width.unwrap_or_default()
     } else {
-      reference_x
+      0
     };
     let realize_coordinate = |value: f32| {
       if self.round_device_coordinates {
@@ -1354,14 +1505,15 @@ impl WmfTextState {
         value
       }
     };
-    let mapped_x = realize_coordinate(
-      self.viewport_org_x as f32 + (aligned_x - self.window_org_x) as f32 * scale_x,
-    );
-    let mapped_reference_y = realize_coordinate(
-      self.viewport_org_y as f32 + (reference_y - self.window_org_y) as f32 * scale_y,
-    );
+    let mapped_reference_x =
+      self.viewport_org_x as f32 + (reference_x - self.window_org_x) as f32 * scale_x;
+    let mapped_reference_y =
+      self.viewport_org_y as f32 + (reference_y - self.window_org_y) as f32 * scale_y;
+    let mapped_aligned_x = mapped_reference_x - alignment_shift as f32 * mapped_axis_x;
+    let mapped_aligned_y = mapped_reference_y - alignment_shift as f32 * mapped_axis_y;
     let font = WmfTextFont {
       height: self.current_font_height,
+      escapement: self.current_font_escapement,
       family: self.current_font_family.clone(),
       char_set: self.current_font_char_set,
       weight: self.current_font_weight,
@@ -1373,23 +1525,39 @@ impl WmfTextState {
     // the requested LOGFONT character height. Use the same realized-face
     // metrics as EMF extraction and raster playback; retain lfHeight only as
     // the no-font fallback inside `baseline_for_alignment`.
-    let mapped_font_height = self.current_font_height.abs() as f32 * scale_y.abs();
+    let logical_normal_x = escapement_radians.sin();
+    let logical_normal_y = escapement_radians.cos();
+    let mapped_normal_x = logical_normal_x * scale_x;
+    let mapped_normal_y = logical_normal_y * scale_y;
+    let mapped_normal_length = mapped_normal_x.hypot(mapped_normal_y);
+    let mapped_font_height =
+      self.current_font_height.abs() as f32 * mapped_normal_length.max(f32::EPSILON);
+    let realized_reference_y = realize_coordinate(mapped_reference_y);
     let continuous_baseline = self.font_cache.baseline_for_alignment(
       &font,
       mapped_font_height.max(1.0),
-      mapped_reference_y,
+      realized_reference_y,
       self.text_alignment,
     );
     // Windows exposes TEXTMETRIC ascent/descent in integer device pixels.
     // Keep the mapped reference coordinate intact, but realize the alignment
     // advance on that integer grid before normalizing it for a vector host.
-    let alignment_advance = continuous_baseline - mapped_reference_y;
+    let alignment_advance = continuous_baseline - realized_reference_y;
     let realized_advance = if alignment_advance.is_sign_negative() {
       alignment_advance.floor()
     } else {
       alignment_advance.ceil()
     };
-    let mapped_y = mapped_reference_y + realized_advance;
+    let (normal_x, normal_y) = if mapped_normal_length > f32::EPSILON {
+      (
+        mapped_normal_x / mapped_normal_length,
+        mapped_normal_y / mapped_normal_length,
+      )
+    } else {
+      (0.0, 1.0)
+    };
+    let mapped_x = realize_coordinate(mapped_aligned_x + normal_x * realized_advance);
+    let mapped_y = realize_coordinate(mapped_aligned_y + normal_y * realized_advance);
     let advances = logical_advances.map(|values| {
       if self.round_device_coordinates {
         let values = values
@@ -1397,7 +1565,9 @@ impl WmfTextState {
           .map(|value| i32::from(*value))
           .collect::<Vec<_>>();
         cumulative_mapped_advances(&values, |logical_cumulative| {
-          (logical_cumulative as f32 * scale_x).round()
+          let x = (logical_cumulative as f32 * mapped_axis_x).round();
+          let y = (logical_cumulative as f32 * mapped_axis_y).round();
+          x.hypot(y).copysign(logical_cumulative as f32)
         })
         .into_iter()
         .map(|advance| advance / self.natural_width)
@@ -1405,7 +1575,7 @@ impl WmfTextState {
       } else {
         values
           .iter()
-          .map(|advance| f32::from(*advance) * scale_x / self.natural_width)
+          .map(|advance| f32::from(*advance) * mapped_axis_length / self.natural_width)
           .collect::<Vec<_>>()
       }
     });
@@ -1413,7 +1583,8 @@ impl WmfTextState {
       text,
       x: mapped_x / self.natural_width,
       y: mapped_y / self.natural_height,
-      font_size: Some(self.current_font_height.abs() as f32 * scale_y.abs() / self.natural_height),
+      rotation_degrees,
+      font_size: Some(mapped_font_height / self.natural_height),
       font_family: self.current_font_family.clone(),
       bold: self.current_font_bold,
       italic: self.current_font_italic,
@@ -1425,8 +1596,9 @@ impl WmfTextState {
       requires_raster_backdrop: false,
     };
     if update_current_position && let Some(logical_width) = logical_width {
-      self.current_pos_x = aligned_x.saturating_add(logical_width);
-      self.current_pos_y = reference_y;
+      let remaining_width = logical_width.saturating_sub(alignment_shift) as f32;
+      self.current_pos_x = (reference_x as f32 + remaining_width * logical_axis_x).round() as i32;
+      self.current_pos_y = (reference_y as f32 + remaining_width * logical_axis_y).round() as i32;
     }
     Some(run)
   }
@@ -1964,6 +2136,7 @@ fn wmf_text_font(value: &crate::wmf::WmfFontObject) -> WmfTextFont {
   };
   WmfTextFont {
     height: i32::from(value.height),
+    escapement: i32::from(value.escapement),
     family,
     char_set,
     weight: value.weight.max(0) as u16,
@@ -2090,6 +2263,7 @@ fn decode_emf_as_raster(
   options: RenderOptions,
   force_vector_replay: bool,
   text_surface: GdiTextSurface,
+  gdi_plus_dc_mode: GdiPlusDcMode,
 ) -> Result<Option<DecodedMetafile>, String> {
   let Some(mut pos) = emf_header_record_size(data) else {
     return Ok(None);
@@ -2130,12 +2304,16 @@ fn decode_emf_as_raster(
   }
 
   if needs_vector_replay || force_vector_replay {
-    return decode_vector_emf_as_png(data, options, text_surface).map(Some);
+    return decode_vector_emf_as_png_with_dc_mode(data, options, text_surface, gdi_plus_dc_mode)
+      .map(Some);
   }
 
   let (record_type, record_offset, record_size) = match bitmap_record {
     Some(record) => record,
-    None => return decode_vector_emf_as_png(data, options, text_surface).map(Some),
+    None => {
+      return decode_vector_emf_as_png_with_dc_mode(data, options, text_surface, gdi_plus_dc_mode)
+        .map(Some);
+    }
   };
   decode_bitmap_record_as_raster(data, record_type, record_offset, record_size).map(Some)
 }
@@ -2443,18 +2621,21 @@ impl EmfTextState {
     (y1 - y0).abs()
   }
 
-  fn map_horizontal_distance(&self, logical_width: i64) -> f32 {
-    let width = logical_width as f32;
-    let (scale_x, scale_y) = emf_window_viewport_scale(
-      self.map_mode,
-      self.window_ext_x,
-      self.window_ext_y,
-      self.viewport_ext_x,
-      self.viewport_ext_y,
-    );
-    let x = width * self.world_transform.m11 * scale_x * self.playback_scale_x;
-    let y = width * self.world_transform.m12 * scale_y * self.playback_scale_y;
-    x.hypot(y)
+  fn map_horizontal_distance(&self, logical_origin: EmfPoint, logical_width: i64) -> f32 {
+    let width = i32::try_from(logical_width).unwrap_or(if logical_width < 0 {
+      i32::MIN
+    } else {
+      i32::MAX
+    });
+    let endpoint = EmfPoint {
+      x: logical_origin.x.saturating_add(width),
+      y: logical_origin.y,
+    };
+    let origin = self.map_point(logical_origin);
+    let endpoint = self.map_point(endpoint);
+    let x = endpoint.0.round() - origin.0.round();
+    let y = endpoint.1.round() - origin.1.round();
+    x.hypot(y).copysign(logical_width as f32)
   }
 
   fn text_run(
@@ -2508,6 +2689,7 @@ impl EmfTextState {
       .as_ref()
       .map(|font| WmfTextFont {
         height: font.height,
+        escapement: 0,
         family: font.family.clone(),
         char_set: font.char_set,
         weight: font.weight,
@@ -2516,6 +2698,7 @@ impl EmfTextState {
       })
       .unwrap_or(WmfTextFont {
         height: 12,
+        escapement: 0,
         family: None,
         char_set: 0,
         weight: 400,
@@ -2534,13 +2717,28 @@ impl EmfTextState {
     );
     let advances = logical_advances.as_deref().map(|values| {
       cumulative_mapped_advances(values, |logical_cumulative| {
-        self.map_horizontal_distance(logical_cumulative) / self.width.max(1) as f32
+        // Wine win32u/font.c ExtTextOutW follows GDI's integer device-grid
+        // contract: accumulate authored Dx in logical units, map that total
+        // through LPtoDP (GDI_ROUND), then subtract the preceding mapped
+        // total.  Rounding only after normalization lets fractional residue
+        // leak between character-cell origins.
+        self
+          .map_horizontal_distance(
+            EmfPoint {
+              x: aligned_x,
+              y: reference.y,
+            },
+            logical_cumulative,
+          )
+          .round()
+          / self.width.max(1) as f32
       })
     });
     let run = MetafileTextRun {
       text,
       x: x / self.width.max(1) as f32,
       y: y / self.height.max(1) as f32,
+      rotation_degrees: 0.0,
       font_size: selected_font
         .as_ref()
         .map(|_| font_size / self.height.max(1) as f32),
@@ -2563,7 +2761,15 @@ impl EmfTextState {
       // using it as the canvas makes identical text wider whenever a
       // metafile happens to have tighter ink bounds.
       width: logical_width
-        .map(|width| self.map_horizontal_distance(i64::from(width)) / self.width.max(1) as f32)
+        .map(|width| {
+          self.map_horizontal_distance(
+            EmfPoint {
+              x: aligned_x,
+              y: reference.y,
+            },
+            i64::from(width),
+          ) / self.width.max(1) as f32
+        })
         .filter(|width| width.is_finite() && *width > 0.0),
       advances,
       requires_raster_backdrop: false,
@@ -2592,6 +2798,8 @@ struct EmfVectorState {
   playback_scale_y: f32,
   output_scale_x: f32,
   output_scale_y: f32,
+  text_output_scale_x: f32,
+  text_output_scale_y: f32,
   map_mode: EmrMapMode,
   window_org_x: i32,
   window_org_y: i32,
@@ -2627,9 +2835,11 @@ struct EmfVectorState {
   emf_plus_objects: Vec<Option<EmfPlusRenderObject>>,
   emf_plus_object_assembler: EmfPlusObjectAssembler,
   font_cache: RenderFontCache,
+  font_gamma_ramp: Option<GdiFontGammaRamp>,
   text_surface: GdiTextSurface,
   suppress_text: bool,
   rgb: Vec<u8>,
+  gdi_plus_dc_destination: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Debug)]
@@ -2792,6 +3002,7 @@ struct RenderFontKey {
 struct RenderFontFace {
   font_data: fontique::Blob<u8>,
   face_index: u32,
+  synthesis: FontSynthesis,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -2915,12 +3126,36 @@ enum GdiTextSurface {
   Monochrome,
 }
 
+/// How a GDI+ bitmap-backed `Graphics` exposes an HDC to classic metafile
+/// playback.
+///
+/// Native GDI+ does not hand GDI the destination bitmap. It supplies a
+/// sentinel-filled scratch DIB and copies only pixels whose final value differs
+/// from that sentinel when the DC is released. Wine's `GdipGetDC`/`GdipReleaseDC`
+/// implements the same contract with `DC_BACKGROUND_KEY = 0x0d0b0c`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GdiPlusDcMode {
+  Direct,
+  Scratch,
+}
+
+// GDI+ fills the 32-bpp DIB returned by GdipGetDC with the DWORD
+// 0x000d0b0c. In RGB channel order that key is (0x0d, 0x0b, 0x0c).
+// GdipReleaseDC copies a pixel back only when its final value differs.
+const GDI_PLUS_DC_BACKGROUND_KEY: EmfColor = EmfColor {
+  r: 0x0d,
+  g: 0x0b,
+  b: 0x0c,
+};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum GdiGlyphFormat {
   Monochrome,
   Grayscale,
   Lcd,
 }
+
+const GDI_CLEARTYPE_X_SAMPLES: i32 = 6;
 
 impl GdiTextSurface {
   fn glyph_format(self, quality: u8) -> GdiGlyphFormat {
@@ -2963,8 +3198,15 @@ struct TextRenderRequest<'a> {
   text: &'a str,
   x: f32,
   baseline_y: f32,
+  rotation_degrees: f32,
+  /// Font mapper size used by the TrueType interpreter before the DC
+  /// transform is applied.
+  hinting_height: f32,
+  /// Device height retained for alignment and the built-in fallback font.
   height: f32,
+  /// Ratio between the mapped device X and Y font axes.
   horizontal_scale: f32,
+  vertical_scale: f32,
   advances: Option<&'a [f32]>,
   surface: GdiTextSurface,
 }
@@ -3012,6 +3254,7 @@ impl RenderFontCache {
         face = Some(RenderFontFace {
           font_data: font.blob.clone(),
           face_index: font.index,
+          synthesis: font.synthesis,
         });
         QueryStatus::Stop
       });
@@ -3032,6 +3275,9 @@ impl RenderFontCache {
     }
     let metrics = self.resolve_face(font).and_then(|face_data| {
       let face = FontRef::from_index(face_data.font_data.as_ref(), face_data.face_index).ok()?;
+      let location = face
+        .axes()
+        .location(face_data.synthesis.variation_settings().iter().copied());
       // The OpenType VDMX table records the hinted yMax/yMin that Windows
       // uses for device Font Height. Wine's load_VDMX follows the negative
       // LOGFONT path by selecting the exact device ppem; positive lfHeight
@@ -3046,7 +3292,7 @@ impl RenderFontCache {
         })
         .flatten();
       Some((
-        face.metrics(FontSize::new(height.max(1.0)), LocationRef::default()),
+        face.metrics(FontSize::new(height.max(1.0)), LocationRef::from(&location)),
         device_metrics,
       ))
     });
@@ -3084,37 +3330,90 @@ impl RenderFontCache {
     let face_data = self.resolve_face(request.font)?.clone();
     let data = face_data.font_data.as_ref();
     let face = FontRef::from_index(data, face_data.face_index).ok()?;
-    let size = FontSize::new(request.height.max(1.0));
-    let location = LocationRef::new(&[]);
+    let vertical_ppem = request.hinting_height.max(1.0);
+    let format = request.surface.glyph_format(request.font.quality);
+    let requested_horizontal_scale = if request.horizontal_scale.is_finite() {
+      request.horizontal_scale.abs()
+    } else {
+      1.0
+    };
+    let horizontal_device_ppem =
+      gdi_realized_font_metric(vertical_ppem * requested_horizontal_scale).max(1.0);
+    let horizontal_advance_scale = horizontal_device_ppem / vertical_ppem;
+    let horizontal_outline_samples = if format == GdiGlyphFormat::Lcd {
+      GDI_CLEARTYPE_X_SAMPLES as f32
+    } else {
+      1.0
+    };
+    let horizontal_outline_ppem = gdi_realized_font_metric(
+      vertical_ppem * requested_horizontal_scale * horizontal_outline_samples,
+    )
+    .max(1.0);
+    let vertical_scale = if request.vertical_scale.is_finite() {
+      request.vertical_scale.abs()
+    } else {
+      1.0
+    };
+    let location = face
+      .axes()
+      .location(face_data.synthesis.variation_settings().iter().copied());
     let outlines = face.outline_glyphs();
     let charmap = face.charmap();
-    let metrics = face.glyph_metrics(size, location);
-    let format = request.surface.glyph_format(request.font.quality);
-    let hinting_key = RenderHintingKey {
-      font: RenderFontKey {
-        family: request.font.family.clone(),
-        weight: request.font.weight,
-        italic: request.font.italic,
-      },
-      pixel_height_bits: request.height.max(1.0).to_bits(),
+    let metrics = face.glyph_metrics(
+      FontSize::new(horizontal_device_ppem),
+      LocationRef::from(&location),
+    );
+    let font_key = RenderFontKey {
+      family: request.font.family.clone(),
+      weight: request.font.weight,
+      italic: request.font.italic,
+    };
+    let vertical_hinting_key = RenderHintingKey {
+      font: font_key.clone(),
+      pixel_height_bits: vertical_ppem.to_bits(),
       format,
     };
-    if !self.hinting_instances.contains_key(&hinting_key) {
+    let horizontal_device_hinting_key = RenderHintingKey {
+      font: font_key.clone(),
+      pixel_height_bits: horizontal_device_ppem.to_bits(),
+      format,
+    };
+    let horizontal_outline_hinting_key = RenderHintingKey {
+      font: font_key,
+      pixel_height_bits: horizontal_outline_ppem.to_bits(),
+      format,
+    };
+    let target = match format {
+      GdiGlyphFormat::Monochrome => Target::Mono,
+      GdiGlyphFormat::Grayscale => SmoothMode::Normal.into(),
+      GdiGlyphFormat::Lcd => Target::Smooth {
+        mode: SmoothMode::Lcd,
+        // Classic GDI exposes rasterizer version 37: ClearType is enabled,
+        // but the version-40 symmetric-rendering GETINFO bit is not.  The
+        // output is consequently 6x1 rather than the later 6x5 mode.
+        symmetric_rendering: false,
+        preserve_linear_metrics: false,
+      },
+    };
+    for (hinting_key, ppem) in [
+      (&vertical_hinting_key, vertical_ppem),
+      (&horizontal_device_hinting_key, horizontal_device_ppem),
+      (&horizontal_outline_hinting_key, horizontal_outline_ppem),
+    ] {
+      if self.hinting_instances.contains_key(hinting_key) {
+        continue;
+      }
       // Wine maps GGO_BITMAP to FT_LOAD_TARGET_MONO, GGO_GRAY* to
       // FT_LOAD_TARGET_NORMAL and horizontal subpixel output to
-      // FT_LOAD_TARGET_LCD. Skrifa exposes those targets directly. Keep their
-      // native interpreter settings: ExtTextOut's Dx array is applied to the
-      // resulting glyph origins and does not require disabling horizontal
-      // grid fitting inside each glyph.
-      let target = match format {
-        GdiGlyphFormat::Monochrome => Target::Mono,
-        GdiGlyphFormat::Grayscale => SmoothMode::Normal.into(),
-        GdiGlyphFormat::Lcd => SmoothMode::Lcd.into(),
-      };
+      // FT_LOAD_TARGET_LCD. Skrifa exposes those interpreter targets
+      // directly; the high-resolution X instance above supplies the separate
+      // six-sample grid used by classic GDI ClearType.
+      // Rasterization below independently maps the result to the six-sample
+      // color-filter grid.
       let hinting = HintingInstance::new(
         &outlines,
-        size,
-        location,
+        FontSize::new(ppem),
+        LocationRef::from(&location),
         HintingOptions {
           engine: Default::default(),
           target,
@@ -3123,53 +3422,204 @@ impl RenderFontCache {
       .ok()?;
       self.hinting_instances.insert(hinting_key.clone(), hinting);
     }
-    let hinting = self.hinting_instances.get(&hinting_key)?;
-    let mut cursor_x = request.x;
+    let rotation_radians = request.rotation_degrees.to_radians();
+    let baseline_axis_x = rotation_radians.cos();
+    let baseline_axis_y = rotation_radians.sin();
+    // GDI only synthesizes bold above the midpoint between FW_MEDIUM (500)
+    // and FW_SEMIBOLD (600). Fontique also reports weaker requested-weight
+    // mismatches as embolden candidates, so retain the Win32 cutoff here.
+    // See Wine win32u/font.c:create_gdi_font.
+    let synthesize_bold = face_data.synthesis.embolden() && request.font.weight > 550;
+    let synthetic_advance = if synthesize_bold { 1.0 } else { 0.0 };
+    let mut cursor_advance = 0.0;
     let mut glyphs = Vec::with_capacity(request.text.chars().count());
     for (index, ch) in request.text.chars().enumerate() {
       if ch == '\n' || ch == '\r' {
         continue;
       }
       if ch.is_whitespace() {
-        cursor_x += request
+        cursor_advance += request
           .advances
           .and_then(|values| values.get(index))
           .copied()
-          .unwrap_or(request.height * 0.35);
+          .unwrap_or(horizontal_device_ppem * 0.35 + synthetic_advance * horizontal_advance_scale);
         continue;
       }
       let glyph_id = charmap.map(ch)?;
       let outline = outlines.get(glyph_id)?;
-      let mut path_builder = TinySkiaPathBuilder::new();
-      let mut collector = TinySkiaGlyphPathCollector {
-        builder: &mut path_builder,
+      let draw_hinted_path = |hinting: &HintingInstance| {
+        let mut path_builder = TinySkiaPathBuilder::new();
+        let mut collector = TinySkiaGlyphPathCollector {
+          builder: &mut path_builder,
+        };
+        let adjusted_metrics = outline
+          .draw(DrawSettings::hinted(hinting, false), &mut collector)
+          .ok()?;
+        Some((adjusted_metrics, path_builder.finish()?))
       };
-      let adjusted_metrics = outline
-        .draw(DrawSettings::hinted(hinting, false), &mut collector)
-        .ok()?;
-      if let Some(path) = path_builder.finish()
-        && let Some(glyph) = rasterize_gdi_glyph(
-          path,
-          cursor_x,
-          request.baseline_y,
-          request.horizontal_scale,
-          format,
-        )
-      {
+      let (_, vertical_path) =
+        draw_hinted_path(self.hinting_instances.get(&vertical_hinting_key)?)?;
+      let (adjusted_metrics, horizontal_device_path) =
+        draw_hinted_path(self.hinting_instances.get(&horizontal_device_hinting_key)?)?;
+      let horizontal_outline_path =
+        if horizontal_outline_hinting_key == horizontal_device_hinting_key {
+          horizontal_device_path
+        } else {
+          draw_hinted_path(
+            self
+              .hinting_instances
+              .get(&horizontal_outline_hinting_key)?,
+          )?
+          .1
+        };
+      let path = if horizontal_outline_hinting_key == vertical_hinting_key {
+        vertical_path
+      } else {
+        combine_gdi_hinted_axes(
+          &horizontal_outline_path,
+          &vertical_path,
+          horizontal_outline_samples.recip(),
+        )?
+      };
+      let path = synthesize_gdi_font_path(
+        path,
+        face_data.synthesis.skew(),
+        synthesize_bold.then_some(vertical_ppem / 24.0),
+      )?;
+      let cursor_x = request.x + cursor_advance * baseline_axis_x;
+      let cursor_y = request.baseline_y + cursor_advance * baseline_axis_y;
+      if let Some(glyph) = rasterize_gdi_glyph(
+        path,
+        cursor_x,
+        cursor_y,
+        request.rotation_degrees,
+        1.0,
+        vertical_scale,
+        format,
+      ) {
         glyphs.push(glyph);
       }
       let advance = adjusted_metrics
         .advance_width
         .or_else(|| metrics.advance_width(glyph_id))
-        .unwrap_or(request.height * 0.5);
-      cursor_x += request
+        .unwrap_or(vertical_ppem * 0.5);
+      cursor_advance += request
         .advances
         .and_then(|values| values.get(index))
         .copied()
-        .unwrap_or(advance);
+        .unwrap_or(advance + synthetic_advance * horizontal_advance_scale);
     }
     Some(glyphs)
   }
+}
+
+/// Combines independently grid-fitted X and Y outlines.
+///
+/// Win32 `GetGlyphOutlineW(GGO_NATIVE)` control matrices show that an
+/// anisotropic Tahoma outline is point-for-point identical to the horizontal
+/// ppem outline on X and the vertical ppem outline on Y. TrueType hinting does
+/// not change contour topology, so a mismatched command stream is an invalid
+/// font result rather than something that can be combined safely.
+fn combine_gdi_hinted_axes(
+  horizontal: &TinySkiaPath,
+  vertical: &TinySkiaPath,
+  horizontal_coordinate_scale: f32,
+) -> Option<TinySkiaPath> {
+  if !horizontal_coordinate_scale.is_finite() || horizontal_coordinate_scale <= 0.0 {
+    return None;
+  }
+  let mut horizontal_segments = horizontal.segments();
+  let mut vertical_segments = vertical.segments();
+  let mut builder = TinySkiaPathBuilder::new();
+
+  loop {
+    match (horizontal_segments.next(), vertical_segments.next()) {
+      (None, None) => break,
+      (
+        Some(TinySkiaPathSegment::MoveTo(horizontal)),
+        Some(TinySkiaPathSegment::MoveTo(vertical)),
+      ) => {
+        builder.move_to(horizontal.x * horizontal_coordinate_scale, vertical.y);
+      }
+      (
+        Some(TinySkiaPathSegment::LineTo(horizontal)),
+        Some(TinySkiaPathSegment::LineTo(vertical)),
+      ) => {
+        builder.line_to(horizontal.x * horizontal_coordinate_scale, vertical.y);
+      }
+      (
+        Some(TinySkiaPathSegment::QuadTo(horizontal_control, horizontal_end)),
+        Some(TinySkiaPathSegment::QuadTo(vertical_control, vertical_end)),
+      ) => {
+        builder.quad_to(
+          horizontal_control.x * horizontal_coordinate_scale,
+          vertical_control.y,
+          horizontal_end.x * horizontal_coordinate_scale,
+          vertical_end.y,
+        );
+      }
+      (
+        Some(TinySkiaPathSegment::CubicTo(
+          horizontal_control1,
+          horizontal_control2,
+          horizontal_end,
+        )),
+        Some(TinySkiaPathSegment::CubicTo(vertical_control1, vertical_control2, vertical_end)),
+      ) => {
+        builder.cubic_to(
+          horizontal_control1.x * horizontal_coordinate_scale,
+          vertical_control1.y,
+          horizontal_control2.x * horizontal_coordinate_scale,
+          vertical_control2.y,
+          horizontal_end.x * horizontal_coordinate_scale,
+          vertical_end.y,
+        );
+      }
+      (Some(TinySkiaPathSegment::Close), Some(TinySkiaPathSegment::Close)) => builder.close(),
+      _ => return None,
+    }
+  }
+
+  builder.finish()
+}
+
+/// Applies the synthetic style selected by the GDI font mapper.
+///
+/// Wine's FreeType backend applies a 1:4 baseline-relative shear for fake
+/// italic and calls `FT_Outline_Embolden` with `ppem / 24` for fake bold. The
+/// latter expands toward positive X/Y while retaining the original left and
+/// bottom edges. A translated centered stroke is the equivalent path-domain
+/// dilation for tiny-skia and keeps those two bearings fixed.
+fn synthesize_gdi_font_path(
+  mut path: TinySkiaPath,
+  skew_degrees: Option<f32>,
+  bold_strength: Option<f32>,
+) -> Option<TinySkiaPath> {
+  if let Some(skew_degrees) = skew_degrees.filter(|value| value.is_finite() && *value != 0.0) {
+    path = path.transform(TinySkiaTransform::from_skew(
+      skew_degrees.to_radians().tan(),
+      0.0,
+    ))?;
+  }
+
+  let Some(strength) = bold_strength.filter(|value| value.is_finite() && *value > 0.0) else {
+    return Some(path);
+  };
+  let stroke = path.stroke(
+    &TinySkiaStroke {
+      width: strength,
+      ..TinySkiaStroke::default()
+    },
+    1.0,
+  )?;
+  let stroke = stroke.transform(TinySkiaTransform::from_translate(
+    strength * 0.5,
+    strength * 0.5,
+  ))?;
+  let mut builder = TinySkiaPathBuilder::new();
+  builder.push_path(&path);
+  builder.push_path(&stroke);
+  builder.finish()
 }
 
 fn gdi_realized_font_metric(metric: f32) -> f32 {
@@ -3184,36 +3634,108 @@ fn gdi_realized_font_metric(metric: f32) -> f32 {
 ///
 /// Skrifa outlines use a Y-up baseline coordinate system. The device bitmap
 /// is Y-down, so the path is reflected before its pixel bounds are rounded.
-/// Monochrome output uses tiny-skia's integer scan converter and is then
-/// packed exactly like `GGO_BITMAP`: MSB-first and DWORD-aligned per row.
+/// The complete non-uniform device scale is applied here, after TrueType
+/// hinting at the LOGFONT mapper size, in the same order as a GDI DC world
+/// transform. Monochrome output is packed exactly like `GGO_BITMAP`:
+/// MSB-first and DWORD-aligned per row.
+fn gdi_hinted_outline_transform(
+  cursor_x: f32,
+  baseline_y: f32,
+  rotation_degrees: f32,
+  horizontal_scale: f32,
+  vertical_scale: f32,
+  x_samples: i32,
+) -> TinySkiaTransform {
+  let rotation_radians = rotation_degrees.to_radians();
+  let cos = rotation_radians.cos();
+  let sin = rotation_radians.sin();
+  let horizontal_scale = if horizontal_scale.is_finite() {
+    horizontal_scale
+  } else {
+    1.0
+  };
+  let vertical_scale = if vertical_scale.is_finite() {
+    vertical_scale
+  } else {
+    1.0
+  };
+  TinySkiaTransform::from_row(
+    cos * x_samples as f32 * horizontal_scale,
+    sin * horizontal_scale,
+    sin * x_samples as f32 * vertical_scale,
+    -cos * vertical_scale,
+    cursor_x.fract() * x_samples as f32,
+    baseline_y.fract(),
+  )
+}
+
+fn gdi_monochrome_axis_box(minimum: f32, maximum: f32) -> Option<(i64, i64)> {
+  if !minimum.is_finite() || !maximum.is_finite() || minimum > maximum {
+    return None;
+  }
+  let minimum_f26dot6 = (f64::from(minimum) * GDI_OUTLINE_FRACTION).round() as i64;
+  let maximum_f26dot6 = (f64::from(maximum) * GDI_OUTLINE_FRACTION).round() as i64;
+
+  // FreeType's ft_glyphslot_preset_bitmap records this as undocumented but
+  // confirmed GDI behavior: mono control boxes use asymmetric nearest-pixel
+  // rounding so a pixel center is always included. A collapsed box expands
+  // toward the side that retains most of the original F26Dot6 interval.
+  let mut pixel_minimum = (minimum_f26dot6 + 31).div_euclid(64);
+  let mut pixel_maximum = (maximum_f26dot6 + 32).div_euclid(64);
+  if pixel_minimum == pixel_maximum {
+    let minimum_remainder = (minimum_f26dot6.rem_euclid(64) + 31).rem_euclid(64) - 31;
+    let maximum_remainder = (maximum_f26dot6.rem_euclid(64) + 32).rem_euclid(64) - 32;
+    if minimum_remainder + maximum_remainder < 0 {
+      pixel_minimum -= 1;
+    } else {
+      pixel_maximum += 1;
+    }
+  }
+  Some((pixel_minimum, pixel_maximum))
+}
+
 fn rasterize_gdi_glyph(
   path: TinySkiaPath,
   cursor_x: f32,
   baseline_y: f32,
+  rotation_degrees: f32,
   horizontal_scale: f32,
+  vertical_scale: f32,
   format: GdiGlyphFormat,
 ) -> Option<RenderedGlyph> {
-  const CLEARTYPE_X_SCALE: i32 = 6;
   let x_samples = if format == GdiGlyphFormat::Lcd {
-    CLEARTYPE_X_SCALE
+    GDI_CLEARTYPE_X_SAMPLES
   } else {
     1
   };
-  let path = path.transform(TinySkiaTransform::from_row(
-    horizontal_scale * x_samples as f32,
-    0.0,
-    0.0,
-    -1.0,
-    cursor_x.fract() * x_samples as f32,
-    baseline_y.fract(),
+  let path = path.transform(gdi_hinted_outline_transform(
+    cursor_x,
+    baseline_y,
+    rotation_degrees,
+    horizontal_scale,
+    vertical_scale,
+    x_samples,
   ))?;
   let bounds = path.compute_tight_bounds().unwrap_or_else(|| path.bounds());
-  let local_left = bounds.left().floor() as i64;
-  let local_top = bounds.top().floor() as i64;
-  let local_right = bounds.right().ceil() as i64;
-  let local_bottom = bounds.bottom().ceil() as i64;
-  let width = u32::try_from(local_right.checked_sub(local_left)?).ok()?;
-  let height = u32::try_from(local_bottom.checked_sub(local_top)?).ok()?;
+  // Monochrome GGO_BITMAP reports the asymmetric one-bit control box. A color
+  // destination keeps the ordinary floor/ceil extent for smooth samples.
+  // Wine's DIB driver pins this split: indexed destinations force GGO_BITMAP,
+  // while a color destination loads FT_LOAD_TARGET_LCD and renders smooth
+  // horizontal subpixel coverage. Keep those bounds and scanners independent.
+  let uses_monochrome_x = format == GdiGlyphFormat::Monochrome;
+  let uses_monochrome_y = format == GdiGlyphFormat::Monochrome;
+  let (mut local_left, local_right) = if uses_monochrome_x {
+    gdi_monochrome_axis_box(bounds.left(), bounds.right())?
+  } else {
+    (bounds.left().floor() as i64, bounds.right().ceil() as i64)
+  };
+  let (mut local_top, local_bottom) = if uses_monochrome_y {
+    gdi_monochrome_axis_box(bounds.top(), bounds.bottom())?
+  } else {
+    (bounds.top().floor() as i64, bounds.bottom().ceil() as i64)
+  };
+  let mut width = u32::try_from(local_right.checked_sub(local_left)?).ok()?;
+  let mut height = u32::try_from(local_bottom.checked_sub(local_top)?).ok()?;
   if width == 0 || height == 0 {
     return None;
   }
@@ -3221,23 +3743,24 @@ fn rasterize_gdi_glyph(
     -(local_left as f32),
     -(local_top as f32),
   ))?;
-  let mut mask = TinySkiaMask::new(width, height)?;
-  mask.fill_path(
-    &path,
-    TinySkiaFillRule::Winding,
-    format != GdiGlyphFormat::Monochrome,
-    TinySkiaTransform::identity(),
-  );
-  let mut data = mask.take();
-  if format == GdiGlyphFormat::Monochrome {
-    apply_gdi_smart_dropout_control(&path, &mut data, width as usize, height as usize);
-  }
+  let data = match format {
+    GdiGlyphFormat::Monochrome => {
+      let raster = rasterize_gdi_monochrome_path(&path, width as usize, height as usize)?;
+      local_left = local_left.saturating_add(i64::try_from(raster.offset_x).ok()?);
+      local_top = local_top.saturating_add(i64::try_from(raster.offset_y).ok()?);
+      width = u32::try_from(raster.width).ok()?;
+      height = u32::try_from(raster.height).ok()?;
+      raster.coverage
+    }
+    GdiGlyphFormat::Grayscale => rasterize_gdi_grayscale_path(&path, width, height)?,
+    GdiGlyphFormat::Lcd => rasterize_gdi_cleartype_path(&path, width as usize, height as usize)?,
+  };
   let top = (baseline_y.floor() as i32).saturating_add(i32::try_from(local_top).ok()?);
 
   match format {
     GdiGlyphFormat::Lcd => {
       let high_resolution_left = (cursor_x.floor() as i32)
-        .saturating_mul(CLEARTYPE_X_SCALE)
+        .saturating_mul(GDI_CLEARTYPE_X_SAMPLES)
         .saturating_add(i32::try_from(local_left).ok()?);
       let (left, width, coverage) =
         cleartype_box_decimate(&data, width as usize, height as usize, high_resolution_left);
@@ -3269,41 +3792,148 @@ fn rasterize_gdi_glyph(
   }
 }
 
-/// A line segment used by the local monochrome drop-out scanner.
+/// Rasterizes a hinted outline with the same fixed-point cell/area sweep as
+/// FreeType's `ftgrays` renderer.
 ///
-/// Skrifa has already grid-fitted the outline.  The remaining operation is
-/// scan conversion, so these coordinates are in final device pixels.
+/// Win32 GDI exposes that coverage through `GGO_GRAY*_BITMAP`; Wine's GDI
+/// implementation reaches it through `FT_Render_Glyph(FT_RENDER_MODE_NORMAL)`.
+/// Zeno's pure-Rust rasterizer is a direct structural match for the relevant
+/// FreeType sweep: it quantizes to 8-bit fixed point, accumulates signed cell
+/// cover/area, and applies the non-zero fill rule at the same byte boundary.
+/// This matters for classic ClearType because an analytical float rasterizer
+/// creates low-coverage fringe cells that GDI's scratch DIB never touches.
+fn rasterize_gdi_grayscale_path(path: &TinySkiaPath, width: u32, height: u32) -> Option<Vec<u8>> {
+  if width == 0 || height == 0 {
+    return None;
+  }
+  let mut commands = Vec::new();
+  for segment in path.segments() {
+    let point = |point: TinySkiaPoint| ZenoPoint::new(point.x, point.y);
+    commands.push(match segment {
+      TinySkiaPathSegment::MoveTo(to) => ZenoCommand::MoveTo(point(to)),
+      TinySkiaPathSegment::LineTo(to) => ZenoCommand::LineTo(point(to)),
+      TinySkiaPathSegment::QuadTo(control, to) => ZenoCommand::QuadTo(point(control), point(to)),
+      TinySkiaPathSegment::CubicTo(control1, control2, to) => {
+        ZenoCommand::CurveTo(point(control1), point(control2), point(to))
+      }
+      TinySkiaPathSegment::Close => ZenoCommand::Close,
+    });
+  }
+  if commands.is_empty() {
+    return None;
+  }
+
+  let mut coverage = vec![0; usize::try_from(width.checked_mul(height)?).ok()?];
+  ZenoMask::new(commands.as_slice())
+    .size(width, height)
+    .render_into(&mut coverage, None);
+  Some(coverage)
+}
+
+/// Rasterizes the bi-level source signal consumed by classic ClearType.
+///
+/// Microsoft's displaced-filtering paper defines RGB decimation over an
+/// input sampled at least six times horizontally and illustrates the source
+/// as a bi-level monochrome signal. Native Win32 playback into a white 32-bpp
+/// DIB confirms that each output channel is one of exactly seven values: the
+/// count of six covered source samples. `gasp` symmetric smoothing still
+/// affects the TrueType interpreter target above; it does not turn this GDI
+/// source bitmap into analytical area coverage.
+fn rasterize_gdi_cleartype_path(
+  path: &TinySkiaPath,
+  width: usize,
+  height: usize,
+) -> Option<Vec<u8>> {
+  rasterize_gdi_cleartype_scanlines(path, width, height)
+}
+
+/// Produces classic 6x1 ClearType scanlines on the Win32 black-raster grid.
+fn rasterize_gdi_cleartype_scanlines(
+  path: &TinySkiaPath,
+  width: usize,
+  height: usize,
+) -> Option<Vec<u8>> {
+  if width == 0 || height == 0 {
+    return None;
+  }
+  // The high-resolution ClearType X grid samples F26Dot6 coordinates at
+  // integer positions. The black raster below represents pixel centres by
+  // subtracting half a pixel during quantization, so translate X by that
+  // half sample before reusing its proven profile/drop-out machinery. Y is
+  // deliberately unchanged: GDI ClearType renders it on the normal B/W grid.
+  let path = path
+    .clone()
+    .transform(TinySkiaTransform::from_translate(0.5, 0.0))?;
+  let mut coverage = vec![0_u8; width.checked_mul(height)?];
+  apply_gdi_smart_dropout_control(&path, &mut coverage, width, height, true, true);
+  Some(coverage)
+}
+
+// FreeType sets FT_OUTLINE_HIGH_PRECISION for hinted TrueType glyphs below
+// 24 ppem.  Its black rasterizer consequently uses 12 fractional bits after
+// first receiving an outline quantized to F26Dot6.  Keeping both boundaries
+// explicit is important: the profile sweep compares exact pixel centres and
+// uses a 1/4096-pixel jitter, while the glyph interpreter can only move points
+// on the preceding 1/64-pixel grid.
+const GDI_DROPOUT_PRECISION_BITS: u32 = 12;
+const GDI_DROPOUT_PRECISION: i64 = 1 << GDI_DROPOUT_PRECISION_BITS;
+const GDI_DROPOUT_HALF: i64 = GDI_DROPOUT_PRECISION / 2;
+const GDI_DROPOUT_PRECISION_STEP: i64 = GDI_DROPOUT_PRECISION / 16;
+const GDI_OUTLINE_FRACTION: f64 = 64.0;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GdiDropoutPoint {
+  x: i64,
+  y: i64,
+}
+
+#[derive(Debug)]
+struct GdiDropoutContour {
+  points: Vec<GdiDropoutPoint>,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct GdiDropoutLine {
-  start: GdiDropoutPoint,
-  end: GdiDropoutPoint,
+  start_scan: i64,
+  start_cross: i64,
+  end_scan: i64,
+  end_cross: i64,
+}
+
+#[derive(Debug)]
+struct GdiDropoutProfile {
+  lines: Vec<GdiDropoutLine>,
+  flow_up: bool,
+  bottom_scan: i64,
+  top_scan: i64,
+  successor: usize,
+  overshoot_bottom: bool,
+  overshoot_top: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
-struct GdiDropoutPoint {
-  x: f32,
-  y: f32,
-}
-
-impl From<TinySkiaPoint> for GdiDropoutPoint {
-  fn from(point: TinySkiaPoint) -> Self {
-    Self {
-      x: point.x,
-      y: point.y,
-    }
-  }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct GdiDropoutSpan {
-  start: f32,
-  end: f32,
+struct GdiDropoutCrossing {
+  coordinate: i64,
+  profile: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
 enum GdiDropoutAxis {
+  /// FreeType's first pass: scan original Y and write bitmap rows.
   Horizontal,
+  /// FreeType's flipped second pass: scan original X and write columns.
   Vertical,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum GdiDropoutStubPolicy {
+  /// OpenType Rule 6 expressed through the two unit squares adjacent to the
+  /// candidate scan segment. This remains the native `GGO_BITMAP` control.
+  AdjacentSquares,
+  /// FreeType's Windows-compatible profile-successor/overshoot model.
+  /// Classic ClearType uses it only for the primary horizontal black sweep;
+  /// its perpendicular 6x pass retains the adjacent-square behavior.
+  ProfileTopology,
 }
 
 /// Adds the pixels required by the OpenType smart drop-out rules to a
@@ -3311,97 +3941,218 @@ enum GdiDropoutAxis {
 ///
 /// The public Skrifa API returns the hinted outline but not the final
 /// `SCANCTRL`/`SCANTYPE` graphics state.  This deliberately bounded fallback
-/// therefore uses one deterministic mode: smart drop-outs excluding stubs
-/// (OpenType scan-conversion rules 5 and 6).  Like FreeType's monochrome
-/// rasterizer, it scans in both directions and never changes antialiased text.
+/// therefore uses the GDI-compatible smart mode that excludes stubs (scan
+/// type 5). Narrow spans are processed after ordinary coverage, and the
+/// flipped second pass restores horizontal features and edges that lie
+/// exactly on pixel centres.
 fn apply_gdi_smart_dropout_control(
   path: &TinySkiaPath,
   coverage: &mut [u8],
   width: usize,
   height: usize,
+  draw_regular_spans: bool,
+  cleartype_source: bool,
 ) {
   if coverage.len() != width.saturating_mul(height) || width == 0 || height == 0 {
     return;
   }
 
-  let lines = flatten_gdi_dropout_path(path);
-  if lines.is_empty() {
+  let contours = flatten_gdi_dropout_path(path);
+  if contours.is_empty() {
     return;
   }
 
-  let horizontal_spans = collect_gdi_dropout_spans(&lines, height, GdiDropoutAxis::Horizontal);
-  apply_gdi_dropout_spans(
-    &horizontal_spans,
+  let horizontal_profiles = build_gdi_dropout_profiles(&contours, GdiDropoutAxis::Horizontal);
+  apply_gdi_dropout_profiles(
+    &contours,
+    &horizontal_profiles,
     coverage,
     width,
     height,
     GdiDropoutAxis::Horizontal,
+    draw_regular_spans,
+    if cleartype_source {
+      GdiDropoutStubPolicy::ProfileTopology
+    } else {
+      GdiDropoutStubPolicy::AdjacentSquares
+    },
+    false,
   );
 
-  let vertical_spans = collect_gdi_dropout_spans(&lines, width, GdiDropoutAxis::Vertical);
-  apply_gdi_dropout_spans(
-    &vertical_spans,
+  let vertical_profiles = build_gdi_dropout_profiles(&contours, GdiDropoutAxis::Vertical);
+  apply_gdi_dropout_profiles(
+    &contours,
+    &vertical_profiles,
     coverage,
     width,
     height,
     GdiDropoutAxis::Vertical,
+    false,
+    GdiDropoutStubPolicy::AdjacentSquares,
+    cleartype_source,
   );
 }
 
-fn flatten_gdi_dropout_path(path: &TinySkiaPath) -> Vec<GdiDropoutLine> {
-  let mut lines = Vec::new();
-  let mut current = None;
+/// Rasterizes a hinted outline on the GDI/FreeType monochrome pixel grid.
+///
+/// FreeType's `Vertical_Sweep_Span` first shifts outline coordinates by half
+/// a pixel, then fills every integer center from `CEILING(x1)` through
+/// `FLOOR(x2)`, inclusive.  Expressing that rule directly avoids the
+/// endpoint convention of a general-purpose polygon rasterizer before the
+/// two smart drop-out passes add sub-pixel stems.
+#[derive(Debug)]
+struct GdiMonochromeRaster {
+  coverage: Vec<u8>,
+  width: usize,
+  height: usize,
+  offset_x: usize,
+  offset_y: usize,
+}
+
+/// Produces the cropped `GGO_BITMAP` black box for a hinted outline.
+///
+/// GDI reports the bounds of the resulting bilevel ink, not the looser
+/// floor/ceil control box of the outline. Both ordinary spans and drop-outs
+/// therefore come from the same profile sweep; using a general polygon mask
+/// as an intermediate changes the pixel-centre endpoint convention and can
+/// clip a valid FreeType/GDI span back to the wrong side of the glyph. The
+/// independent Win32 8 ppem Tahoma matrix covers c, punctuation, straight
+/// stems, diagonals, bowls, and descenders.
+fn rasterize_gdi_monochrome_path(
+  path: &TinySkiaPath,
+  width: usize,
+  height: usize,
+) -> Option<GdiMonochromeRaster> {
+  if width == 0 || height == 0 {
+    return None;
+  }
+
+  let mut coverage = vec![0; width.checked_mul(height)?];
+  apply_gdi_smart_dropout_control(path, &mut coverage, width, height, true, false);
+  let (left, top, right, bottom) = gdi_monochrome_ink_bounds(&coverage, width, height)?;
+  let cropped_width = right.checked_sub(left)?;
+  let cropped_height = bottom.checked_sub(top)?;
+  let mut cropped = vec![0; cropped_width.checked_mul(cropped_height)?];
+  for row in 0..cropped_height {
+    let source_start = (top + row).checked_mul(width)?.checked_add(left)?;
+    let source_end = source_start.checked_add(cropped_width)?;
+    let destination_start = row.checked_mul(cropped_width)?;
+    let destination_end = destination_start.checked_add(cropped_width)?;
+    cropped[destination_start..destination_end]
+      .copy_from_slice(coverage.get(source_start..source_end)?);
+  }
+  Some(GdiMonochromeRaster {
+    coverage: cropped,
+    width: cropped_width,
+    height: cropped_height,
+    offset_x: left,
+    offset_y: top,
+  })
+}
+
+fn gdi_monochrome_ink_bounds(
+  coverage: &[u8],
+  width: usize,
+  height: usize,
+) -> Option<(usize, usize, usize, usize)> {
+  if coverage.len() != width.checked_mul(height)? {
+    return None;
+  }
+  let mut left = width;
+  let mut top = height;
+  let mut right = 0;
+  let mut bottom = 0;
+  for y in 0..height {
+    for x in 0..width {
+      if coverage[y * width + x] == 0 {
+        continue;
+      }
+      left = left.min(x);
+      top = top.min(y);
+      right = right.max(x + 1);
+      bottom = bottom.max(y + 1);
+    }
+  }
+  (left < right && top < bottom).then_some((left, top, right, bottom))
+}
+
+fn flatten_gdi_dropout_path(path: &TinySkiaPath) -> Vec<GdiDropoutContour> {
+  let mut contours = Vec::new();
+  let mut current = Vec::new();
   let mut segments = path.segments();
   segments.set_auto_close(true);
 
   for segment in segments {
     match segment {
-      TinySkiaPathSegment::MoveTo(point) => current = Some(point.into()),
+      TinySkiaPathSegment::MoveTo(point) => {
+        finish_gdi_dropout_contour(&mut current, &mut contours);
+        current.push(quantize_gdi_dropout_point(point));
+      }
       TinySkiaPathSegment::LineTo(point) => {
-        let point = GdiDropoutPoint::from(point);
-        if let Some(start) = current {
-          push_gdi_dropout_line(&mut lines, start, point);
-        }
-        current = Some(point);
+        push_gdi_dropout_point(&mut current, quantize_gdi_dropout_point(point));
       }
       TinySkiaPathSegment::QuadTo(control, end) => {
-        let control = GdiDropoutPoint::from(control);
-        let end = GdiDropoutPoint::from(end);
-        if let Some(start) = current {
-          flatten_gdi_dropout_quad(start, control, end, 0, &mut lines);
+        let control = quantize_gdi_dropout_point(control);
+        let end = quantize_gdi_dropout_point(end);
+        if let Some(start) = current.last().copied() {
+          flatten_gdi_dropout_quad(start, control, end, 0, &mut current);
         }
-        current = Some(end);
       }
       TinySkiaPathSegment::CubicTo(control1, control2, end) => {
-        let control1 = GdiDropoutPoint::from(control1);
-        let control2 = GdiDropoutPoint::from(control2);
-        let end = GdiDropoutPoint::from(end);
-        if let Some(start) = current {
-          flatten_gdi_dropout_cubic(start, control1, control2, end, 0, &mut lines);
+        let control1 = quantize_gdi_dropout_point(control1);
+        let control2 = quantize_gdi_dropout_point(control2);
+        let end = quantize_gdi_dropout_point(end);
+        if let Some(start) = current.last().copied() {
+          flatten_gdi_dropout_cubic(start, control1, control2, end, 0, &mut current);
         }
-        current = Some(end);
       }
-      TinySkiaPathSegment::Close => current = None,
+      TinySkiaPathSegment::Close => finish_gdi_dropout_contour(&mut current, &mut contours),
     }
   }
+  finish_gdi_dropout_contour(&mut current, &mut contours);
 
-  lines
+  contours
 }
 
-fn push_gdi_dropout_line(
-  lines: &mut Vec<GdiDropoutLine>,
-  start: GdiDropoutPoint,
-  end: GdiDropoutPoint,
-) {
-  if start.x != end.x || start.y != end.y {
-    lines.push(GdiDropoutLine { start, end });
+fn quantize_gdi_dropout_point(point: TinySkiaPoint) -> GdiDropoutPoint {
+  fn quantize(value: f32) -> i64 {
+    let f26dot6 = (f64::from(value) * GDI_OUTLINE_FRACTION).round() as i64;
+    f26dot6 * (GDI_DROPOUT_PRECISION / 64) - GDI_DROPOUT_HALF
   }
+
+  GdiDropoutPoint {
+    x: quantize(point.x),
+    y: quantize(point.y),
+  }
+}
+
+fn push_gdi_dropout_point(points: &mut Vec<GdiDropoutPoint>, point: GdiDropoutPoint) {
+  if points.last() != Some(&point) {
+    points.push(point);
+  }
+}
+
+fn finish_gdi_dropout_contour(
+  points: &mut Vec<GdiDropoutPoint>,
+  contours: &mut Vec<GdiDropoutContour>,
+) {
+  if points.len() >= 2 {
+    let first = points[0];
+    push_gdi_dropout_point(points, first);
+    if points.len() >= 4 {
+      contours.push(GdiDropoutContour {
+        points: std::mem::take(points),
+      });
+      return;
+    }
+  }
+  points.clear();
 }
 
 fn midpoint_gdi_dropout_point(first: GdiDropoutPoint, second: GdiDropoutPoint) -> GdiDropoutPoint {
   GdiDropoutPoint {
-    x: (first.x + second.x) * 0.5,
-    y: (first.y + second.y) * 0.5,
+    x: (first.x + second.x) >> 1,
+    y: (first.y + second.y) >> 1,
   }
 }
 
@@ -3409,18 +4160,18 @@ fn squared_gdi_dropout_distance_to_line(
   point: GdiDropoutPoint,
   start: GdiDropoutPoint,
   end: GdiDropoutPoint,
-) -> f32 {
+) -> f64 {
   let dx = end.x - start.x;
   let dy = end.y - start.y;
   let length_squared = dx * dx + dy * dy;
-  if length_squared == 0.0 {
-    let px = point.x - start.x;
-    let py = point.y - start.y;
+  if length_squared == 0 {
+    let px = (point.x - start.x) as f64;
+    let py = (point.y - start.y) as f64;
     return px * px + py * py;
   }
 
-  let cross = dx * (point.y - start.y) - dy * (point.x - start.x);
-  cross * cross / length_squared
+  let cross = (dx as f64) * (point.y - start.y) as f64 - (dy as f64) * (point.x - start.x) as f64;
+  cross * cross / length_squared as f64
 }
 
 fn flatten_gdi_dropout_quad(
@@ -3428,25 +4179,25 @@ fn flatten_gdi_dropout_quad(
   control: GdiDropoutPoint,
   end: GdiDropoutPoint,
   depth: u8,
-  lines: &mut Vec<GdiDropoutLine>,
+  points: &mut Vec<GdiDropoutPoint>,
 ) {
-  // FreeType's normal B/W raster precision is 1/64 pixel.  Matching that
-  // granularity is sufficient for deciding whether a pixel-center gap was
-  // crossed, while the depth guard bounds malformed or extreme curves.
-  const TOLERANCE_SQUARED: f32 = 1.0 / (64.0 * 64.0);
+  // `Bezier_Up` subdivides high-precision outlines at a 1/16-pixel step.
+  // A stricter 1/64-pixel chord tolerance retains the same extrema while
+  // keeping the bounded recursive representation compact.
+  const TOLERANCE_SQUARED: f64 = 64.0 * 64.0;
   const MAX_DEPTH: u8 = 12;
   if depth == MAX_DEPTH
     || squared_gdi_dropout_distance_to_line(control, start, end) <= TOLERANCE_SQUARED
   {
-    push_gdi_dropout_line(lines, start, end);
+    push_gdi_dropout_point(points, end);
     return;
   }
 
   let start_control = midpoint_gdi_dropout_point(start, control);
   let control_end = midpoint_gdi_dropout_point(control, end);
   let midpoint = midpoint_gdi_dropout_point(start_control, control_end);
-  flatten_gdi_dropout_quad(start, start_control, midpoint, depth + 1, lines);
-  flatten_gdi_dropout_quad(midpoint, control_end, end, depth + 1, lines);
+  flatten_gdi_dropout_quad(start, start_control, midpoint, depth + 1, points);
+  flatten_gdi_dropout_quad(midpoint, control_end, end, depth + 1, points);
 }
 
 fn flatten_gdi_dropout_cubic(
@@ -3455,14 +4206,14 @@ fn flatten_gdi_dropout_cubic(
   control2: GdiDropoutPoint,
   end: GdiDropoutPoint,
   depth: u8,
-  lines: &mut Vec<GdiDropoutLine>,
+  points: &mut Vec<GdiDropoutPoint>,
 ) {
-  const TOLERANCE_SQUARED: f32 = 1.0 / (64.0 * 64.0);
+  const TOLERANCE_SQUARED: f64 = 64.0 * 64.0;
   const MAX_DEPTH: u8 = 12;
   let flatness = squared_gdi_dropout_distance_to_line(control1, start, end)
     .max(squared_gdi_dropout_distance_to_line(control2, start, end));
   if depth == MAX_DEPTH || flatness <= TOLERANCE_SQUARED {
-    push_gdi_dropout_line(lines, start, end);
+    push_gdi_dropout_point(points, end);
     return;
   }
 
@@ -3478,147 +4229,505 @@ fn flatten_gdi_dropout_cubic(
     left_control,
     midpoint,
     depth + 1,
-    lines,
+    points,
   );
-  flatten_gdi_dropout_cubic(midpoint, right_control, control_end, end, depth + 1, lines);
+  flatten_gdi_dropout_cubic(midpoint, right_control, control_end, end, depth + 1, points);
 }
 
-fn collect_gdi_dropout_spans(
-  lines: &[GdiDropoutLine],
-  scan_count: usize,
+fn build_gdi_dropout_profiles(
+  contours: &[GdiDropoutContour],
   axis: GdiDropoutAxis,
-) -> Vec<Vec<GdiDropoutSpan>> {
-  let mut scans = Vec::with_capacity(scan_count);
-  for scan_index in 0..scan_count {
-    let scan_coordinate = scan_index as f32 + 0.5;
-    let mut crossings = Vec::new();
-    for line in lines {
-      let (start_axis, end_axis, start_cross, end_cross) = match axis {
-        GdiDropoutAxis::Horizontal => (line.start.y, line.end.y, line.start.x, line.end.x),
-        GdiDropoutAxis::Vertical => (line.start.x, line.end.x, line.start.y, line.end.y),
-      };
-      let crossing = if start_axis <= scan_coordinate && scan_coordinate < end_axis {
-        Some(1)
-      } else if end_axis <= scan_coordinate && scan_coordinate < start_axis {
-        Some(-1)
-      } else {
-        None
-      };
-      let Some(winding) = crossing else {
-        continue;
-      };
-      let t = (scan_coordinate - start_axis) / (end_axis - start_axis);
-      crossings.push((start_cross + (end_cross - start_cross) * t, winding));
-    }
-    crossings.sort_by(|left, right| left.0.total_cmp(&right.0));
+) -> Vec<GdiDropoutProfile> {
+  let mut profiles = Vec::new();
 
-    let mut winding = 0i32;
-    let mut span_start = None;
-    let mut spans = Vec::new();
-    for (coordinate, delta) in crossings {
-      let previous_winding = winding;
-      winding += delta;
-      if previous_winding == 0 && winding != 0 {
-        span_start = Some(coordinate);
-      } else if previous_winding != 0
-        && winding == 0
-        && let Some(start) = span_start.take()
-        && coordinate > start
-      {
-        spans.push(GdiDropoutSpan {
-          start,
-          end: coordinate,
+  for contour in contours {
+    let first_contour_profile = profiles.len();
+    let mut lines = Vec::new();
+    for points in contour.points.windows(2) {
+      let (start_scan, start_cross) = gdi_dropout_sweep_coordinates(points[0], axis);
+      let (end_scan, end_cross) = gdi_dropout_sweep_coordinates(points[1], axis);
+      if start_scan != end_scan {
+        lines.push(GdiDropoutLine {
+          start_scan,
+          start_cross,
+          end_scan,
+          end_cross,
         });
       }
     }
-    scans.push(spans);
+    if lines.len() < 2 {
+      continue;
+    }
+
+    // Start at a direction change so equal-direction profiles on opposite
+    // sides of the arbitrary MoveTo seam remain one cyclic profile.
+    let Some(start_index) = lines.iter().enumerate().find_map(|(index, line)| {
+      let previous = &lines[(index + lines.len() - 1) % lines.len()];
+      ((line.end_scan > line.start_scan) != (previous.end_scan > previous.start_scan))
+        .then_some(index)
+    }) else {
+      continue;
+    };
+
+    let mut groups = Vec::<Vec<GdiDropoutLine>>::new();
+    for offset in 0..lines.len() {
+      let line = lines[(start_index + offset) % lines.len()];
+      let flow_up = line.end_scan > line.start_scan;
+      if groups
+        .last()
+        .is_none_or(|group| (group[0].end_scan > group[0].start_scan) != flow_up)
+      {
+        groups.push(Vec::new());
+      }
+      groups.last_mut().unwrap().push(line);
+    }
+
+    for group in groups {
+      let flow_up = group[0].end_scan > group[0].start_scan;
+      let first_scan = group[0].start_scan;
+      let last_scan = group.last().unwrap().end_scan;
+      let bottom = first_scan.min(last_scan);
+      let top = first_scan.max(last_scan);
+      let bottom_scan = gdi_dropout_ceil(bottom) / GDI_DROPOUT_PRECISION;
+      let top_scan = gdi_dropout_floor(top) / GDI_DROPOUT_PRECISION;
+      if bottom_scan > top_scan {
+        continue;
+      }
+      profiles.push(GdiDropoutProfile {
+        lines: group,
+        flow_up,
+        bottom_scan,
+        top_scan,
+        successor: usize::MAX,
+        overshoot_bottom: gdi_dropout_ceil(bottom) - bottom >= GDI_DROPOUT_HALF,
+        overshoot_top: top - gdi_dropout_floor(top) >= GDI_DROPOUT_HALF,
+      });
+    }
+
+    let end_contour_profile = profiles.len();
+    for profile_index in first_contour_profile..end_contour_profile {
+      profiles[profile_index].successor = if profile_index + 1 < end_contour_profile {
+        profile_index + 1
+      } else {
+        first_contour_profile
+      };
+    }
   }
-  scans
+
+  profiles
 }
 
-fn apply_gdi_dropout_spans(
-  scans: &[Vec<GdiDropoutSpan>],
+fn gdi_dropout_sweep_coordinates(point: GdiDropoutPoint, axis: GdiDropoutAxis) -> (i64, i64) {
+  match axis {
+    // The tiny-skia path was reflected into Y-down device space.  Negating
+    // Y restores FreeType's original Y-up profile coordinates modulo a
+    // whole-pixel translation, which leaves every scan rule invariant.
+    GdiDropoutAxis::Horizontal => (-point.y, point.x),
+    GdiDropoutAxis::Vertical => (point.x, -point.y),
+  }
+}
+
+fn apply_gdi_dropout_profiles(
+  contours: &[GdiDropoutContour],
+  profiles: &[GdiDropoutProfile],
   coverage: &mut [u8],
   width: usize,
   height: usize,
   axis: GdiDropoutAxis,
+  draw_regular_spans: bool,
+  stub_policy: GdiDropoutStubPolicy,
+  close_cleartype_perpendicular_dropouts: bool,
 ) {
-  if scans.len() < 3 {
+  let scan_count = match axis {
+    GdiDropoutAxis::Horizontal => height,
+    GdiDropoutAxis::Vertical => width,
+  };
+  if profiles.is_empty() || scan_count == 0 {
     return;
   }
 
-  for scan_index in 1..scans.len() - 1 {
-    for span in &scans[scan_index] {
-      let first_center = (span.start - 0.5).ceil() as i32;
-      let last_center = (span.end - 0.5).floor() as i32;
-      if first_center <= last_center {
+  for scan_index in 0..scan_count {
+    let scan = match axis {
+      GdiDropoutAxis::Horizontal => -(scan_index as i64),
+      GdiDropoutAxis::Vertical => scan_index as i64,
+    };
+    let scan_coordinate = scan * GDI_DROPOUT_PRECISION;
+    let mut left = Vec::new();
+    let mut right = Vec::new();
+    for (profile_index, profile) in profiles.iter().enumerate() {
+      if scan < profile.bottom_scan || scan > profile.top_scan {
         continue;
       }
-
-      // Rule 6 excludes a stub unless both contours continue to intersect
-      // scan lines in both directions.  Interval overlap is the local
-      // equivalent for the flattened hinted outline; steep features are
-      // recovered by the perpendicular pass.
-      if !gdi_dropout_span_continues(*span, &scans[scan_index - 1])
-        || !gdi_dropout_span_continues(*span, &scans[scan_index + 1])
-      {
-        continue;
-      }
-
-      let lower = (span.start - 0.5).floor() as i32;
-      let Some(upper) = lower.checked_add(1) else {
+      let Some(coordinate) = gdi_dropout_profile_crossing(profile, scan_coordinate) else {
         continue;
       };
-      let midpoint = (span.start + span.end) * 0.5;
-      // FreeType's SMART macro has a 63/64-pixel pre-division bias.  In
-      // device coordinates this is a 1/128-pixel tie bias toward the left;
-      // reflection into the Y-down bitmap reverses it for vertical scans.
-      const SMART_TIE_BIAS: f32 = 1.0 / 128.0;
-      let preferred = match axis {
-        GdiDropoutAxis::Horizontal => (midpoint - SMART_TIE_BIAS).floor() as i32,
-        GdiDropoutAxis::Vertical => (midpoint + SMART_TIE_BIAS).floor() as i32,
+      let crossing = GdiDropoutCrossing {
+        coordinate,
+        profile: profile_index,
+      };
+      if profile.flow_up {
+        left.push(crossing);
+      } else {
+        right.push(crossing);
       }
-      .clamp(lower, upper);
-      let other = if preferred == lower { upper } else { lower };
+    }
+    left.sort_by_key(|crossing| (crossing.coordinate, crossing.profile));
+    right.sort_by_key(|crossing| (crossing.coordinate, crossing.profile));
 
-      let preferred_index = gdi_dropout_mask_index(axis, scan_index, preferred, width, height);
-      let other_index = gdi_dropout_mask_index(axis, scan_index, other, width, height);
+    for (left, right) in left.into_iter().zip(right) {
+      let (x1, x2) = if left.coordinate <= right.coordinate {
+        (left.coordinate, right.coordinate)
+      } else {
+        (right.coordinate, left.coordinate)
+      };
+      if gdi_dropout_ceil(x1) <= gdi_dropout_floor(x2) {
+        if draw_regular_spans && matches!(axis, GdiDropoutAxis::Horizontal) {
+          apply_gdi_dropout_regular_span(scan_index, x1, x2, coverage, width, height);
+        } else if matches!(axis, GdiDropoutAxis::Vertical) {
+          apply_gdi_dropout_aligned_edges(
+            scan_index,
+            x1,
+            x2,
+            coverage,
+            width,
+            height,
+            axis,
+            close_cleartype_perpendicular_dropouts,
+          );
+        }
+        continue;
+      }
+
+      let upper = gdi_dropout_ceil(x1);
+      let lower = gdi_dropout_floor(x2);
+      if upper != lower + GDI_DROPOUT_PRECISION {
+        continue;
+      }
+
+      let excluded_stub = match stub_policy {
+        GdiDropoutStubPolicy::AdjacentSquares => {
+          !gdi_dropout_contours_continue(contours, axis, scan_coordinate, lower, upper)
+        }
+        GdiDropoutStubPolicy::ProfileTopology => {
+          gdi_dropout_is_excluded_profile_stub(profiles, left, right, scan, x1, x2)
+        }
+      };
+      if excluded_stub {
+        continue;
+      }
+      let preferred = gdi_dropout_smart(x1, x2);
+      let other = if preferred == upper { lower } else { upper };
+      let preferred_pixel = preferred / GDI_DROPOUT_PRECISION;
+      let other_pixel = other / GDI_DROPOUT_PRECISION;
+      let preferred_index =
+        gdi_dropout_mask_index(axis, scan_index, preferred_pixel, width, height);
+      let other_index = gdi_dropout_mask_index(axis, scan_index, other_pixel, width, height);
       if let Some(preferred_index) = preferred_index {
         if other_index.is_some_and(|index| coverage[index] != 0) {
           continue;
         }
         coverage[preferred_index] = u8::MAX;
+        if close_cleartype_perpendicular_dropouts
+          && gdi_cleartype_closes_perpendicular_dropout(scan_index, preferred, lower)
+          && let Some(other_index) = other_index
+        {
+          coverage[other_index] = u8::MAX;
+        }
       } else if let Some(other_index) = other_index {
-        // FreeType keeps the drop-out inside the glyph bitmap when its
-        // preferred pixel lies just outside the rounded bounding box.
+        // FreeType keeps the drop-out inside the glyph bitmap when the
+        // SMART-selected centre is just outside its rounded bounds.
         coverage[other_index] = u8::MAX;
       }
     }
   }
 }
 
-fn gdi_dropout_span_continues(span: GdiDropoutSpan, adjacent: &[GdiDropoutSpan]) -> bool {
-  adjacent
-    .iter()
-    .any(|candidate| candidate.start < span.end && span.start < candidate.end)
+fn gdi_dropout_is_excluded_profile_stub(
+  profiles: &[GdiDropoutProfile],
+  left: GdiDropoutCrossing,
+  right: GdiDropoutCrossing,
+  scan: i64,
+  x1: i64,
+  x2: i64,
+) -> bool {
+  let Some(left_profile) = profiles.get(left.profile) else {
+    return true;
+  };
+  let Some(right_profile) = profiles.get(right.profile) else {
+    return true;
+  };
+  let span = x2 - x1;
+
+  // FreeType's Windows-calibrated Rule 6 model uses the cyclic profile
+  // successor, the first/last scan of the left profile, and half-pixel
+  // overshoot. In particular, two non-successor profiles are a continuing
+  // bowl rather than a terminal stub (the lower-left 8 ppem Tahoma `c`).
+  let upper_stub = scan == left_profile.top_scan
+    && left_profile.successor == right.profile
+    && !(left_profile.overshoot_top && span >= GDI_DROPOUT_HALF);
+  let lower_stub = scan == left_profile.bottom_scan
+    && right_profile.successor == left.profile
+    && !(left_profile.overshoot_bottom && span >= GDI_DROPOUT_HALF);
+  upper_stub || lower_stub
+}
+
+fn gdi_cleartype_closes_perpendicular_dropout(
+  high_resolution_x: usize,
+  preferred: i64,
+  lower: i64,
+) -> bool {
+  // Native Office playback uses the same six-sample horizontal source as
+  // the displaced RGB filter.  Its perpendicular pass retains both adjacent
+  // samples at the two phase/direction boundaries below.  The phase-zero
+  // symmetric `x` edge is an explicit negative control: closing every smart
+  // dropout would grow that edge by one pixel.
+  let phase = high_resolution_x % 6;
+  (phase == 2 && preferred == lower) || (phase == 5 && preferred != lower)
+}
+
+fn gdi_dropout_contours_continue(
+  contours: &[GdiDropoutContour],
+  axis: GdiDropoutAxis,
+  scan_coordinate: i64,
+  lower: i64,
+  upper: i64,
+) -> bool {
+  [
+    scan_coordinate - GDI_DROPOUT_PRECISION,
+    scan_coordinate + GDI_DROPOUT_PRECISION,
+  ]
+  .into_iter()
+  .all(|opposite_scan| {
+    gdi_dropout_square_boundary_intersections(
+      contours,
+      axis,
+      scan_coordinate,
+      opposite_scan,
+      lower,
+      upper,
+    ) >= 2
+  })
+}
+
+fn gdi_dropout_square_boundary_intersections(
+  contours: &[GdiDropoutContour],
+  axis: GdiDropoutAxis,
+  candidate_scan: i64,
+  opposite_scan: i64,
+  lower: i64,
+  upper: i64,
+) -> usize {
+  let scan_min = candidate_scan.min(opposite_scan);
+  let scan_max = candidate_scan.max(opposite_scan);
+  let mut intersections = Vec::new();
+
+  for contour in contours {
+    for points in contour.points.windows(2) {
+      let start = gdi_dropout_sweep_coordinates(points[0], axis);
+      let end = gdi_dropout_sweep_coordinates(points[1], axis);
+      push_gdi_dropout_boundary_intersection(
+        &mut intersections,
+        start,
+        end,
+        opposite_scan,
+        lower,
+        upper,
+        false,
+      );
+      push_gdi_dropout_boundary_intersection(
+        &mut intersections,
+        start,
+        end,
+        lower,
+        scan_min,
+        scan_max,
+        true,
+      );
+      push_gdi_dropout_boundary_intersection(
+        &mut intersections,
+        start,
+        end,
+        upper,
+        scan_min,
+        scan_max,
+        true,
+      );
+      if intersections.len() >= 2 {
+        return intersections.len();
+      }
+    }
+  }
+
+  intersections.len()
+}
+
+fn push_gdi_dropout_boundary_intersection(
+  intersections: &mut Vec<GdiDropoutPoint>,
+  mut start: (i64, i64),
+  mut end: (i64, i64),
+  boundary: i64,
+  range_min: i64,
+  range_max: i64,
+  transpose: bool,
+) {
+  if transpose {
+    start = (start.1, start.0);
+    end = (end.1, end.0);
+  }
+
+  let (boundary_coordinate, ranged_coordinate) = if start.0 == end.0 {
+    if start.0 != boundary {
+      return;
+    }
+    let overlap_min = start.1.min(end.1).max(range_min);
+    let overlap_max = start.1.max(end.1).min(range_max);
+    if overlap_min > overlap_max {
+      return;
+    }
+    (boundary, overlap_min)
+  } else {
+    if boundary < start.0.min(end.0) || boundary > start.0.max(end.0) {
+      return;
+    }
+    let ranged_coordinate =
+      start.1 + gdi_dropout_mul_div(end.1 - start.1, boundary - start.0, end.0 - start.0);
+    if ranged_coordinate < range_min || ranged_coordinate > range_max {
+      return;
+    }
+    (boundary, ranged_coordinate)
+  };
+
+  let point = if transpose {
+    GdiDropoutPoint {
+      x: ranged_coordinate,
+      y: boundary_coordinate,
+    }
+  } else {
+    GdiDropoutPoint {
+      x: boundary_coordinate,
+      y: ranged_coordinate,
+    }
+  };
+  if !intersections.contains(&point) {
+    intersections.push(point);
+  }
+}
+
+fn apply_gdi_dropout_regular_span(
+  scan_index: usize,
+  x1: i64,
+  x2: i64,
+  coverage: &mut [u8],
+  width: usize,
+  height: usize,
+) {
+  let first = gdi_dropout_ceil(x1);
+  let last = gdi_dropout_floor(x2);
+  if last < first {
+    return;
+  }
+
+  for pixel in first / GDI_DROPOUT_PRECISION..=last / GDI_DROPOUT_PRECISION {
+    if let Some(index) =
+      gdi_dropout_mask_index(GdiDropoutAxis::Horizontal, scan_index, pixel, width, height)
+    {
+      coverage[index] = u8::MAX;
+    }
+  }
+}
+
+fn gdi_dropout_profile_crossing(profile: &GdiDropoutProfile, scan_coordinate: i64) -> Option<i64> {
+  // At a same-direction joint FreeType replaces the preceding endpoint with
+  // the following segment's start.  Reverse traversal reproduces that rule,
+  // including a flat segment between the two monotone arcs.
+  profile.lines.iter().rev().find_map(|line| {
+    let min_scan = line.start_scan.min(line.end_scan);
+    let max_scan = line.start_scan.max(line.end_scan);
+    (scan_coordinate >= min_scan && scan_coordinate <= max_scan).then(|| {
+      line.start_cross
+        + gdi_dropout_mul_div(
+          line.end_cross - line.start_cross,
+          scan_coordinate - line.start_scan,
+          line.end_scan - line.start_scan,
+        )
+    })
+  })
+}
+
+fn gdi_dropout_mul_div(value: i64, multiplier: i64, divisor: i64) -> i64 {
+  debug_assert_ne!(divisor, 0);
+  let product = i128::from(value) * i128::from(multiplier);
+  let divisor = i128::from(divisor);
+  let negative = (product < 0) != (divisor < 0);
+  let magnitude = (product.abs() + divisor.abs() / 2) / divisor.abs();
+  let result = if negative { -magnitude } else { magnitude };
+  result.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
+}
+
+fn apply_gdi_dropout_aligned_edges(
+  scan_index: usize,
+  x1: i64,
+  x2: i64,
+  coverage: &mut [u8],
+  width: usize,
+  height: usize,
+  axis: GdiDropoutAxis,
+  close_cleartype_perpendicular_edges: bool,
+) {
+  for coordinate in [x1, x2] {
+    let aligned_coordinate = if coordinate == gdi_dropout_ceil(coordinate) {
+      Some(coordinate)
+    } else if close_cleartype_perpendicular_edges {
+      let nearest = gdi_dropout_floor(coordinate + GDI_DROPOUT_HALF);
+      ((coordinate - nearest).abs() <= GDI_DROPOUT_PRECISION_STEP).then_some(nearest)
+    } else {
+      None
+    };
+    if let Some(aligned_coordinate) = aligned_coordinate
+      && let Some(index) = gdi_dropout_mask_index(
+        axis,
+        scan_index,
+        aligned_coordinate / GDI_DROPOUT_PRECISION,
+        width,
+        height,
+      )
+    {
+      coverage[index] = u8::MAX;
+    }
+  }
+}
+
+fn gdi_dropout_floor(value: i64) -> i64 {
+  value.div_euclid(GDI_DROPOUT_PRECISION) * GDI_DROPOUT_PRECISION
+}
+
+fn gdi_dropout_ceil(value: i64) -> i64 {
+  -gdi_dropout_floor(-value)
+}
+
+fn gdi_dropout_smart(first: i64, second: i64) -> i64 {
+  // FreeType SMART: FLOOR(((p + q + precision * 63 / 64) >> 1)).
+  gdi_dropout_floor((first + second + GDI_DROPOUT_PRECISION * 63 / 64) >> 1)
 }
 
 fn gdi_dropout_mask_index(
   axis: GdiDropoutAxis,
   scan_index: usize,
-  pixel: i32,
+  pixel: i64,
   width: usize,
   height: usize,
 ) -> Option<usize> {
-  let pixel = usize::try_from(pixel).ok()?;
   match axis {
-    GdiDropoutAxis::Horizontal if scan_index < height && pixel < width => {
-      scan_index.checked_mul(width)?.checked_add(pixel)
+    GdiDropoutAxis::Horizontal => {
+      let pixel = usize::try_from(pixel).ok()?;
+      (scan_index < height && pixel < width)
+        .then(|| scan_index.checked_mul(width)?.checked_add(pixel))?
     }
-    GdiDropoutAxis::Vertical if scan_index < width && pixel < height => {
-      pixel.checked_mul(width)?.checked_add(scan_index)
+    GdiDropoutAxis::Vertical => {
+      let pixel = usize::try_from(-pixel).ok()?;
+      (scan_index < width && pixel < height)
+        .then(|| pixel.checked_mul(width)?.checked_add(scan_index))?
     }
-    _ => None,
   }
 }
 
@@ -3642,9 +4751,61 @@ fn pack_gdi_monochrome_mask(
   Some((stride, bits))
 }
 
-fn gdi_subpixel_blend(destination: u8, text: u8, alpha: u8) -> u8 {
-  ((u32::from(text) * u32::from(alpha) + u32::from(destination) * u32::from(u8::MAX - alpha) + 127)
-    / 255) as u8
+#[derive(Clone)]
+struct GdiFontGammaRamp {
+  encode: [u8; 256],
+  decode: [u8; 256],
+}
+
+impl GdiFontGammaRamp {
+  fn new(contrast: u16) -> Self {
+    let contrast = contrast.clamp(1000, 2200) as f32;
+    Self {
+      encode: gdi_font_gamma_table(1000.0 / contrast),
+      decode: gdi_font_gamma_table(contrast / 1000.0),
+    }
+  }
+}
+
+fn gdi_font_gamma_table(exponent: f32) -> [u8; 256] {
+  std::array::from_fn(|value| {
+    ((value as f32 / 255.0).powf(exponent) * 255.0)
+      .round()
+      .clamp(0.0, 255.0) as u8
+  })
+}
+
+fn gdi_subpixel_blend_with_gamma(
+  destination: u8,
+  text: u8,
+  alpha: u8,
+  gamma_ramp: Option<&GdiFontGammaRamp>,
+) -> u8 {
+  // Wine's DIB driver preserves the exact-source and exact-destination
+  // boundaries before entering the gamma tables. A zero stripe is different:
+  // `draw_gdi_glyph` has already rejected an all-zero RGB pixel, so a zero
+  // sibling channel in a touched native HRGB pixel still takes the gamma
+  // round-trip. Office exposes that distinction on the GDI+ scratch key because
+  // encode(decode(x)) is not an identity at every byte value.
+  if destination == text {
+    return destination;
+  }
+  if alpha == u8::MAX {
+    return text;
+  }
+  let blend = |destination: u8, text: u8| {
+    ((u32::from(text) * u32::from(alpha)
+      + u32::from(destination) * u32::from(u8::MAX - alpha)
+      + 127)
+      / 255) as u8
+  };
+  let Some(gamma_ramp) = gamma_ramp else {
+    return blend(destination, text);
+  };
+  gamma_ramp.encode[usize::from(blend(
+    gamma_ramp.decode[usize::from(destination)],
+    gamma_ramp.decode[usize::from(text)],
+  ))]
 }
 
 /// Seventeen-level grayscale intensity ramp used by the Wine DIB GDI driver.
@@ -3683,6 +4844,11 @@ fn gdi_grayscale_blend(destination: EmfColor, text: EmfColor, level: usize) -> E
 
 /// Applies the one-pixel-wide displaced box filters described by Microsoft's
 /// ClearType RGB-decimation paper to a six-times-horizontal alpha raster.
+///
+/// The displaced blue window reaches into the device pixel immediately before
+/// the one containing the outline's first high-resolution sample. Keep that
+/// leading support pixel just like the trailing red support pixel; an all-zero
+/// result remains untouched when the realized glyph does not reach the window.
 fn cleartype_box_decimate(
   high_resolution: &[u8],
   high_resolution_width: usize,
@@ -3716,7 +4882,12 @@ fn cleartype_box_decimate(
             sum += u16::from(*sample);
           }
         }
-        channels[channel] = ((sum + 3) / SAMPLES_PER_PIXEL as u16) as u8;
+        // GDI stores the fixed-width box integral in an eight-bit coverage
+        // channel by integer division.  In particular, three covered binary
+        // samples are 127 (765 / 6), not 128.  Native PlayEnhMetaFile sweeps
+        // over independent destination RGB values distinguish that one-byte
+        // midpoint from a rounded average after the font gamma ramp.
+        channels[channel] = (sum / SAMPLES_PER_PIXEL as u16) as u8;
       }
       output[y * width + (output_x - left) as usize] = channels;
     }
@@ -3764,8 +4935,22 @@ impl EmfVectorState {
     let natural_width = geometry.width;
     let natural_height = geometry.height;
     let (width, height) = options.resolved_canvas_size(natural_width, natural_height);
-    let output_scale_x = width as f32 / natural_width.max(1) as f32;
-    let output_scale_y = height as f32 / natural_height.max(1) as f32;
+    let output_scale_x = options.output_scale(options.playback_width_px, width, natural_width);
+    let output_scale_y = options.output_scale(options.playback_height_px, height, natural_height);
+    let text_output_scale_x = options.output_scale(
+      options
+        .text_playback_width(text_surface)
+        .or(options.playback_width_px),
+      width,
+      natural_width,
+    );
+    let text_output_scale_y = options.output_scale(
+      options
+        .text_playback_height(text_surface)
+        .or(options.playback_height_px),
+      height,
+      natural_height,
+    );
     let background_color = options.background_color.unwrap_or([255; 3]);
     let mut rgb = vec![0; width * height * RGB_BYTES_PER_PIXEL];
     for pixel in rgb.chunks_exact_mut(RGB_BYTES_PER_PIXEL) {
@@ -3783,6 +4968,8 @@ impl EmfVectorState {
       playback_scale_y: geometry.scale_y,
       output_scale_x,
       output_scale_y,
+      text_output_scale_x,
+      text_output_scale_y,
       map_mode: EmrMapMode::Text,
       window_org_x: 0,
       window_org_y: 0,
@@ -3826,10 +5013,51 @@ impl EmfVectorState {
       emf_plus_objects: Vec::new(),
       emf_plus_object_assembler: EmfPlusObjectAssembler::default(),
       font_cache: RenderFontCache::load(),
+      font_gamma_ramp: options.font_smoothing_contrast.map(GdiFontGammaRamp::new),
       text_surface,
       suppress_text: options.suppress_text,
       rgb,
+      gdi_plus_dc_destination: None,
     })
+  }
+
+  fn begin_gdi_plus_dc(&mut self) {
+    if self.gdi_plus_dc_destination.is_some() {
+      return;
+    }
+
+    let mut scratch = vec![0; self.rgb.len()];
+    for pixel in scratch.chunks_exact_mut(RGB_BYTES_PER_PIXEL) {
+      pixel.copy_from_slice(&[
+        GDI_PLUS_DC_BACKGROUND_KEY.r,
+        GDI_PLUS_DC_BACKGROUND_KEY.g,
+        GDI_PLUS_DC_BACKGROUND_KEY.b,
+      ]);
+    }
+    self.gdi_plus_dc_destination = Some(std::mem::replace(&mut self.rgb, scratch));
+  }
+
+  fn end_gdi_plus_dc(&mut self) {
+    let Some(mut destination) = self.gdi_plus_dc_destination.take() else {
+      return;
+    };
+
+    for (scratch, target) in self
+      .rgb
+      .chunks_exact(RGB_BYTES_PER_PIXEL)
+      .zip(destination.chunks_exact_mut(RGB_BYTES_PER_PIXEL))
+    {
+      if scratch
+        != [
+          GDI_PLUS_DC_BACKGROUND_KEY.r,
+          GDI_PLUS_DC_BACKGROUND_KEY.g,
+          GDI_PLUS_DC_BACKGROUND_KEY.b,
+        ]
+      {
+        target.copy_from_slice(scratch);
+      }
+    }
+    self.rgb = destination;
   }
 
   fn map_point(&self, point: EmfPoint) -> (f32, f32) {
@@ -4011,8 +5239,13 @@ impl EmfVectorState {
     // leading edge to the nearest device pixel and truncates the exclusive
     // trailing edge; rounding both edges makes a half-pixel bottom grow by
     // one row (as in the 32-unit preview bitmap in tdf135653.docx).
-    let right = mapped_left.max(mapped_right).floor() as i32;
-    let bottom = mapped_top.max(mapped_bottom).floor() as i32;
+    // GDI maps both logical corners through LPtoDP before subtracting the
+    // resulting device coordinates. The right and bottom endpoints therefore
+    // use the same nearest-device-sample realization as left and top; flooring
+    // only the far corner contracts fractional MaskBlt destinations by a row
+    // or column.
+    let right = mapped_left.max(mapped_right).round() as i32;
+    let bottom = mapped_top.max(mapped_bottom).round() as i32;
     let width = (right - left).max(1);
     let height = (bottom - top).max(1);
     let interpolate = width as usize != image.width || height as usize != image.height;
@@ -4057,8 +5290,13 @@ impl EmfVectorState {
     });
     let left = mapped_left.min(mapped_right).round() as i32;
     let top = mapped_top.min(mapped_bottom).round() as i32;
-    let right = mapped_left.max(mapped_right).floor() as i32;
-    let bottom = mapped_top.max(mapped_bottom).floor() as i32;
+    // GDI maps both logical corners through LPtoDP before subtracting the
+    // resulting device coordinates. The right and bottom endpoints therefore
+    // use the same nearest-device-sample realization as left and top; flooring
+    // only the far corner contracts fractional MaskBlt destinations by a row
+    // or column.
+    let right = mapped_left.max(mapped_right).round() as i32;
+    let bottom = mapped_top.max(mapped_bottom).round() as i32;
     let width = (right - left).max(1);
     let height = (bottom - top).max(1);
     let interpolate =
@@ -4129,8 +5367,13 @@ impl EmfVectorState {
     });
     let left = mapped_left.min(mapped_right).round() as i32;
     let top = mapped_top.min(mapped_bottom).round() as i32;
-    let right = mapped_left.max(mapped_right).floor() as i32;
-    let bottom = mapped_top.max(mapped_bottom).floor() as i32;
+    // GDI maps both logical corners through LPtoDP before subtracting the
+    // resulting device coordinates. The right and bottom endpoints therefore
+    // use the same nearest-device-sample realization as left and top; flooring
+    // only the far corner contracts fractional MaskBlt destinations by a row
+    // or column.
+    let right = mapped_left.max(mapped_right).round() as i32;
+    let bottom = mapped_top.max(mapped_bottom).round() as i32;
     let width = (right - left).max(1);
     let height = (bottom - top).max(1);
     // A one-bit mask in the canonical SRCAND/SRCINVERT transparency pair must
@@ -4182,8 +5425,13 @@ impl EmfVectorState {
     });
     let left = mapped_left.min(mapped_right).round() as i32;
     let top = mapped_top.min(mapped_bottom).round() as i32;
-    let right = mapped_left.max(mapped_right).floor() as i32;
-    let bottom = mapped_top.max(mapped_bottom).floor() as i32;
+    // GDI maps both logical corners through LPtoDP before subtracting the
+    // resulting device coordinates. The right and bottom endpoints therefore
+    // use the same nearest-device-sample realization as left and top; flooring
+    // only the far corner contracts fractional MaskBlt destinations by a row
+    // or column.
+    let right = mapped_left.max(mapped_right).round() as i32;
+    let bottom = mapped_top.max(mapped_bottom).round() as i32;
     let width = (right - left).max(1) as usize;
     let height = (bottom - top).max(1) as usize;
     let interpolate = width != image.width || height != image.height;
@@ -4198,19 +5446,19 @@ impl EmfVectorState {
         } else {
           raster_color(image, x, y)
         };
-        // The canonical SRCAND mask uses black for covered source pixels and
-        // white for the transparent destination. GDI+ filters the paired
-        // SRCINVERT color bitmap independently, and a nonblack filtered
-        // sample is consequently part of the pair's opaque output even when
-        // its nearest one-bit mask sample is white. Keeping that color fringe
-        // is required before black/white destination reconstruction; masking
-        // first contracts icon edges.
-        if u16::from(mask_color.r) + u16::from(mask_color.g) + u16::from(mask_color.b) >= 3 * 128
-          && color == (EmfColor { r: 0, g: 0, b: 0 })
-        {
+        let dest_x = left + x as i32;
+        let dest_y = top + y as i32;
+        let Some(destination) = self.pixel(dest_x, dest_y) else {
           continue;
-        }
-        self.set_pixel(left + x as i32, top + y as i32, color);
+        };
+
+        // The paired records implement SRCAND followed by SRCINVERT.
+        // [MS-WMF] defines those ROPs as DSa and DSx respectively, so the
+        // filtered source must be combined as (destination AND mask) XOR
+        // source. Keeping both operations is observable at antialiased mask
+        // fringes, where the mask and filtered source use different sampling
+        // rules.
+        self.set_pixel(dest_x, dest_y, destination.and(mask_color).xor(color));
       }
     }
   }
@@ -4315,14 +5563,30 @@ impl EmfVectorState {
 
   fn mapped_vertical_length(&self, logical_height: i32) -> f32 {
     let height = logical_height.unsigned_abs().max(1) as f32;
-    let (x, y) = self.map_vector(0.0, height);
+    let (x, y) = self.map_text_vector(0.0, height);
     x.hypot(y).max(1.0)
   }
 
   fn mapped_horizontal_length(&self, logical_width: i32) -> f32 {
     let width = logical_width.unsigned_abs().max(1) as f32;
-    let (x, y) = self.map_vector(width, 0.0);
+    let (x, y) = self.map_text_vector(width, 0.0);
     x.hypot(y).max(f32::EPSILON)
+  }
+
+  fn map_text_vector(&self, x: f32, y: f32) -> (f32, f32) {
+    let mapped_x = x * self.world_transform.m11 + y * self.world_transform.m21;
+    let mapped_y = x * self.world_transform.m12 + y * self.world_transform.m22;
+    let (page_scale_x, page_scale_y) = self.emf_plus_page_device_scale();
+    let (extent_scale_x, extent_scale_y) = emf_window_viewport_scale(
+      self.map_mode,
+      self.window_ext_x,
+      self.window_ext_y,
+      self.viewport_ext_x,
+      self.viewport_ext_y,
+    );
+    let scale_x = extent_scale_x * page_scale_x * self.playback_scale_x * self.text_output_scale_x;
+    let scale_y = extent_scale_y * page_scale_y * self.playback_scale_y * self.text_output_scale_y;
+    (mapped_x * scale_x, mapped_y * scale_y)
   }
 
   fn map_vector(&self, x: f32, y: f32) -> (f32, f32) {
@@ -4341,17 +5605,23 @@ impl EmfVectorState {
     (mapped_x * scale_x, mapped_y * scale_y)
   }
 
-  fn mapped_horizontal_distance(&self, logical_width: i64) -> f32 {
+  fn mapped_horizontal_distance(&self, logical_origin: EmfPoint, logical_width: i64) -> f32 {
     let width = i32::try_from(logical_width).unwrap_or(if logical_width < 0 {
       i32::MIN
     } else {
       i32::MAX
     });
-    // ExtTextOut maps the cumulative logical origin and the zero origin to
-    // device coordinates separately, rounds both, and then subtracts them.
-    // Keeping that phase also retains the outer playback viewport.
-    let origin = self.map_point(EmfPoint { x: 0, y: 0 });
-    let endpoint = self.map_point(EmfPoint { x: width, y: 0 });
+    // ExtTextOut maps each authored character-cell origin as an actual logical
+    // point. Native PlayEnhMetaFile reference/Dx sweeps show that LPtoDP's
+    // integer rounding phase is anchored at the aligned text reference, not at
+    // logical zero. Dropping that phase moves later glyphs at fractional
+    // playback scales even when every individual Dx is otherwise correct.
+    let endpoint = EmfPoint {
+      x: logical_origin.x.saturating_add(width),
+      y: logical_origin.y,
+    };
+    let origin = self.map_point(logical_origin);
+    let endpoint = self.map_point(endpoint);
     let x = endpoint.0.round() - origin.0.round();
     let y = endpoint.1.round() - origin.1.round();
     x.hypot(y).copysign(width as f32)
@@ -4365,6 +5635,7 @@ impl EmfVectorState {
       color,
       &WmfTextFont {
         height,
+        escapement: 0,
         family: None,
         char_set: 0,
         weight: 400,
@@ -4395,17 +5666,28 @@ impl EmfVectorState {
     logical_advances: Option<&[i16]>,
   ) {
     let (mapped_x, mapped_y) = self.map_point(EmfPoint { x, y });
-    let height = self
-      .mapped_vertical_length(if font.height == 0 { 12 } else { font.height })
-      .round()
-      .max(1.0);
+    let escapement_radians = (font.escapement as f32 / 10.0).to_radians();
+    let logical_axis_x = escapement_radians.cos();
+    let logical_axis_y = -escapement_radians.sin();
+    let (mapped_axis_x, mapped_axis_y) = self.map_vector(logical_axis_x, logical_axis_y);
+    let rotation_degrees = mapped_axis_y.atan2(mapped_axis_x).to_degrees();
+    let logical_normal_x = escapement_radians.sin();
+    let logical_normal_y = escapement_radians.cos();
+    let (mapped_normal_x, mapped_normal_y) = self.map_vector(logical_normal_x, logical_normal_y);
+    let height = ((if font.height == 0 { 12 } else { font.height }).unsigned_abs() as f32
+      * mapped_normal_x.hypot(mapped_normal_y))
+    .round()
+    .max(1.0);
     let advances = logical_advances.map(|values| {
       let values = values
         .iter()
         .map(|value| i32::from(*value))
         .collect::<Vec<_>>();
       cumulative_mapped_advances(&values, |logical_cumulative| {
-        self.mapped_horizontal_distance(logical_cumulative)
+        let logical_cumulative = logical_cumulative as f32;
+        let x = (logical_cumulative * mapped_axis_x).round();
+        let y = (logical_cumulative * mapped_axis_y).round();
+        x.hypot(y).copysign(logical_cumulative)
       })
     });
     self.draw_text_at_device(
@@ -4415,8 +5697,11 @@ impl EmfVectorState {
         text,
         x: mapped_x.round(),
         baseline_y: mapped_y.round(),
+        rotation_degrees,
+        hinting_height: height,
         height,
         horizontal_scale: 1.0,
+        vertical_scale: 1.0,
         advances: advances.as_deref(),
         surface: self.text_surface,
       },
@@ -4466,42 +5751,42 @@ impl EmfVectorState {
       x: aligned_x,
       y: reference.y,
     });
-    // GDI maps the logical text reference point and LOGFONT character height
-    // to device units before selecting and rasterizing the realized font.
     let mapped_x = mapped_x.round();
     let reference_y = reference_y.round();
-    // GDI realizes a transformed LOGFONT height in whole device pixels by
-    // truncating the positive magnitude. For example, the -11 logical Segoe
-    // UI font in tdf135653 maps to 22.83 pixels and Windows uses a 22-pixel
-    // realization; rounding to 23 grows every glyph one row above TA_TOP.
-    let height = self.mapped_vertical_length(font_height).floor().max(1.0);
+    // PlayEnhMetaFile switches to the record's GM_COMPATIBLE mode and
+    // reselects the current font before ExtTextOut. Native GetGlyphOutlineW
+    // exposes integer device ppem grids for both axes; render_text combines
+    // their independently hinted coordinates below.
+    let mapped_font_height = self.mapped_vertical_length(font_height);
+    let height = mapped_font_height.round().max(1.0);
+    let hinting_height = height;
     let mapped_y =
       self
         .font_cache
         .baseline_for_alignment(font, height, reference_y, self.text_alignment);
     let advances = logical_advances.map(|values| {
       cumulative_mapped_advances(values, |logical_cumulative| {
-        self.mapped_horizontal_distance(logical_cumulative)
+        // ExtTextOutW consumes Dx as logical character-cell spacing. GDI
+        // cumulatively maps each origin through LPtoDP, which realizes an
+        // integer device point before adjacent origins are differenced.
+        self
+          .mapped_horizontal_distance(
+            EmfPoint {
+              x: aligned_x,
+              y: reference.y,
+            },
+            logical_cumulative,
+          )
+          .round()
       })
     });
-    // [MS-EMF] 2.3.5.8 defines exScale/eyScale as page-space to physical
-    // (.01mm) scales for GM_COMPATIBLE text. Convert equal physical X/Y font
-    // dimensions through the player's full output mapping; supplied Dx
-    // positions remain independent page-space origins. This matters when an
-    // OLE preview is played into a host viewport with a different aspect
-    // ratio from its recorded device.
-    let horizontal_scale = if text_record.graphics_mode == 1
-      && text_record.x_scale.is_finite()
-      && text_record.y_scale.is_finite()
-      && text_record.x_scale != 0.0
-      && text_record.y_scale != 0.0
-    {
-      let output_axis_ratio =
-        self.mapped_horizontal_length(font_height) / self.mapped_vertical_length(font_height);
-      output_axis_ratio * (text_record.y_scale / text_record.x_scale).abs()
-    } else {
-      1.0
-    };
+    // EMREXTTEXTOUT exScale/eyScale describe the recording device's physical
+    // page units; they are not an additional playback transform. Wine and
+    // ReactOS replay ExtTextOut after reselecting the font without consuming
+    // those fields, and native Win32 produces byte-identical output when each
+    // field is independently varied. Use only the actual LPtoDP axes here.
+    let horizontal_scale = self.mapped_horizontal_length(font_height) / mapped_font_height;
+    let vertical_scale = 1.0;
     self.draw_text_at_device(
       color,
       TextRenderRequest {
@@ -4509,8 +5794,11 @@ impl EmfVectorState {
         text,
         x: mapped_x,
         baseline_y: mapped_y,
+        rotation_degrees: 0.0,
+        hinting_height,
         height,
         horizontal_scale,
+        vertical_scale,
         advances: advances.as_deref(),
         surface: self.text_surface,
       },
@@ -4535,6 +5823,31 @@ impl EmfVectorState {
     }
 
     let scale = ((request.height as usize).max(7) / 7).max(1);
+    if request.rotation_degrees.abs() > f32::EPSILON {
+      let mut cursor_advance = 0.0;
+      for (index, ch) in request.text.chars().enumerate() {
+        let default_advance = if ch.is_whitespace() { 4 } else { 6 };
+        let advance = request
+          .advances
+          .and_then(|values| values.get(index))
+          .copied()
+          .unwrap_or((default_advance * scale) as f32);
+        if !ch.is_whitespace() {
+          draw_glyph_5x7_rotated(
+            self,
+            request.x,
+            request.baseline_y,
+            cursor_advance,
+            request.rotation_degrees,
+            ch,
+            color,
+            scale,
+          );
+        }
+        cursor_advance += advance;
+      }
+      return;
+    }
     let mut cursor_x = request.x.round() as i32;
     let baseline_y = request.baseline_y.round() as i32;
     for (index, ch) in request.text.chars().enumerate() {
@@ -4599,15 +5912,13 @@ impl EmfVectorState {
             let Some(destination) = self.pixel(device_x, device_y) else {
               continue;
             };
-            self.set_vector_pixel(
-              device_x,
-              device_y,
-              EmfColor {
-                r: gdi_subpixel_blend(destination.r, color.r, coverage[0]),
-                g: gdi_subpixel_blend(destination.g, color.g, coverage[1]),
-                b: gdi_subpixel_blend(destination.b, color.b, coverage[2]),
-              },
-            );
+            let gamma_ramp = self.font_gamma_ramp.as_ref();
+            let blended = EmfColor {
+              r: gdi_subpixel_blend_with_gamma(destination.r, color.r, coverage[0], gamma_ramp),
+              g: gdi_subpixel_blend_with_gamma(destination.g, color.g, coverage[1], gamma_ramp),
+              b: gdi_subpixel_blend_with_gamma(destination.b, color.b, coverage[2], gamma_ramp),
+            };
+            self.set_vector_pixel(device_x, device_y, blended);
           }
         }
       }
@@ -5046,6 +6357,34 @@ impl EmfVectorState {
     });
   }
 
+  fn fill_polygon_with_wmf_pattern(
+    &mut self,
+    points: &[EmfPoint],
+    pattern: &WmfPatternBrush,
+    text_color: EmfColor,
+    background_color: EmfColor,
+  ) {
+    if points.len() < 3 {
+      return;
+    }
+
+    let mapped = points
+      .iter()
+      .map(|point| self.map_point(*point))
+      .collect::<Vec<_>>();
+    let width = self.width;
+    let height = self.height;
+    visit_polygon_scanline_spans(&mapped, width, height, |y, start, end| {
+      for x in start..end {
+        self.set_vector_pixel(
+          x as i32,
+          y as i32,
+          pattern.color_at(x as i32, y as i32, text_color, background_color),
+        );
+      }
+    });
+  }
+
   fn fill_polygon_with_emf_plus_brush(&mut self, points: &[EmfPoint], brush: &EmfPlusRenderBrush) {
     if points.len() < 3 {
       return;
@@ -5285,10 +6624,20 @@ impl EmfVectorState {
   }
 }
 
+#[cfg(test)]
 fn decode_vector_emf_as_png(
   data: &[u8],
   options: RenderOptions,
   text_surface: GdiTextSurface,
+) -> Result<DecodedMetafile, String> {
+  decode_vector_emf_as_png_with_dc_mode(data, options, text_surface, GdiPlusDcMode::Direct)
+}
+
+fn decode_vector_emf_as_png_with_dc_mode(
+  data: &[u8],
+  options: RenderOptions,
+  text_surface: GdiTextSurface,
+  gdi_plus_dc_mode: GdiPlusDcMode,
 ) -> Result<DecodedMetafile, String> {
   let mut state = if text_surface == GdiTextSurface::Color {
     EmfVectorState::new_with_options(data, options)?
@@ -5297,6 +6646,10 @@ fn decode_vector_emf_as_png(
   };
   let mut pos =
     emf_header_record_size(data).ok_or_else(|| "invalid EMF header record".to_string())?;
+  let contains_emf_plus = emf_contains_emf_plus(data)?;
+  if gdi_plus_dc_mode == GdiPlusDcMode::Scratch && !contains_emf_plus {
+    state.begin_gdi_plus_dc();
+  }
   let mut emf_plus_playback = false;
   let mut emf_device_context = None;
 
@@ -5313,6 +6666,9 @@ fn decode_vector_emf_as_png(
     if is_emf_plus_comment && let Some(bridge) = emf_device_context.take() {
       // The next EMF+ record ends the GetDC interval. Restore the EMF+
       // graphics state before consuming that record.
+      if gdi_plus_dc_mode == GdiPlusDcMode::Scratch {
+        state.end_gdi_plus_dc();
+      }
       state.end_emf_device_context(bridge);
     }
     if emf_plus_playback
@@ -5716,7 +7072,11 @@ fn decode_vector_emf_as_png(
         if let Some(control) = process_emf_plus_comment(data, pos, record_size, &mut state)? {
           emf_plus_playback |= control.header;
           if emf_plus_playback && control.get_dc {
-            emf_device_context = Some(state.begin_emf_device_context());
+            let bridge = state.begin_emf_device_context();
+            if gdi_plus_dc_mode == GdiPlusDcMode::Scratch {
+              state.begin_gdi_plus_dc();
+            }
+            emf_device_context = Some(bridge);
           }
         }
       }
@@ -5725,6 +7085,15 @@ fn decode_vector_emf_as_png(
     }
 
     pos += record_size + consumed_following_record_size;
+  }
+
+  if let Some(bridge) = emf_device_context.take() {
+    if gdi_plus_dc_mode == GdiPlusDcMode::Scratch {
+      state.end_gdi_plus_dc();
+    }
+    state.end_emf_device_context(bridge);
+  } else if gdi_plus_dc_mode == GdiPlusDcMode::Scratch {
+    state.end_gdi_plus_dc();
   }
 
   Ok(DecodedMetafile {
@@ -5737,6 +7106,29 @@ fn emf_comment_is_emf_plus(data: &[u8], record_offset: usize, record_size: usize
   record_size >= 16
     && read_u32(data, record_offset + 8).is_ok_and(|data_size| data_size >= 4)
     && read_u32(data, record_offset + 12).is_ok_and(|identifier| identifier == EMR_COMMENT_EMFPLUS)
+}
+
+fn emf_contains_emf_plus(data: &[u8]) -> Result<bool, String> {
+  let Some(mut pos) = emf_header_record_size(data) else {
+    return Ok(false);
+  };
+  while pos + EMF_RECORD_HEADER_SIZE <= data.len() {
+    let record_type = read_u32(data, pos)?;
+    let record_size = read_u32(data, pos + 4)? as usize;
+    if record_size < EMF_RECORD_HEADER_SIZE || pos + record_size > data.len() {
+      return Err(format!(
+        "invalid EMF record at offset {pos}: type=0x{record_type:08x} size={record_size}"
+      ));
+    }
+    if record_type == EMR_COMMENT && emf_comment_is_emf_plus(data, pos, record_size) {
+      return Ok(true);
+    }
+    pos += record_size;
+    if record_type == EMR_EOF {
+      break;
+    }
+  }
+  Ok(false)
 }
 
 fn replay_emf_alpha_blend(
@@ -6404,6 +7796,35 @@ struct WmfPatternBrush {
   filtered_color: Option<EmfColor>,
 }
 
+impl WmfPatternBrush {
+  fn color_at(&self, x: i32, y: i32, text_color: EmfColor, background_color: EmfColor) -> EmfColor {
+    if let Some(color) = self.filtered_color {
+      return color;
+    }
+    if self.image.width == 0 || self.image.height == 0 {
+      return background_color;
+    }
+
+    let pattern_x = x.rem_euclid(self.image.width as i32) as usize;
+    let pattern_y = y.rem_euclid(self.image.height as i32) as usize;
+    let offset = (pattern_y * self.image.width + pattern_x) * RGB_BYTES_PER_PIXEL;
+    let stored = EmfColor {
+      r: self.image.rgb[offset],
+      g: self.image.rgb[offset + 1],
+      b: self.image.rgb[offset + 2],
+    };
+    if self.use_dc_colors {
+      if u16::from(stored.r) + u16::from(stored.g) + u16::from(stored.b) < 3 * 128 {
+        text_color
+      } else {
+        background_color
+      }
+    } else {
+      stored
+    }
+  }
+}
+
 #[derive(Clone, Debug)]
 enum WmfRenderObject {
   Pen(Option<EmfPen>),
@@ -6434,14 +7855,29 @@ impl WmfRenderState {
     metafile: &WmfMetafileRef<'_>,
     options: RenderOptions,
     text_surface: GdiTextSurface,
+    gdi_plus_dc_mode: GdiPlusDcMode,
   ) -> Result<Self, String> {
     let (window_org_x, window_org_y, window_ext_x, window_ext_y) =
       wmf_initial_window(metafile, options.wmf_external_header);
     let natural_width = window_ext_x.unsigned_abs().max(1) as usize;
     let natural_height = window_ext_y.unsigned_abs().max(1) as usize;
     let (width, height) = options.resolved_canvas_size(natural_width, natural_height);
-    let output_scale_x = width as f32 / natural_width as f32;
-    let output_scale_y = height as f32 / natural_height as f32;
+    let output_scale_x = options.output_scale(options.playback_width_px, width, natural_width);
+    let output_scale_y = options.output_scale(options.playback_height_px, height, natural_height);
+    let text_output_scale_x = options.output_scale(
+      options
+        .text_playback_width(text_surface)
+        .or(options.playback_width_px),
+      width,
+      natural_width,
+    );
+    let text_output_scale_y = options.output_scale(
+      options
+        .text_playback_height(text_surface)
+        .or(options.playback_height_px),
+      height,
+      natural_height,
+    );
     let object_count = metafile.header.number_of_objects as usize;
     let background_color = options.background_color.unwrap_or([255; 3]);
     let mut rgb = vec![0; width * height * RGB_BYTES_PER_PIXEL];
@@ -6449,7 +7885,7 @@ impl WmfRenderState {
       pixel.copy_from_slice(&background_color);
     }
 
-    Ok(Self {
+    let mut state = Self {
       canvas: EmfVectorState {
         width,
         height,
@@ -6461,6 +7897,8 @@ impl WmfRenderState {
         playback_scale_y: 1.0,
         output_scale_x,
         output_scale_y,
+        text_output_scale_x,
+        text_output_scale_y,
         // WMF owns its mapping state in WmfRenderState. Keep this shared
         // canvas on the variable-extent path so META_SETWINDOWEXT and the
         // caller-supplied viewport retain their existing mapping.
@@ -6508,9 +7946,11 @@ impl WmfRenderState {
         emf_plus_objects: Vec::new(),
         emf_plus_object_assembler: EmfPlusObjectAssembler::default(),
         font_cache: RenderFontCache::load(),
+        font_gamma_ramp: options.font_smoothing_contrast.map(GdiFontGammaRamp::new),
         text_surface,
         suppress_text: options.suppress_text,
         rgb,
+        gdi_plus_dc_destination: None,
       },
       objects: vec![None; object_count],
       current_pos: EmfPoint { x: 0, y: 0 },
@@ -6524,6 +7964,7 @@ impl WmfRenderState {
       current_solid_brush: false,
       current_font: WmfTextFont {
         height: 12,
+        escapement: 0,
         family: None,
         char_set: 0,
         weight: 400,
@@ -6532,7 +7973,11 @@ impl WmfRenderState {
       },
       text_alignment: WmfTextAlignmentModeFlags::empty(),
       saved: Vec::new(),
-    })
+    };
+    if gdi_plus_dc_mode == GdiPlusDcMode::Scratch {
+      state.canvas.begin_gdi_plus_dc();
+    }
+    Ok(state)
   }
 
   fn insert_object(&mut self, object: WmfRenderObject) {
@@ -6602,6 +8047,7 @@ impl WmfRenderState {
         self.current_solid_brush = solid;
       }
       WmfRenderObject::PatternBrush(pattern) => {
+        self.canvas.current_brush = None;
         self.current_pattern_brush = Some(pattern);
         self.current_solid_brush = false;
       }
@@ -6632,25 +8078,33 @@ impl WmfRenderState {
 
   fn text_origin(&self, x: i16, y: i16, logical_width: Option<i32>) -> EmfPoint {
     let mut reference = self.text_reference_point(x, y);
-    if self
+    let alignment_shift = if self
       .text_alignment
       .contains(WmfTextAlignmentModeFlags::CENTER)
     {
-      reference.x = reference
-        .x
-        .saturating_sub(logical_width.unwrap_or_default() / 2);
+      logical_width.unwrap_or_default() / 2
     } else if self
       .text_alignment
       .contains(WmfTextAlignmentModeFlags::RIGHT)
     {
-      reference.x = reference
-        .x
-        .saturating_sub(logical_width.unwrap_or_default());
+      logical_width.unwrap_or_default()
+    } else {
+      0
+    };
+    if alignment_shift != 0 {
+      let (axis_x, axis_y) = self.text_axis();
+      reference.x = (reference.x as f32 - alignment_shift as f32 * axis_x).round() as i32;
+      reference.y = (reference.y as f32 - alignment_shift as f32 * axis_y).round() as i32;
     }
     reference
   }
 
-  fn text_baseline_y(&self, reference_y: i32) -> i32 {
+  fn text_axis(&self) -> (f32, f32) {
+    let radians = (self.current_font.escapement as f32 / 10.0).to_radians();
+    (radians.cos(), -radians.sin())
+  }
+
+  fn text_baseline(&self, reference: EmfPoint) -> EmfPoint {
     if self
       .text_alignment
       .contains(WmfTextAlignmentModeFlags::BASELINE)
@@ -6658,12 +8112,18 @@ impl WmfRenderState {
         .text_alignment
         .contains(WmfTextAlignmentModeFlags::BOTTOM)
     {
-      reference_y
+      reference
     } else {
       // [MS-WMF] 2.1.2.3 defines the all-zero vertical mode as TA_TOP.
-      // Our outline painter takes a baseline, so advance by the logical
-      // character-cell height before applying the device mapping.
-      reference_y.saturating_add(self.current_font.height.unsigned_abs() as i32)
+      // The top-to-baseline vector is normal to lfEscapement. Wine applies
+      // the same (sin(theta), cos(theta)) advance before handing the baseline
+      // to its output driver.
+      let radians = (self.current_font.escapement as f32 / 10.0).to_radians();
+      let height = self.current_font.height.unsigned_abs() as f32;
+      EmfPoint {
+        x: (reference.x as f32 + height * radians.sin()).round() as i32,
+        y: (reference.y as f32 + height * radians.cos()).round() as i32,
+      }
     }
   }
 
@@ -6677,8 +8137,9 @@ impl WmfRenderState {
       .contains(WmfTextAlignmentModeFlags::UPDATE_CP)
       && let Some(logical_width) = logical_width
     {
-      self.current_pos.x = text_origin.x.saturating_add(logical_width);
-      self.current_pos.y = text_origin.y;
+      let (axis_x, axis_y) = self.text_axis();
+      self.current_pos.x = (text_origin.x as f32 + logical_width as f32 * axis_x).round() as i32;
+      self.current_pos.y = (text_origin.y as f32 + logical_width as f32 * axis_y).round() as i32;
     }
   }
 
@@ -6710,23 +8171,7 @@ impl WmfRenderState {
       .min(self.canvas.height as f32) as i32;
     for y in top..bottom {
       for x in left..right {
-        let pattern_x = x.rem_euclid(pattern.image.width as i32) as usize;
-        let pattern_y = y.rem_euclid(pattern.image.height as i32) as usize;
-        let offset = (pattern_y * pattern.image.width + pattern_x) * RGB_BYTES_PER_PIXEL;
-        let stored = pattern.filtered_color.unwrap_or(EmfColor {
-          r: pattern.image.rgb[offset],
-          g: pattern.image.rgb[offset + 1],
-          b: pattern.image.rgb[offset + 2],
-        });
-        let brush = if pattern.use_dc_colors {
-          if u16::from(stored.r) + u16::from(stored.g) + u16::from(stored.b) < 3 * 128 {
-            self.text_color
-          } else {
-            self.background_color
-          }
-        } else {
-          stored
-        };
+        let brush = pattern.color_at(x, y, self.text_color, self.background_color);
         if let Some(color) = self
           .canvas
           .apply_raster_op_with_pattern(x, y, brush, brush, rop)
@@ -6737,19 +8182,82 @@ impl WmfRenderState {
     }
     true
   }
+
+  fn fill_polygon(&mut self, points: &[EmfPoint]) {
+    if let Some(pattern) = self.current_pattern_brush.as_ref() {
+      self.canvas.fill_polygon_with_wmf_pattern(
+        points,
+        pattern,
+        self.text_color,
+        self.background_color,
+      );
+    } else {
+      self.canvas.fill_polygon(points);
+    }
+  }
+
+  fn fill_rect(&mut self, left: i32, top: i32, right: i32, bottom: i32) {
+    let points = [
+      EmfPoint { x: left, y: top },
+      EmfPoint { x: right, y: top },
+      EmfPoint {
+        x: right,
+        y: bottom,
+      },
+      EmfPoint { x: left, y: bottom },
+    ];
+    self.fill_polygon(&points);
+    self.canvas.draw_polyline(&points, true);
+  }
+
+  fn fill_ellipse(&mut self, left: i32, top: i32, right: i32, bottom: i32) {
+    const STEPS: usize = 72;
+    let cx = (left + right) as f32 / 2.0;
+    let cy = (top + bottom) as f32 / 2.0;
+    let rx = (right - left).abs() as f32 / 2.0;
+    let ry = (bottom - top).abs() as f32 / 2.0;
+    let mut points = Vec::with_capacity(STEPS);
+    for index in 0..STEPS {
+      let theta = index as f32 * std::f32::consts::TAU / STEPS as f32;
+      points.push(EmfPoint {
+        x: (cx + theta.cos() * rx).round() as i32,
+        y: (cy + theta.sin() * ry).round() as i32,
+      });
+    }
+    self.fill_polygon(&points);
+    self.canvas.draw_polyline(&points, true);
+  }
+
+  fn fill_arc_segment(
+    &mut self,
+    rect: (i32, i32, i32, i32),
+    start_angle: f32,
+    sweep_angle: f32,
+    pie: bool,
+  ) {
+    let (left, top, right, bottom) = rect;
+    let points = arc_segment_points(left, top, right, bottom, start_angle, sweep_angle, pie);
+    if pie {
+      self.fill_polygon(&points);
+      self.canvas.draw_polyline(&points, true);
+    } else {
+      self.canvas.draw_polyline(&points, false);
+    }
+  }
 }
 
 fn decode_wmf_as_raster(
   data: &[u8],
   options: RenderOptions,
   text_surface: GdiTextSurface,
+  gdi_plus_dc_mode: GdiPlusDcMode,
 ) -> Result<Option<DecodedMetafile>, String> {
   if !crate::wmf::looks_like_wmf(data) {
     return Ok(None);
   }
 
   let metafile = WmfMetafileRef::from_bytes(data).map_err(|err| err.to_string())?;
-  let mut state = WmfRenderState::new(&metafile, options, text_surface)?;
+  let mut state = WmfRenderState::new(&metafile, options, text_surface, gdi_plus_dc_mode)?;
 
   let mut records = metafile.records().peekable();
   while let Some(record) = records.next() {
@@ -6943,7 +8451,7 @@ fn decode_wmf_as_raster(
             y: i32::from(point.y),
           })
           .collect::<Vec<_>>();
-        state.canvas.fill_polygon(&points);
+        state.fill_polygon(&points);
         state.canvas.draw_polyline(&points, true);
       }
       WmfRecordData::Polyline(value) => {
@@ -6970,30 +8478,30 @@ fn decode_wmf_as_raster(
               y: i32::from(point.y),
             })
             .collect::<Vec<_>>();
-          state.canvas.fill_polygon(&points);
+          state.fill_polygon(&points);
           state.canvas.draw_polyline(&points, true);
           cursor = end;
         }
       }
-      WmfRecordData::Rectangle(value) => state.canvas.fill_rect(
+      WmfRecordData::Rectangle(value) => state.fill_rect(
         i32::from(value.left),
         i32::from(value.top),
         i32::from(value.right),
         i32::from(value.bottom),
       ),
-      WmfRecordData::RoundRect(value) => state.canvas.fill_rect(
+      WmfRecordData::RoundRect(value) => state.fill_rect(
         i32::from(value.left),
         i32::from(value.top),
         i32::from(value.right),
         i32::from(value.bottom),
       ),
-      WmfRecordData::Ellipse(value) => state.canvas.fill_ellipse(
+      WmfRecordData::Ellipse(value) => state.fill_ellipse(
         i32::from(value.left),
         i32::from(value.top),
         i32::from(value.right),
         i32::from(value.bottom),
       ),
-      WmfRecordData::Arc(value) => state.canvas.fill_arc_segment(
+      WmfRecordData::Arc(value) => state.fill_arc_segment(
         (
           i32::from(value.left),
           i32::from(value.top),
@@ -7004,7 +8512,7 @@ fn decode_wmf_as_raster(
         sweep_from_arc_points(value),
         false,
       ),
-      WmfRecordData::Chord(value) | WmfRecordData::Pie(value) => state.canvas.fill_arc_segment(
+      WmfRecordData::Chord(value) | WmfRecordData::Pie(value) => state.fill_arc_segment(
         (
           i32::from(value.left),
           i32::from(value.top),
@@ -7018,10 +8526,10 @@ fn decode_wmf_as_raster(
       WmfRecordData::TextOut(value) => {
         let text = decode_wmf_text(&value.string, state.current_font.char_set);
         let origin = state.text_origin(value.x_start, value.y_start, None);
-        let baseline_y = state.text_baseline_y(origin.y);
+        let baseline = state.text_baseline(origin);
         state.canvas.draw_text_with_font(
-          origin.x,
-          baseline_y,
+          baseline.x,
+          baseline.y,
           &text,
           state.text_color,
           &state.current_font,
@@ -7050,7 +8558,7 @@ fn decode_wmf_as_raster(
           })
         });
         let origin = state.text_origin(value.x, value.y, logical_width);
-        let baseline_y = state.text_baseline_y(origin.y);
+        let baseline = state.text_baseline(origin);
         let saved_clip = value
           .rectangle
           .filter(|_| value.options.contains(WmfExtTextOutOptions::CLIPPED))
@@ -7078,8 +8586,8 @@ fn decode_wmf_as_raster(
             saved
           });
         state.canvas.draw_wmf_text(
-          origin.x,
-          baseline_y,
+          baseline.x,
+          baseline.y,
           &text,
           state.text_color,
           &state.current_font,
@@ -7218,6 +8726,7 @@ fn decode_wmf_as_raster(
             options,
             false,
             state.canvas.text_surface,
+            GdiPlusDcMode::Direct,
           )?
           && let Some(image) = decoded_raster_to_rgb(&raster)?
         {
@@ -7232,6 +8741,10 @@ fn decode_wmf_as_raster(
       }
       _ => {}
     }
+  }
+
+  if gdi_plus_dc_mode == GdiPlusDcMode::Scratch {
+    state.canvas.end_gdi_plus_dc();
   }
 
   Ok(Some(DecodedMetafile {
@@ -8643,6 +10156,7 @@ fn emf_current_font(state: &EmfVectorState) -> WmfTextFont {
     .and_then(|id| state.fonts.get(&id))
     .map(|font| WmfTextFont {
       height: font.height,
+      escapement: 0,
       family: font.family.clone(),
       char_set: font.char_set,
       weight: font.weight,
@@ -8651,6 +10165,7 @@ fn emf_current_font(state: &EmfVectorState) -> WmfTextFont {
     })
     .unwrap_or(WmfTextFont {
       height: 12,
+      escapement: 0,
       family: None,
       char_set: 0,
       weight: 400,
@@ -8799,12 +10314,14 @@ fn straight_rgba_from_black_white_with_mask(
 }
 
 fn straight_rgba_with_binary_coverage(
+  color_key: &[u8],
   color_black: &[u8],
   color_white: &[u8],
   mask_black: &[u8],
   mask_white: &[u8],
 ) -> Result<Vec<u8>, String> {
-  if color_black.len() != color_white.len()
+  if color_key.len() != color_black.len()
+    || color_black.len() != color_white.len()
     || color_black.len() != mask_black.len()
     || color_white.len() != mask_white.len()
     || !color_black.len().is_multiple_of(RGB_BYTES_PER_PIXEL)
@@ -8812,36 +10329,39 @@ fn straight_rgba_with_binary_coverage(
     return Err("metafile color and monochrome replay buffers have incompatible lengths".into());
   }
   let mut rgba = Vec::with_capacity(color_black.len() / RGB_BYTES_PER_PIXEL * BGRA_BYTES_PER_PIXEL);
-  for (((color_black, color_white), mask_black), mask_white) in color_black
+  for ((((_color_key, _color_black), _color_white), mask_black), mask_white) in color_key
     .chunks_exact(RGB_BYTES_PER_PIXEL)
+    .zip(color_black.chunks_exact(RGB_BYTES_PER_PIXEL))
     .zip(color_white.chunks_exact(RGB_BYTES_PER_PIXEL))
     .zip(mask_black.chunks_exact(RGB_BYTES_PER_PIXEL))
     .zip(mask_white.chunks_exact(RGB_BYTES_PER_PIXEL))
   {
-    // The paired OLE replacement bitmap owns a one-bit destination mask.
-    // ClearType coverage is independent per RGB stripe, so a pixel is
-    // covered when any black/white-matte channel differs from the untouched
-    // 0/255 background pair. Reducing the three stripes to the scalar alpha
-    // used by ordinary transparent images would discard edge pixels whenever
-    // one stripe remains untouched.
-    let color_covered = color_black
-      .iter()
-      .zip(color_white)
-      .any(|(black, white)| white.saturating_sub(*black) != u8::MAX);
+    // GdipReleaseDC marks a scratch pixel opaque only when the final 32-bit
+    // value differs from DC_BACKGROUND_KEY. A weak LCD stripe can affect the
+    // black/white diagnostic mattes yet round back to that exact key; treating
+    // the diagnostic pair as coverage grows a one-pixel fringe that native
+    // GDI+ deliberately leaves transparent.
+    let color_key = _color_key;
+    let color_covered = color_key
+      != [
+        GDI_PLUS_DC_BACKGROUND_KEY.r,
+        GDI_PLUS_DC_BACKGROUND_KEY.g,
+        GDI_PLUS_DC_BACKGROUND_KEY.b,
+      ];
     let mask_covered = mask_black
       .iter()
       .zip(mask_white)
       .any(|(black, white)| white.saturating_sub(*black) != u8::MAX);
     if !color_covered && !mask_covered {
       rgba.extend_from_slice(&[0, 0, 0, 0]);
-    } else if color_covered {
-      // Office stores the color replay over its black matte verbatim and
-      // attaches the binary replacement mask separately. This preserves the
-      // realized ClearType stripe values instead of unpremultiplying them as
-      // an ordinary soft-alpha image.
-      rgba.extend_from_slice(&[color_black[0], color_black[1], color_black[2], u8::MAX]);
     } else {
-      rgba.extend_from_slice(&[mask_black[0], mask_black[1], mask_black[2], u8::MAX]);
+      // GdipGetDC realizes classic GDI into a scratch DIB filled with
+      // DC_BACKGROUND_KEY (0x0d0b0c), then GdipReleaseDC copies each changed
+      // pixel verbatim. Office attaches its separate one-bit replacement mask
+      // to that realized color bitmap, so retain the key-background replay for
+      // both color- and monochrome-only coverage instead of substituting a
+      // black matte or unpremultiplying it.
+      rgba.extend_from_slice(&[color_key[0], color_key[1], color_key[2], u8::MAX]);
     }
   }
   Ok(rgba)
@@ -9329,6 +10849,41 @@ fn draw_glyph_5x7(
           state.set_vector_pixel(
             x + (col * scale + xx) as i32,
             y + (row * scale + yy) as i32,
+            color,
+          );
+        }
+      }
+    }
+  }
+}
+
+fn draw_glyph_5x7_rotated(
+  state: &mut EmfVectorState,
+  baseline_x: f32,
+  baseline_y: f32,
+  cursor_advance: f32,
+  rotation_degrees: f32,
+  ch: char,
+  color: EmfColor,
+  scale: usize,
+) {
+  let radians = rotation_degrees.to_radians();
+  let cos = radians.cos();
+  let sin = radians.sin();
+  let glyph = glyph_5x7(ch);
+  let top = -((7 * scale) as f32);
+  for (row, bits) in glyph.iter().copied().enumerate() {
+    for col in 0..5 {
+      if bits & (1 << (4 - col)) == 0 {
+        continue;
+      }
+      for yy in 0..scale {
+        for xx in 0..scale {
+          let local_x = cursor_advance + (col * scale + xx) as f32;
+          let local_y = top + (row * scale + yy) as f32;
+          state.set_vector_pixel(
+            (baseline_x + local_x * cos - local_y * sin).round() as i32,
+            (baseline_y + local_x * sin + local_y * cos).round() as i32,
             color,
           );
         }
@@ -10003,9 +11558,9 @@ fn extract_emr_ext_text_out_a(
 
 #[derive(Clone, Copy, Debug)]
 struct ExtTextRecord {
-  graphics_mode: u32,
-  x_scale: f32,
-  y_scale: f32,
+  _graphics_mode: u32,
+  _x_scale: f32,
+  _y_scale: f32,
   x: i32,
   y: i32,
   characters: usize,
@@ -10037,9 +11592,9 @@ fn ext_text_record(data: &[u8], record_offset: usize, record_size: usize) -> Opt
     return None;
   }
   Some(ExtTextRecord {
-    graphics_mode: read_u32(data, record_offset + GRAPHICS_MODE_OFFSET).ok()?,
-    x_scale: read_f32(data, record_offset + X_SCALE_OFFSET).ok()?,
-    y_scale: read_f32(data, record_offset + Y_SCALE_OFFSET).ok()?,
+    _graphics_mode: read_u32(data, record_offset + GRAPHICS_MODE_OFFSET).ok()?,
+    _x_scale: read_f32(data, record_offset + X_SCALE_OFFSET).ok()?,
+    _y_scale: read_f32(data, record_offset + Y_SCALE_OFFSET).ok()?,
     x: read_i32(data, record_offset + EMRTEXT_REFERENCE_X_OFFSET).ok()?,
     y: read_i32(data, record_offset + EMRTEXT_REFERENCE_Y_OFFSET).ok()?,
     characters,
@@ -10244,8 +11799,8 @@ mod tests {
   use crate::wmf::{
     WmfColorRecord, WmfDibCreatePatternBrushRecord, WmfDibStretchBltRecord, WmfDibTarget,
     WmfExtTextOutRecord, WmfLogBrushObject, WmfMetafileType, WmfMetafileVersion,
-    WmfObjectIndexRecord, WmfPatBltRecord, WmfPointRecord, WmfRectObject, WmfSetPixelRecord,
-    WmfU16Record,
+    WmfObjectIndexRecord, WmfPatBltRecord, WmfPointRecord, WmfRectObject, WmfRectRecord,
+    WmfSetPixelRecord, WmfU16Record,
   };
   use crate::{
     BitmapSourceBounds, ColorRef, DibColorUsage, EMR_EOF, EMR_HEADER, EmfMetafile, EmfRecord,
@@ -10254,11 +11809,108 @@ mod tests {
   };
 
   #[test]
+  #[ignore]
+  fn dump_external_emf_records() {
+    let path = std::env::var("EMFSDK_DUMP_PATH").expect("EMFSDK_DUMP_PATH");
+    let bytes = std::fs::read(path).unwrap();
+    let metafile = crate::emf::EmfMetafileRef::from_bytes(&bytes).unwrap();
+    for (index, record) in metafile.records().enumerate() {
+      let data = crate::emf::EmfRecordData::from_record_ref(record).unwrap();
+      println!("emf[{index}] kind={:?}", record.record_kind());
+      match &data {
+        crate::emf::EmfRecordData::Comment(crate::emf::EmrComment::Public {
+          comment: crate::emf::EmrPublicComment::WindowsMetafile(value),
+          ..
+        }) => {
+          let wmf = value.windows_metafile().unwrap();
+          for (nested_index, nested_record) in wmf.records.iter().enumerate() {
+            println!(
+              "  wmf[{nested_index}] kind={:?} data={:#?}",
+              nested_record.function_kind(),
+              crate::wmf::WmfRecordData::from_record(nested_record)
+            );
+          }
+        }
+        crate::emf::EmfRecordData::Comment(_)
+        | crate::emf::EmfRecordData::StretchDiBits(_)
+        | crate::emf::EmfRecordData::SetDiBitsToDevice(_) => {}
+        _ => println!("  data={data:#?}"),
+      }
+    }
+  }
+
+  #[test]
   fn gdi_font_metrics_are_realized_on_the_integer_device_grid() {
     assert_eq!(gdi_realized_font_metric(23.740_234), 24.0);
     assert_eq!(gdi_realized_font_metric(19.009_277), 19.0);
     assert_eq!(gdi_realized_font_metric(-5.6), -6.0);
     assert_eq!(gdi_realized_font_metric(-5.4), -5.0);
+  }
+
+  #[test]
+  fn gdi_nonuniform_hinting_combines_independent_axis_grid_fits() {
+    let horizontal = rectangular_dropout_test_path(1.0, 100.0, 3.0, 200.0);
+    let vertical = rectangular_dropout_test_path(10.0, 2.0, 20.0, 6.0);
+    let combined = combine_gdi_hinted_axes(&horizontal, &vertical, 0.5).unwrap();
+    let bounds = combined.compute_tight_bounds().unwrap();
+
+    assert_eq!(bounds.left(), 0.5);
+    assert_eq!(bounds.right(), 1.5);
+    assert_eq!(bounds.top(), 2.0);
+    assert_eq!(bounds.bottom(), 6.0);
+  }
+
+  #[test]
+  fn gdi_cleartype_realizes_x_on_the_six_sample_grid_before_rounding() {
+    let vertical_ppem = 8.0;
+    let horizontal_scale = 0.577_698_2;
+    let horizontal_device_ppem =
+      gdi_realized_font_metric(vertical_ppem * horizontal_scale).max(1.0);
+    let horizontal_outline_ppem =
+      gdi_realized_font_metric(vertical_ppem * horizontal_scale * GDI_CLEARTYPE_X_SAMPLES as f32)
+        .max(1.0);
+
+    assert_eq!(
+      horizontal_device_ppem, 5.0,
+      "GDI realizes its mapped X device grid independently"
+    );
+    assert_eq!(
+      horizontal_outline_ppem, 28.0,
+      "ClearType rounds after entering the six-sample X grid"
+    );
+  }
+
+  #[test]
+  fn gdi_mono_control_box_uses_asymmetric_pixel_center_rounding() {
+    assert_eq!(gdi_monochrome_axis_box(0.53125, 5.09375), Some((1, 5)));
+    assert_eq!(gdi_monochrome_axis_box(0.140625, 2.21875), Some((0, 2)));
+    assert_eq!(gdi_monochrome_axis_box(0.328125, 2.625), Some((0, 3)));
+  }
+
+  #[test]
+  fn gdi_synthetic_font_styles_preserve_the_baseline_bearings() {
+    let mut builder = TinySkiaPathBuilder::new();
+    builder.move_to(1.0, 2.0);
+    builder.line_to(5.0, 2.0);
+    builder.line_to(5.0, 7.0);
+    builder.line_to(1.0, 7.0);
+    builder.close();
+    let path = builder.finish().unwrap();
+
+    let unchanged = synthesize_gdi_font_path(path.clone(), None, None).unwrap();
+    assert_eq!(unchanged.bounds(), path.bounds());
+
+    let bold = synthesize_gdi_font_path(path.clone(), None, Some(2.0)).unwrap();
+    let bold_bounds = bold.compute_tight_bounds().unwrap();
+    assert!((bold_bounds.left() - 1.0).abs() < 0.001);
+    assert!((bold_bounds.top() - 2.0).abs() < 0.001);
+    assert!((bold_bounds.right() - 7.0).abs() < 0.001);
+    assert!((bold_bounds.bottom() - 9.0).abs() < 0.001);
+
+    let skewed = synthesize_gdi_font_path(path, Some(14.0), None).unwrap();
+    let skewed_bounds = skewed.compute_tight_bounds().unwrap();
+    assert!((skewed_bounds.left() - (1.0 + 2.0 * 14.0_f32.to_radians().tan())).abs() < 0.001);
+    assert!((skewed_bounds.right() - (5.0 + 7.0 * 14.0_f32.to_radians().tan())).abs() < 0.001);
   }
 
   fn header_record(right: i32, bottom: i32) -> EmfRecord {
@@ -10658,7 +12310,7 @@ mod tests {
   }
 
   #[test]
-  fn emf_ext_text_out_preserves_graphics_scales_and_cumulative_dx_mapping() {
+  fn emf_ext_text_out_parses_graphics_metadata_and_cumulative_dx_mapping() {
     let mut record = vec![0; 96];
     record[24..28].copy_from_slice(&1u32.to_le_bytes());
     record[28..32].copy_from_slice(&25.0f32.to_le_bytes());
@@ -10672,9 +12324,9 @@ mod tests {
     record[88..92].copy_from_slice(&3i32.to_le_bytes());
 
     let text = ext_text_record(&record, 0, record.len()).unwrap();
-    assert_eq!(text.graphics_mode, 1);
-    assert_eq!(text.x_scale, 25.0);
-    assert_eq!(text.y_scale, 24.074_074);
+    assert_eq!(text._graphics_mode, 1);
+    assert_eq!(text._x_scale, 25.0);
+    assert_eq!(text._y_scale, 24.074_074);
     assert_eq!((text.x, text.y), (16, 34));
     assert_eq!(
       ext_text_advances(&record, 0, record.len(), text).unwrap(),
@@ -10685,6 +12337,18 @@ mod tests {
       (logical as f32 * 214.0 / 103.0).round()
     });
     assert_eq!(mapped, [12.0, 7.0, 8.0]);
+  }
+
+  #[test]
+  fn emf_character_cell_advances_preserve_the_aligned_reference_phase() {
+    let scale = 0.384_677_7f32;
+    let aligned_reference = 7.0f32;
+    let mapped_reference = (aligned_reference * scale).round();
+    let mapped = cumulative_mapped_advances(&[5, 3, 5, 2, 5, 3, 5, 2, 6], |logical| {
+      ((aligned_reference + logical as f32) * scale).round() - mapped_reference
+    });
+
+    assert_eq!(mapped, [2.0, 1.0, 2.0, 0.0, 2.0, 2.0, 1.0, 1.0, 3.0]);
   }
 
   #[test]
@@ -10840,12 +12504,19 @@ mod tests {
   }
 
   #[test]
-  fn render_target_defines_the_playback_viewport_in_both_directions() {
+  fn render_target_and_playback_rectangle_are_independent_device_extents() {
     assert_eq!(
       RenderOptions {
         target_width_px: Some(200),
         target_height_px: Some(100),
         max_pixels: None,
+        font_smoothing_contrast: None,
+        playback_width_px: None,
+        playback_height_px: None,
+        text_playback_width_px: None,
+        text_playback_height_px: None,
+        monochrome_text_playback_width_px: None,
+        monochrome_text_playback_height_px: None,
         transparent_background: false,
         background_color: None,
         monochrome_dib_palette_override: None,
@@ -10863,6 +12534,13 @@ mod tests {
         target_width_px: Some(400),
         target_height_px: Some(300),
         max_pixels: None,
+        font_smoothing_contrast: None,
+        playback_width_px: None,
+        playback_height_px: None,
+        text_playback_width_px: None,
+        text_playback_height_px: None,
+        monochrome_text_playback_width_px: None,
+        monochrome_text_playback_height_px: None,
         transparent_background: false,
         background_color: None,
         monochrome_dib_palette_override: None,
@@ -10900,6 +12578,29 @@ mod tests {
         y: natural_height as i32,
       }),
       (4.0, 3.0)
+    );
+
+    let mut clipped_playback_state = EmfVectorState::new_with_options(
+      &metafile_with_records(Vec::new()),
+      RenderOptions {
+        target_width_px: Some(4),
+        target_height_px: Some(3),
+        playback_width_px: Some(5),
+        playback_height_px: Some(3),
+        ..RenderOptions::default()
+      },
+    )
+    .expect("fixed-output playback state with a clipped right endpoint");
+    clipped_playback_state.window_ext_x = natural_width as i32;
+    clipped_playback_state.window_ext_y = natural_height as i32;
+    clipped_playback_state.viewport_ext_x = natural_width as i32;
+    clipped_playback_state.viewport_ext_y = natural_height as i32;
+    assert_eq!(
+      clipped_playback_state.map_point(EmfPoint {
+        x: natural_width as i32,
+        y: natural_height as i32,
+      }),
+      (5.0, 3.0)
     );
   }
 
@@ -11569,6 +13270,95 @@ mod tests {
   }
 
   #[test]
+  fn wmf_dib_pattern_brush_fills_closed_shapes() {
+    let mut pattern = bitmap_info(8, 8, 1, 0);
+    pattern.extend_from_slice(&[128, 128, 128, 0, 255, 255, 255, 0]);
+    for row in 0..8 {
+      pattern.extend_from_slice(&[if row % 2 == 0 { 0xAA } else { 0x55 }, 0, 0, 0]);
+    }
+    let records = vec![
+      WmfRecordData::SetWindowExt(WmfPointRecord { x: 8, y: 8 })
+        .to_record()
+        .unwrap(),
+      WmfRecordData::CreateBrushIndirect(WmfLogBrushObject {
+        brush_style: WmfBrushStyle::Solid.raw(),
+        color_ref: ColorRef {
+          red: 255,
+          green: 0,
+          blue: 0,
+          reserved: 0,
+        },
+        brush_hatch: 0,
+      })
+      .to_record()
+      .unwrap(),
+      WmfRecordData::SelectObject(WmfObjectIndexRecord { index: 0 })
+        .to_record()
+        .unwrap(),
+      WmfRecordData::DibCreatePatternBrush(WmfDibCreatePatternBrushRecord {
+        style: WmfBrushStyle::Pattern.raw(),
+        color_usage: DibColorUsage::RgbColors.wmf_raw(),
+        target: pattern,
+      })
+      .to_record()
+      .unwrap(),
+      WmfRecordData::SelectObject(WmfObjectIndexRecord { index: 1 })
+        .to_record()
+        .unwrap(),
+      WmfRecordData::Rectangle(WmfRectRecord {
+        bottom: 7,
+        right: 7,
+        top: 1,
+        left: 1,
+      })
+      .to_record()
+      .unwrap(),
+      WmfRecordData::Eof(crate::wmf::WmfEofRecord::default())
+        .to_record()
+        .unwrap(),
+    ];
+    let bytes = WmfMetafile {
+      placeable_header: None,
+      header: WmfHeader {
+        metafile_type: WmfMetafileType::Memory.raw(),
+        header_size_words: 9,
+        version: WmfMetafileVersion::Version300.raw(),
+        file_size_words: 0,
+        number_of_objects: 2,
+        max_record_words: 0,
+        number_of_parameters: 0,
+      },
+      records,
+      trailing_data: Vec::new(),
+    }
+    .to_bytes()
+    .unwrap();
+
+    let decoded = decode_metafile_as_raster(&bytes, Some("image/x-wmf"))
+      .unwrap()
+      .unwrap();
+    let image = image::load_from_memory_with_format(&decoded.data, image::ImageFormat::Png)
+      .unwrap()
+      .to_rgb8();
+    let first = image.get_pixel(3, 3).0;
+    let second = image.get_pixel(4, 3).0;
+
+    assert_ne!(
+      first, second,
+      "the selected checkerboard brush remains spatial"
+    );
+    assert!([first, second].contains(&[128, 128, 128]));
+    assert!([first, second].contains(&[255, 255, 255]));
+    assert!(
+      image
+        .enumerate_pixels()
+        .filter(|(x, y, _)| (2..6).contains(x) && (2..6).contains(y))
+        .all(|(_, _, pixel)| pixel.0 != [255, 0, 0]),
+      "closed-shape fill must not fall back to the previously selected solid brush"
+    );
+  }
+
+  #[test]
   fn world_unit_pen_width_uses_the_active_device_transform() {
     let mut data = vec![0; EMF_HEADER_SIZE];
     data[16..20].copy_from_slice(&999i32.to_le_bytes());
@@ -11579,6 +13369,13 @@ mod tests {
         target_width_px: Some(100),
         target_height_px: Some(100),
         max_pixels: None,
+        font_smoothing_contrast: None,
+        playback_width_px: None,
+        playback_height_px: None,
+        text_playback_width_px: None,
+        text_playback_height_px: None,
+        monochrome_text_playback_width_px: None,
+        monochrome_text_playback_height_px: None,
         transparent_background: false,
         background_color: None,
         monochrome_dib_palette_override: None,
@@ -11615,6 +13412,13 @@ mod tests {
         target_width_px: Some(227),
         target_height_px: Some(225),
         max_pixels: None,
+        font_smoothing_contrast: None,
+        playback_width_px: None,
+        playback_height_px: None,
+        text_playback_width_px: None,
+        text_playback_height_px: None,
+        monochrome_text_playback_width_px: None,
+        monochrome_text_playback_height_px: None,
         transparent_background: false,
         background_color: None,
         monochrome_dib_palette_override: None,
@@ -12132,6 +13936,51 @@ mod tests {
     EmfRecord::new(super::EMR_SET_PIXEL_V, data)
   }
 
+  #[test]
+  fn gdi_plus_dc_scratch_restores_untouched_destination_pixels() {
+    let emf = metafile_with_records(vec![set_pixel_record(0, 0, 0x0000_00ff)]);
+
+    for background in [[0, 0, 0], [255, 255, 255]] {
+      let decoded = decode_vector_emf_as_png_with_dc_mode(
+        &emf,
+        RenderOptions {
+          background_color: Some(background),
+          ..RenderOptions::default()
+        },
+        GdiTextSurface::Color,
+        GdiPlusDcMode::Scratch,
+      )
+      .unwrap();
+      let image = image::load_from_memory(&decoded.data).unwrap().to_rgb8();
+
+      assert_eq!(image.get_pixel(0, 0).0, [255, 0, 0]);
+      assert_eq!(image.get_pixel(1, 1).0, background);
+    }
+  }
+
+  #[test]
+  fn gdi_plus_dc_scratch_treats_the_background_key_as_unchanged() {
+    // COLORREF is 0x00bbggrr, so this record writes RGB (0x0d, 0x0b, 0x0c).
+    let emf = metafile_with_records(vec![set_pixel_record(0, 0, 0x000c_0b0d)]);
+
+    for background in [[0, 0, 0], [255, 255, 255]] {
+      let decoded = decode_vector_emf_as_png_with_dc_mode(
+        &emf,
+        RenderOptions {
+          background_color: Some(background),
+          ..RenderOptions::default()
+        },
+        GdiTextSurface::Color,
+        GdiPlusDcMode::Scratch,
+      )
+      .unwrap();
+      let image = image::load_from_memory(&decoded.data).unwrap().to_rgb8();
+
+      assert_eq!(image.get_pixel(0, 0).0, background);
+      assert_eq!(image.get_pixel(1, 1).0, background);
+    }
+  }
+
   fn emf_plus_comment_record(records: Vec<EmfPlusRecord>) -> EmfRecord {
     let stream = EmfPlusStream {
       records,
@@ -12645,8 +14494,8 @@ mod tests {
 
     assert_eq!(image.get_pixel(0, 0).0, [0, 0, 255, 255]);
     assert_eq!(image.get_pixel(1, 0).0, [0, 0, 191, 255]);
-    assert_eq!(image.get_pixel(2, 0).0, [0, 0, 128, 255]);
-    assert_eq!(image.get_pixel(3, 0).0, [0, 0, 64, 255]);
+    assert_eq!(image.get_pixel(2, 0).0, [13, 11, 140, 255]);
+    assert_eq!(image.get_pixel(3, 0).0, [13, 11, 76, 255]);
   }
 
   #[test]
@@ -12740,7 +14589,7 @@ mod tests {
   }
 
   #[test]
-  fn resized_masked_blt_keeps_filtered_source_color_fringe() {
+  fn resized_masked_blt_applies_both_rops_to_the_filtered_source_fringe() {
     let mut mask_info = bitmap_info(2, 2, 1, BI_RGB);
     mask_info.extend_from_slice(&[
       0, 0, 0, 0, // black
@@ -12775,8 +14624,66 @@ mod tests {
 
     assert_eq!(image.get_pixel(0, 0).0, [0, 0, 255, 255]);
     assert_eq!(image.get_pixel(1, 0).0, [0, 0, 191, 255]);
-    assert_eq!(image.get_pixel(2, 0).0, [0, 0, 128, 255]);
-    assert_eq!(image.get_pixel(3, 0).0, [0, 0, 64, 255]);
+    assert_eq!(image.get_pixel(2, 0).0, [13, 11, 140, 255]);
+    assert_eq!(image.get_pixel(3, 0).0, [13, 11, 76, 255]);
+  }
+
+  #[test]
+  fn masked_blt_rounds_both_mapped_destination_endpoints_on_the_device_grid() {
+    let mut state = EmfVectorState::new_with_options(
+      &metafile_with_header_bounds(20, 20, Vec::new()),
+      RenderOptions {
+        target_width_px: Some(20),
+        target_height_px: Some(20),
+        ..RenderOptions::default()
+      },
+    )
+    .expect("minimal EMF playback state");
+    state.playback_origin_x = 0.0;
+    state.playback_origin_y = 0.0;
+    state.playback_scale_x = 1.0;
+    state.playback_scale_y = 1.0;
+    state.output_scale_x = 0.387;
+    state.output_scale_y = 0.387;
+    state.window_ext_x = 1;
+    state.window_ext_y = 1;
+    state.viewport_ext_x = 1;
+    state.viewport_ext_y = 1;
+
+    let red = RasterPixels {
+      width: 1,
+      height: 1,
+      rgb: vec![255, 0, 0],
+    };
+    let covered = RasterPixels {
+      width: 1,
+      height: 1,
+      rgb: vec![0, 0, 0],
+    };
+    // The mapped rectangle is approximately [3.483, 15.867) on each axis.
+    // LPtoDP realizes those endpoints as [3, 16), so device sample 15 is part
+    // of the blit while sample 16 remains outside it.
+    assert_eq!(state.map_point(EmfPoint { x: 9, y: 9 }), (3.483, 3.483));
+    assert_eq!(state.map_point(EmfPoint { x: 41, y: 41 }), (15.867, 15.867));
+    state.draw_masked_rgb_image(9, 9, 32, 32, &red, &covered);
+
+    assert_eq!(state.pixel(15, 15), Some(EmfColor { r: 255, g: 0, b: 0 }));
+    assert_eq!(
+      state.pixel(16, 15),
+      Some(EmfColor {
+        r: 255,
+        g: 255,
+        b: 255
+      })
+    );
+    assert_eq!(
+      state.pixel(15, 16),
+      Some(EmfColor {
+        r: 255,
+        g: 255,
+        b: 255
+      })
+    );
   }
 
   #[test]
@@ -12788,7 +14695,142 @@ mod tests {
     assert_eq!(
       coverage,
       [[0, 0, 85], [170, 255, 170], [85, 0, 0]],
-      "the one-pixel box is centered independently on the R, G, and B stripes"
+      "the displaced boxes retain both one-pixel filter-support stripes"
+    );
+  }
+
+  #[test]
+  fn cleartype_box_decimation_truncates_fractional_binary_sample_counts() {
+    let (left, width, coverage) = cleartype_box_decimate(&[255, 255, 255, 0, 0, 0], 6, 1, 0);
+
+    assert_eq!(left, -1);
+    assert_eq!(width, 3);
+    assert_eq!(coverage, [[0, 0, 85], [127, 127, 42], [0, 0, 0]]);
+  }
+
+  #[test]
+  fn gdi_cleartype_scanline_uses_bilevel_six_sample_source() {
+    let mut builder = TinySkiaPathBuilder::new();
+    builder.move_to(0.25, 0.25);
+    builder.line_to(1.75, 0.25);
+    builder.line_to(1.75, 1.75);
+    builder.line_to(0.25, 1.75);
+    builder.close();
+    let path = builder.finish().unwrap();
+
+    assert_eq!(
+      rasterize_gdi_cleartype_scanlines(&path, 3, 3).unwrap(),
+      [0, 255, 0, 0, 255, 0, 0, 0, 0],
+      "device-row and high-resolution X centres produce the bi-level ClearType source"
+    );
+  }
+
+  #[test]
+  fn gdi_cleartype_path_preserves_the_bilevel_source() {
+    let mut builder = TinySkiaPathBuilder::new();
+    builder.move_to(0.25, 0.25);
+    builder.line_to(1.75, 0.25);
+    builder.line_to(1.75, 1.75);
+    builder.line_to(0.25, 1.75);
+    builder.close();
+    let path = builder.finish().unwrap();
+
+    assert_eq!(
+      rasterize_gdi_cleartype_path(&path, 3, 3).unwrap(),
+      [0, 255, 0, 0, 255, 0, 0, 0, 0],
+      "the path wrapper must not introduce analytical or vertical area coverage"
+    );
+  }
+
+  #[test]
+  fn gdi_grayscale_cell_sweep_matches_freetype_for_the_office_tahoma_z() {
+    // `GetGlyphOutlineW(GGO_NATIVE)` from the Office color DIB, with the
+    // MAT2 horizontal axis set to 6, produces this one-contour outline. The
+    // expected bytes are an independent FT_Outline_Get_Bitmap gray render of
+    // those F26Dot6 points. This pins the portable GGO_GRAY* scan-conversion
+    // backend independently from the bilevel source used by classic LCD text.
+    let points = [
+      (11.890625, 0.0),
+      (0.671875, 0.0),
+      (0.671875, 0.546875),
+      (8.65625, 3.765625),
+      (1.0, 3.765625),
+      (1.0, 4.359375),
+      (11.75, 4.359375),
+      (11.75, 3.84375),
+      (3.71875, 0.609375),
+      (11.890625, 0.609375),
+    ];
+    let mut builder = TinySkiaPathBuilder::new();
+    builder.move_to(points[0].0, points[0].1);
+    for &(x, y) in &points[1..] {
+      builder.line_to(x, y);
+    }
+    builder.close();
+    let path = builder.finish().unwrap();
+
+    assert_eq!(
+      rasterize_gdi_grayscale_path(&path, 12, 5).unwrap(),
+      [
+        0x33, 0xdf, 0xff, 0xfc, 0xb4, 0x9c, 0x9c, 0x9c, 0x9c, 0x9c, 0x9c, 0x8a, //
+        0x00, 0x02, 0x48, 0xaf, 0xf7, 0xac, 0x45, 0x01, 0x00, 0x00, 0x00, 0x00, //
+        0x00, 0x00, 0x00, 0x00, 0x1a, 0x7d, 0xe2, 0xdc, 0x77, 0x16, 0x00, 0x00, //
+        0x00, 0x3c, 0x3c, 0x3c, 0x3c, 0x3c, 0x3f, 0x88, 0xe9, 0xf9, 0xa9, 0x3b, //
+        0x00, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x45,
+      ]
+    );
+  }
+
+  #[test]
+  fn gdi_monochrome_scan_matches_office_six_sample_tahoma_z() {
+    // The same Office color-DIB DC returns this outline from GGO_NATIVE and
+    // the expected 11x4 payload from GGO_BITMAP. Keep the control-box and
+    // scan-conversion boundary covered separately from RGB decimation.
+    let points = [
+      (11.890625, 0.0),
+      (0.671875, 0.0),
+      (0.671875, 0.546875),
+      (8.65625, 3.765625),
+      (1.0, 3.765625),
+      (1.0, 4.359375),
+      (11.75, 4.359375),
+      (11.75, 3.84375),
+      (3.71875, 0.609375),
+      (11.890625, 0.609375),
+    ];
+    let mut builder = TinySkiaPathBuilder::new();
+    builder.move_to(points[0].0, -points[0].1);
+    for &(x, y) in &points[1..] {
+      builder.line_to(x, -y);
+    }
+    builder.close();
+    let path = builder.finish().unwrap();
+    let bounds = path.compute_tight_bounds().unwrap();
+    let (left, right) = gdi_monochrome_axis_box(bounds.left(), bounds.right()).unwrap();
+    let (top, bottom) = gdi_monochrome_axis_box(bounds.top(), bounds.bottom()).unwrap();
+    let path = path
+      .transform(TinySkiaTransform::from_translate(
+        -(left as f32),
+        -(top as f32),
+      ))
+      .unwrap();
+    let raster = rasterize_gdi_monochrome_path(
+      &path,
+      usize::try_from(right - left).unwrap(),
+      usize::try_from(bottom - top).unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!((left, top, right, bottom), (1, -4, 12, 0));
+    assert_eq!((raster.width, raster.height), (11, 4));
+    assert_eq!(
+      raster.coverage,
+      [
+        0, 255, 255, 255, 255, 255, 255, 255, 255, 255, 0, // 0x7fc0
+        0, 0, 0, 0, 0, 255, 255, 0, 0, 0, 0, // 0x0600
+        0, 0, 255, 255, 255, 0, 0, 0, 0, 0, 0, // 0x3800
+        255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, // 0xffe0
+      ]
     );
   }
 
@@ -12824,21 +14866,22 @@ mod tests {
   }
 
   fn rasterize_dropout_test_path(path: &TinySkiaPath, width: usize, height: usize) -> Vec<u8> {
-    let mut mask = TinySkiaMask::new(width as u32, height as u32).unwrap();
-    mask.fill_path(
-      path,
-      TinySkiaFillRule::Winding,
-      false,
-      TinySkiaTransform::identity(),
-    );
-    let mut coverage = mask.take();
-    apply_gdi_smart_dropout_control(path, &mut coverage, width, height);
+    let Some(raster) = rasterize_gdi_monochrome_path(path, width, height) else {
+      return vec![0; width.saturating_mul(height)];
+    };
+    let mut coverage = vec![0; width.saturating_mul(height)];
+    for row in 0..raster.height {
+      let source_start = row * raster.width;
+      let destination_start = (raster.offset_y + row) * width + raster.offset_x;
+      coverage[destination_start..destination_start + raster.width]
+        .copy_from_slice(&raster.coverage[source_start..source_start + raster.width]);
+    }
     coverage
   }
 
   #[test]
   fn smart_dropout_recovers_a_vertical_stem_in_both_directions() {
-    let path = rectangular_dropout_test_path(0.75, 0.0, 1.25, 4.0);
+    let path = rectangular_dropout_test_path(0.8, 0.0, 1.2, 4.0);
 
     assert_eq!(
       rasterize_dropout_test_path(&path, 2, 4),
@@ -12849,7 +14892,7 @@ mod tests {
 
   #[test]
   fn smart_dropout_second_pass_recovers_a_horizontal_stem() {
-    let path = rectangular_dropout_test_path(0.0, 0.75, 4.0, 1.25);
+    let path = rectangular_dropout_test_path(0.0, 0.8, 4.0, 1.2);
 
     assert_eq!(
       rasterize_dropout_test_path(&path, 4, 2),
@@ -12860,19 +14903,30 @@ mod tests {
 
   #[test]
   fn smart_dropout_excludes_an_isolated_stub() {
-    let path = rectangular_dropout_test_path(0.75, 1.0, 1.25, 2.0);
+    let path = rectangular_dropout_test_path(0.8, 1.0, 1.2, 2.0);
 
     assert_eq!(rasterize_dropout_test_path(&path, 2, 3), [0; 6]);
   }
 
   #[test]
+  fn half_pixel_span_with_a_center_on_its_boundary_is_regular() {
+    let path = rectangular_dropout_test_path(0.5, 0.0, 1.0, 4.0);
+
+    assert_eq!(
+      rasterize_dropout_test_path(&path, 2, 4),
+      [u8::MAX, 0, u8::MAX, 0, u8::MAX, 0, u8::MAX, 0],
+      "a contour on a pixel center is ordinary Rule 1/2 coverage on every row"
+    );
+  }
+
+  #[test]
   fn smart_dropout_does_not_duplicate_an_already_set_neighbor() {
-    let path = rectangular_dropout_test_path(0.75, 0.0, 1.25, 4.0);
+    let path = rectangular_dropout_test_path(0.8, 0.0, 1.2, 4.0);
     let mut coverage = vec![0; 8];
     coverage[3] = u8::MAX;
     coverage[5] = u8::MAX;
 
-    apply_gdi_smart_dropout_control(&path, &mut coverage, 2, 4);
+    apply_gdi_smart_dropout_control(&path, &mut coverage, 2, 4, false, false);
 
     assert_eq!(coverage, [0, 0, 0, u8::MAX, 0, u8::MAX, 0, 0]);
   }
@@ -12907,31 +14961,83 @@ mod tests {
   }
 
   #[test]
-  fn binary_coverage_surface_keeps_black_matte_rgb_and_any_stripe() {
+  fn binary_coverage_surface_keeps_scratch_key_rgb_and_any_stripe() {
     let rgba = straight_rgba_with_binary_coverage(
-      &[0, 0, 0, 0, 0, 0, 255, 255, 255, 32, 0, 0],
-      &[13, 8, 4, 255, 255, 255, 255, 255, 255, 255, 127, 255],
-      &[0, 0, 0, 0, 0, 0, 255, 255, 255, 0, 0, 0],
-      &[255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+      &[13, 8, 4, 13, 11, 12, 255, 255, 255, 13, 10, 11, 13, 11, 12],
+      &[0, 0, 0, 0, 0, 0, 255, 255, 255, 32, 0, 0, 0, 0, 0],
+      &[
+        13, 8, 4, 255, 255, 255, 255, 255, 255, 255, 127, 255, 254, 255, 255,
+      ],
+      &[0, 0, 0, 0, 0, 0, 255, 255, 255, 0, 0, 0, 0, 0, 0],
+      &[
+        255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+      ],
     )
     .unwrap();
 
     assert_eq!(
       rgba,
       [
-        0, 0, 0, 255, // ClearType edge: black-matte RGB with binary coverage
+        13, 8, 4, 255, // ClearType edge: scratch-key RGB with binary coverage
         0, 0, 0, 0, // untouched background
         255, 255, 255, 255, // an opaque white source pixel
-        32, 0, 0, 255, // one covered stripe keeps the black-matte RGB sample
+        13, 10, 11, 255, // one covered stripe keeps the scratch-key RGB sample
+        0, 0, 0, 0, // matte drift alone cannot override an unchanged scratch key
       ]
     );
   }
 
   #[test]
   fn gdi_subpixel_blend_matches_the_dib_driver_integer_formula() {
-    assert_eq!(gdi_subpixel_blend(255, 0, 128), 127);
-    assert_eq!(gdi_subpixel_blend(17, 201, 0), 17);
-    assert_eq!(gdi_subpixel_blend(17, 201, 255), 201);
+    assert_eq!(gdi_subpixel_blend_with_gamma(255, 0, 128, None), 127);
+    assert_eq!(gdi_subpixel_blend_with_gamma(17, 201, 0, None), 17);
+    assert_eq!(gdi_subpixel_blend_with_gamma(17, 201, 255, None), 201);
+  }
+
+  #[test]
+  fn gdi_font_smoothing_contrast_matches_the_native_cleartype_power_ramp() {
+    let gamma_ramp = GdiFontGammaRamp::new(1200);
+
+    // SPI_SETFONTSMOOTHINGCONTRAST interpolation on a 32-bpp DIB maps the
+    // six GDI coverage levels below exactly from contrast 1000 to 1200.
+    assert_eq!(
+      [43, 85, 128, 170, 212, 255].map(|value| gamma_ramp.encode[value]),
+      [58, 102, 144, 182, 219, 255]
+    );
+    assert_eq!(
+      [58, 102, 144, 182, 219, 255].map(|value| gamma_ramp.decode[value]),
+      [43, 85, 128, 170, 212, 255]
+    );
+    assert_eq!(
+      gdi_subpixel_blend_with_gamma(0, 255, 43, Some(&gamma_ramp)),
+      58
+    );
+    assert_eq!(
+      gdi_subpixel_blend_with_gamma(255, 0, 212, Some(&gamma_ramp)),
+      58
+    );
+    assert_eq!(
+      gdi_subpixel_blend_with_gamma(12, 0, 0, Some(&gamma_ramp)),
+      13,
+      "a zero sibling stripe still passes through the native gamma round-trip"
+    );
+    assert_eq!(
+      gdi_subpixel_blend_with_gamma(12, 0, 255, Some(&gamma_ramp)),
+      0
+    );
+    assert_eq!(
+      gdi_subpixel_blend_with_gamma(12, 12, 73, Some(&gamma_ramp)),
+      12
+    );
+    assert_eq!(
+      [
+        gdi_subpixel_blend_with_gamma(13, 0, 85, Some(&gamma_ramp)),
+        gdi_subpixel_blend_with_gamma(11, 0, 127, Some(&gamma_ramp)),
+        gdi_subpixel_blend_with_gamma(12, 0, 127, Some(&gamma_ramp)),
+      ],
+      [10, 6, 8],
+      "the native scratch-key replay preserves the truncated 3/6 midpoint"
+    );
   }
 
   #[test]
@@ -13069,6 +15175,105 @@ mod tests {
     font.face_name_bytes = 5;
     font.char_set = 0xFE;
     assert_eq!(wmf_text_font(&font).family.as_deref(), Some("Arial"));
+  }
+
+  fn centered_wmf_text_run_with_escapement(escapement: i16) -> MetafileTextRun {
+    let mut face_name = [0; 32];
+    face_name[..5].copy_from_slice(b"Arial");
+    let records = vec![
+      WmfRecordData::SetWindowExt(WmfPointRecord { x: 100, y: 100 })
+        .to_record()
+        .unwrap(),
+      WmfRecordData::SetTextAlign(WmfU16Record {
+        value: (WmfTextAlignmentModeFlags::CENTER | WmfTextAlignmentModeFlags::BASELINE).bits(),
+        reserved: Vec::new(),
+      })
+      .to_record()
+      .unwrap(),
+      WmfRecordData::CreateFontIndirect(crate::wmf::WmfFontObject {
+        height: -12,
+        width: 0,
+        escapement,
+        orientation: escapement,
+        weight: 400,
+        italic: 0,
+        underline: 0,
+        strike_out: 0,
+        char_set: crate::wmf::WmfCharacterSet::Ansi.raw(),
+        out_precision: 0,
+        clip_precision: 0,
+        quality: 0,
+        pitch_and_family: 0,
+        face_name,
+        face_name_bytes: 6,
+      })
+      .to_record()
+      .unwrap(),
+      WmfRecordData::SelectObject(WmfObjectIndexRecord { index: 0 })
+        .to_record()
+        .unwrap(),
+      WmfRecordData::ExtTextOut(WmfExtTextOutRecord {
+        y: 60,
+        x: 40,
+        string_length: 2,
+        options: WmfExtTextOutOptions::empty(),
+        rectangle: None,
+        string: b"AB".to_vec(),
+        string_padding: Vec::new(),
+        dx: vec![10, 10],
+        trailing_data: Vec::new(),
+      })
+      .to_record()
+      .unwrap(),
+      WmfRecordData::Eof(crate::wmf::WmfEofRecord::default())
+        .to_record()
+        .unwrap(),
+    ];
+    let bytes = WmfMetafile {
+      placeable_header: None,
+      header: WmfHeader {
+        metafile_type: WmfMetafileType::Memory.raw(),
+        header_size_words: 9,
+        version: WmfMetafileVersion::Version300.raw(),
+        file_size_words: 0,
+        number_of_objects: 1,
+        max_record_words: 0,
+        number_of_parameters: 0,
+      },
+      records,
+      trailing_data: Vec::new(),
+    }
+    .to_bytes()
+    .unwrap();
+
+    extract_metafile_text_runs(&bytes, Some("image/x-wmf"))
+      .into_iter()
+      .next()
+      .unwrap()
+  }
+
+  #[test]
+  fn wmf_escapement_rotates_the_baseline_and_center_alignment_continuously() {
+    for (escapement, expected_x, expected_y, expected_rotation) in [
+      (0, 0.30, 0.60, 0.0),
+      (450, 0.329_289_32, 0.670_710_7, -45.0),
+      (900, 0.40, 0.70, -90.0),
+    ] {
+      let run = centered_wmf_text_run_with_escapement(escapement);
+      assert!(
+        (run.x - expected_x).abs() < 0.000_1,
+        "escapement={escapement}"
+      );
+      assert!(
+        (run.y - expected_y).abs() < 0.000_1,
+        "escapement={escapement}"
+      );
+      assert!(
+        (run.rotation_degrees - expected_rotation).abs() < 0.000_1,
+        "escapement={escapement}"
+      );
+      assert!((run.width.unwrap() - 0.20).abs() < 0.000_1);
+    }
   }
 
   #[test]
