@@ -94,7 +94,6 @@ dependencies = [
  "skrifa",
  "thiserror",
  "tiny-skia",
- "zeno",
 ]
 
 [[package]]
@@ -616,9 +615,3 @@ dependencies = [
  "once_cell",
  "pkg-config",
 ]
-
-[[package]]
-name = "zeno"
-version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6df3dc4292935e51816d896edcd52aa30bc297907c26167fec31e2b0c6a32524"

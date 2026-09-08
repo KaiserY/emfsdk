@@ -21,8 +21,7 @@ image = { workspace = true, optional = true }
 skrifa = { workspace = true, optional = true }
 tiny-skia = { workspace = true, optional = true }
 thiserror = { workspace = true }
-zeno = { workspace = true, optional = true }
 
 [features]
 default = []
-render = ["dep:fontique", "dep:image", "dep:skrifa", "dep:tiny-skia", "dep:zeno"]
+render = ["dep:fontique", "dep:image", "dep:skrifa", "dep:tiny-skia"]

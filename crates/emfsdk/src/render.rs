@@ -16,7 +16,10 @@ use tiny_skia::{
   Path as TinySkiaPath, PathBuilder as TinySkiaPathBuilder, PathSegment as TinySkiaPathSegment,
   Point as TinySkiaPoint, Stroke as TinySkiaStroke, Transform as TinySkiaTransform,
 };
-use zeno::{Command as ZenoCommand, Mask as ZenoMask, Point as ZenoPoint};
+
+mod area_raster;
+
+use area_raster::rasterize_nonzero_path;
 
 use crate::bitmap::{
   BitmapCompression, DeviceIndependentBitmap, DibColorTable, DibColorUsage, DibHeader,
@@ -3797,37 +3800,13 @@ fn rasterize_gdi_glyph(
 ///
 /// Win32 GDI exposes that coverage through `GGO_GRAY*_BITMAP`; Wine's GDI
 /// implementation reaches it through `FT_Render_Glyph(FT_RENDER_MODE_NORMAL)`.
-/// Zeno's pure-Rust rasterizer is a direct structural match for the relevant
+/// The local safe rasterizer is a direct structural match for the relevant
 /// FreeType sweep: it quantizes to 8-bit fixed point, accumulates signed cell
 /// cover/area, and applies the non-zero fill rule at the same byte boundary.
-/// This matters for classic ClearType because an analytical float rasterizer
+/// This matters for classic ClearType because a floating-point scan converter
 /// creates low-coverage fringe cells that GDI's scratch DIB never touches.
 fn rasterize_gdi_grayscale_path(path: &TinySkiaPath, width: u32, height: u32) -> Option<Vec<u8>> {
-  if width == 0 || height == 0 {
-    return None;
-  }
-  let mut commands = Vec::new();
-  for segment in path.segments() {
-    let point = |point: TinySkiaPoint| ZenoPoint::new(point.x, point.y);
-    commands.push(match segment {
-      TinySkiaPathSegment::MoveTo(to) => ZenoCommand::MoveTo(point(to)),
-      TinySkiaPathSegment::LineTo(to) => ZenoCommand::LineTo(point(to)),
-      TinySkiaPathSegment::QuadTo(control, to) => ZenoCommand::QuadTo(point(control), point(to)),
-      TinySkiaPathSegment::CubicTo(control1, control2, to) => {
-        ZenoCommand::CurveTo(point(control1), point(control2), point(to))
-      }
-      TinySkiaPathSegment::Close => ZenoCommand::Close,
-    });
-  }
-  if commands.is_empty() {
-    return None;
-  }
-
-  let mut coverage = vec![0; usize::try_from(width.checked_mul(height)?).ok()?];
-  ZenoMask::new(commands.as_slice())
-    .size(width, height)
-    .render_into(&mut coverage, None);
-  Some(coverage)
+  rasterize_nonzero_path(path, width, height)
 }
 
 /// Rasterizes the bi-level source signal consumed by classic ClearType.

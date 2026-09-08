@@ -24,7 +24,6 @@ fontique = { version = "0.11.0", features = ["fontconfig-dlopen", "system"] }
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 skrifa = "0.46.2"
 tiny-skia = { version = "0.12.0", default-features = false, features = ["std"] }
-zeno = "0.3.3"
 proc-macro2 = "1.0.95"
 quote = "1.0.40"
 syn = { version = "2.0.104", features = ["full"] }
