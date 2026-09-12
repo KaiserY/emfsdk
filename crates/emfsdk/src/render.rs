@@ -41,8 +41,8 @@ use crate::emfplus::{
   EmfPlusTranslateWorldTransformData, EmfPlusUnitType,
 };
 use crate::wmf::{
-  WmfBinaryRasterOperation, WmfBrushStyle, WmfEscapeData, WmfExtTextOutOptions, WmfMetafileRef,
-  WmfPenLineStyle, WmfRecordData, WmfTernaryRasterOperationCode, WmfTextAlignmentModeFlags,
+  WmfBinaryRasterOperation, WmfBrushStyle, WmfExtTextOutOptions, WmfMetafileRef, WmfPenLineStyle,
+  WmfRecordData, WmfTernaryRasterOperationCode, WmfTextAlignmentModeFlags,
 };
 
 // record ids. The byte offsets below are record-relative, including the
@@ -623,6 +623,9 @@ pub fn extract_metafile_text_runs_with_options(
     return extract_emf_text_runs(data);
   }
   if crate::wmf::looks_like_wmf(data) {
+    if let Ok(Some(embedded)) = crate::wmf::embedded_enhanced_metafile(data) {
+      return extract_emf_text_runs(&embedded.data);
+    }
     return extract_wmf_text_runs(data, options.wmf_external_header);
   }
   Vec::new()
@@ -652,6 +655,9 @@ pub fn extract_metafile_solid_rects_with_options(
     return extract_emf_solid_rects(data);
   }
   if crate::wmf::looks_like_wmf(data) {
+    if let Ok(Some(embedded)) = crate::wmf::embedded_enhanced_metafile(data) {
+      return extract_emf_solid_rects(&embedded.data);
+    }
     return extract_wmf_solid_rects(data, options.wmf_external_header);
   }
   Vec::new()
@@ -678,6 +684,11 @@ pub fn extract_metafile_bitmap_layers_with_options(
   options: RenderOptions,
 ) -> Vec<MetafileBitmapLayer> {
   if !looks_like_metafile(data, content_type) || !crate::wmf::looks_like_wmf(data) {
+    return Vec::new();
+  }
+  // The embedded EMF supplies the visible stream. Its bitmaps remain in
+  // raster replay because this extractor only lifts WMF DIB records.
+  if matches!(crate::wmf::embedded_enhanced_metafile(data), Ok(Some(_))) {
     return Vec::new();
   }
   extract_wmf_bitmap_layers(data, options.wmf_external_header)
@@ -963,7 +974,7 @@ impl EmfSolidRectState {
       NULL_BRUSH => self.current_solid_brush = None,
       // The three gray stock brushes are solid but device-dependent. Keep
       // them in raster replay instead of inventing a portable RGB value.
-      value if matches!(value, 0x8000_0001..=0x8000_0003) => {
+      0x8000_0001..=0x8000_0003 => {
         self.current_solid_brush = None;
       }
       _ => {
@@ -1950,8 +1961,10 @@ fn wmf_masked_bitmap_layer(
   for (source, mask) in pair
     .source
     .rgb
-    .chunks_exact(RGB_BYTES_PER_PIXEL)
-    .zip(pair.mask.rgb.chunks_exact(RGB_BYTES_PER_PIXEL))
+    .as_chunks::<RGB_BYTES_PER_PIXEL>()
+    .0
+    .iter()
+    .zip(pair.mask.rgb.as_chunks::<RGB_BYTES_PER_PIXEL>().0.iter())
   {
     rgba.extend_from_slice(source);
     rgba.push(if pair.alpha_is_mask_value {
@@ -3948,14 +3961,16 @@ fn apply_gdi_smart_dropout_control(
     coverage,
     width,
     height,
-    GdiDropoutAxis::Horizontal,
-    draw_regular_spans,
-    if cleartype_source {
-      GdiDropoutStubPolicy::ProfileTopology
-    } else {
-      GdiDropoutStubPolicy::AdjacentSquares
+    GdiDropoutSweep {
+      axis: GdiDropoutAxis::Horizontal,
+      draw_regular_spans,
+      stub_policy: if cleartype_source {
+        GdiDropoutStubPolicy::ProfileTopology
+      } else {
+        GdiDropoutStubPolicy::AdjacentSquares
+      },
+      close_cleartype_perpendicular_dropouts: false,
     },
-    false,
   );
 
   let vertical_profiles = build_gdi_dropout_profiles(&contours, GdiDropoutAxis::Vertical);
@@ -3965,10 +3980,12 @@ fn apply_gdi_smart_dropout_control(
     coverage,
     width,
     height,
-    GdiDropoutAxis::Vertical,
-    false,
-    GdiDropoutStubPolicy::AdjacentSquares,
-    cleartype_source,
+    GdiDropoutSweep {
+      axis: GdiDropoutAxis::Vertical,
+      draw_regular_spans: false,
+      stub_policy: GdiDropoutStubPolicy::AdjacentSquares,
+      close_cleartype_perpendicular_dropouts: cleartype_source,
+    },
   );
 }
 
@@ -4284,8 +4301,8 @@ fn build_gdi_dropout_profiles(
     }
 
     let end_contour_profile = profiles.len();
-    for profile_index in first_contour_profile..end_contour_profile {
-      profiles[profile_index].successor = if profile_index + 1 < end_contour_profile {
+    for (profile_index, profile) in profiles.iter_mut().enumerate().skip(first_contour_profile) {
+      profile.successor = if profile_index + 1 < end_contour_profile {
         profile_index + 1
       } else {
         first_contour_profile
@@ -4306,17 +4323,27 @@ fn gdi_dropout_sweep_coordinates(point: GdiDropoutPoint, axis: GdiDropoutAxis) -
   }
 }
 
+struct GdiDropoutSweep {
+  axis: GdiDropoutAxis,
+  draw_regular_spans: bool,
+  stub_policy: GdiDropoutStubPolicy,
+  close_cleartype_perpendicular_dropouts: bool,
+}
+
 fn apply_gdi_dropout_profiles(
   contours: &[GdiDropoutContour],
   profiles: &[GdiDropoutProfile],
   coverage: &mut [u8],
   width: usize,
   height: usize,
-  axis: GdiDropoutAxis,
-  draw_regular_spans: bool,
-  stub_policy: GdiDropoutStubPolicy,
-  close_cleartype_perpendicular_dropouts: bool,
+  sweep: GdiDropoutSweep,
 ) {
+  let GdiDropoutSweep {
+    axis,
+    draw_regular_spans,
+    stub_policy,
+    close_cleartype_perpendicular_dropouts,
+  } = sweep;
   let scan_count = match axis {
     GdiDropoutAxis::Horizontal => height,
     GdiDropoutAxis::Vertical => width,
@@ -4365,8 +4392,7 @@ fn apply_gdi_dropout_profiles(
         } else if matches!(axis, GdiDropoutAxis::Vertical) {
           apply_gdi_dropout_aligned_edges(
             scan_index,
-            x1,
-            x2,
+            [x1, x2],
             coverage,
             width,
             height,
@@ -4645,15 +4671,14 @@ fn gdi_dropout_mul_div(value: i64, multiplier: i64, divisor: i64) -> i64 {
 
 fn apply_gdi_dropout_aligned_edges(
   scan_index: usize,
-  x1: i64,
-  x2: i64,
+  edges: [i64; 2],
   coverage: &mut [u8],
   width: usize,
   height: usize,
   axis: GdiDropoutAxis,
   close_cleartype_perpendicular_edges: bool,
 ) {
-  for coordinate in [x1, x2] {
+  for coordinate in edges {
     let aligned_coordinate = if coordinate == gdi_dropout_ceil(coordinate) {
       Some(coordinate)
     } else if close_cleartype_perpendicular_edges {
@@ -4932,7 +4957,7 @@ impl EmfVectorState {
     );
     let background_color = options.background_color.unwrap_or([255; 3]);
     let mut rgb = vec![0; width * height * RGB_BYTES_PER_PIXEL];
-    for pixel in rgb.chunks_exact_mut(RGB_BYTES_PER_PIXEL) {
+    for pixel in rgb.as_chunks_mut::<RGB_BYTES_PER_PIXEL>().0 {
       pixel.copy_from_slice(&background_color);
     }
 
@@ -5006,7 +5031,7 @@ impl EmfVectorState {
     }
 
     let mut scratch = vec![0; self.rgb.len()];
-    for pixel in scratch.chunks_exact_mut(RGB_BYTES_PER_PIXEL) {
+    for pixel in scratch.as_chunks_mut::<RGB_BYTES_PER_PIXEL>().0 {
       pixel.copy_from_slice(&[
         GDI_PLUS_DC_BACKGROUND_KEY.r,
         GDI_PLUS_DC_BACKGROUND_KEY.g,
@@ -5021,12 +5046,13 @@ impl EmfVectorState {
       return;
     };
 
-    for (scratch, target) in self
-      .rgb
-      .chunks_exact(RGB_BYTES_PER_PIXEL)
-      .zip(destination.chunks_exact_mut(RGB_BYTES_PER_PIXEL))
-    {
-      if scratch
+    for (scratch, target) in self.rgb.as_chunks::<RGB_BYTES_PER_PIXEL>().0.iter().zip(
+      destination
+        .as_chunks_mut::<RGB_BYTES_PER_PIXEL>()
+        .0
+        .iter_mut(),
+    ) {
+      if *scratch
         != [
           GDI_PLUS_DC_BACKGROUND_KEY.r,
           GDI_PLUS_DC_BACKGROUND_KEY.g,
@@ -5814,8 +5840,7 @@ impl EmfVectorState {
         if !ch.is_whitespace() {
           draw_glyph_5x7_rotated(
             self,
-            request.x,
-            request.baseline_y,
+            (request.x, request.baseline_y),
             cursor_advance,
             request.rotation_degrees,
             ch,
@@ -7514,14 +7539,16 @@ fn nearest_raster_index(destination: usize, destination_size: usize, source_size
 fn is_binary_monochrome_raster(image: &RasterPixels) -> bool {
   image
     .rgb
-    .chunks_exact(RGB_BYTES_PER_PIXEL)
+    .as_chunks::<RGB_BYTES_PER_PIXEL>()
+    .0
+    .iter()
     .all(|pixel| pixel[0] == pixel[1] && pixel[1] == pixel[2] && matches!(pixel[0], 0 | u8::MAX))
 }
 
 fn is_discrete_two_color_raster(image: &RasterPixels) -> bool {
   let mut colors = [[0u8; RGB_BYTES_PER_PIXEL]; 2];
   let mut color_count = 0;
-  for pixel in image.rgb.chunks_exact(RGB_BYTES_PER_PIXEL) {
+  for pixel in image.rgb.as_chunks::<RGB_BYTES_PER_PIXEL>().0 {
     let color = [pixel[0], pixel[1], pixel[2]];
     if colors[..color_count].contains(&color) {
       continue;
@@ -7860,7 +7887,7 @@ impl WmfRenderState {
     let object_count = metafile.header.number_of_objects as usize;
     let background_color = options.background_color.unwrap_or([255; 3]);
     let mut rgb = vec![0; width * height * RGB_BYTES_PER_PIXEL];
-    for pixel in rgb.chunks_exact_mut(RGB_BYTES_PER_PIXEL) {
+    for pixel in rgb.as_chunks_mut::<RGB_BYTES_PER_PIXEL>().0 {
       pixel.copy_from_slice(&background_color);
     }
 
@@ -8236,6 +8263,27 @@ fn decode_wmf_as_raster(
   }
 
   let metafile = WmfMetafileRef::from_bytes(data).map_err(|err| err.to_string())?;
+  if let Ok(Some(embedded)) = crate::wmf::embedded_enhanced_metafile(data) {
+    let (_, _, width, height) = wmf_initial_window(&metafile, options.wmf_external_header);
+    let (width, height) = options.resolved_canvas_size(
+      width.unsigned_abs() as usize,
+      height.unsigned_abs() as usize,
+    );
+    // The complete EMF replaces the WMF fallback records. Map its own frame
+    // directly into the host's WMF canvas, preserving the caller's playback
+    // endpoints without an intermediate image or a second scale operation.
+    return decode_emf_as_raster(
+      &embedded.data,
+      RenderOptions {
+        target_width_px: Some(width as u32),
+        target_height_px: Some(height as u32),
+        ..options
+      },
+      true,
+      text_surface,
+      gdi_plus_dc_mode,
+    );
+  }
   let mut state = WmfRenderState::new(&metafile, options, text_surface, gdi_plus_dc_mode)?;
 
   let mut records = metafile.records().peekable();
@@ -8695,29 +8743,8 @@ fn decode_wmf_as_raster(
           );
         }
       }
-      WmfRecordData::Escape(value) => {
-        if let Ok(WmfEscapeData::EnhancedMetafile {
-          enhanced_metafile_data,
-          ..
-        }) = value.typed_data()
-          && let Some(raster) = decode_emf_as_raster(
-            enhanced_metafile_data,
-            options,
-            false,
-            state.canvas.text_surface,
-            GdiPlusDcMode::Direct,
-          )?
-          && let Some(image) = decoded_raster_to_rgb(&raster)?
-        {
-          state.canvas.draw_rgb_image(
-            state.canvas.window_org_x,
-            state.canvas.window_org_y,
-            state.canvas.window_ext_x,
-            state.canvas.window_ext_y,
-            &image,
-          );
-        }
-      }
+      // Incomplete or invalid embedded alternatives fall through to the
+      // ordinary WMF drawing records; individual EMF chunks are never replayed.
       _ => {}
     }
   }
@@ -9510,7 +9537,7 @@ fn average_image_color(image: &RasterPixels) -> EmfColor {
   let mut g = 0u64;
   let mut b = 0u64;
   let mut count = 0u64;
-  for pixel in image.rgb.chunks_exact(RGB_BYTES_PER_PIXEL) {
+  for pixel in image.rgb.as_chunks::<RGB_BYTES_PER_PIXEL>().0 {
     r += u64::from(pixel[0]);
     g += u64::from(pixel[1]);
     b += u64::from(pixel[2]);
@@ -10237,8 +10264,10 @@ fn straight_rgba_from_black_white(black: &[u8], white: &[u8]) -> Result<Vec<u8>,
 
   let mut rgba = Vec::with_capacity(black.len() / RGB_BYTES_PER_PIXEL * BGRA_BYTES_PER_PIXEL);
   for (black, white) in black
-    .chunks_exact(RGB_BYTES_PER_PIXEL)
-    .zip(white.chunks_exact(RGB_BYTES_PER_PIXEL))
+    .as_chunks::<RGB_BYTES_PER_PIXEL>()
+    .0
+    .iter()
+    .zip(white.as_chunks::<RGB_BYTES_PER_PIXEL>().0.iter())
   {
     let uncovered = white
       .iter()
@@ -10274,8 +10303,10 @@ fn straight_rgba_from_black_white_with_mask(
   let mask = straight_rgba_from_black_white(mask_black, mask_white)?;
   let mut rgba = Vec::with_capacity(color.len());
   for (color, mask) in color
-    .chunks_exact(BGRA_BYTES_PER_PIXEL)
-    .zip(mask.chunks_exact(BGRA_BYTES_PER_PIXEL))
+    .as_chunks::<BGRA_BYTES_PER_PIXEL>()
+    .0
+    .iter()
+    .zip(mask.as_chunks::<BGRA_BYTES_PER_PIXEL>().0.iter())
   {
     let alpha = mask[3];
     if alpha == 0 {
@@ -10309,11 +10340,13 @@ fn straight_rgba_with_binary_coverage(
   }
   let mut rgba = Vec::with_capacity(color_black.len() / RGB_BYTES_PER_PIXEL * BGRA_BYTES_PER_PIXEL);
   for ((((_color_key, _color_black), _color_white), mask_black), mask_white) in color_key
-    .chunks_exact(RGB_BYTES_PER_PIXEL)
-    .zip(color_black.chunks_exact(RGB_BYTES_PER_PIXEL))
-    .zip(color_white.chunks_exact(RGB_BYTES_PER_PIXEL))
-    .zip(mask_black.chunks_exact(RGB_BYTES_PER_PIXEL))
-    .zip(mask_white.chunks_exact(RGB_BYTES_PER_PIXEL))
+    .as_chunks::<RGB_BYTES_PER_PIXEL>()
+    .0
+    .iter()
+    .zip(color_black.as_chunks::<RGB_BYTES_PER_PIXEL>().0.iter())
+    .zip(color_white.as_chunks::<RGB_BYTES_PER_PIXEL>().0.iter())
+    .zip(mask_black.as_chunks::<RGB_BYTES_PER_PIXEL>().0.iter())
+    .zip(mask_white.as_chunks::<RGB_BYTES_PER_PIXEL>().0.iter())
   {
     // GdipReleaseDC marks a scratch pixel opaque only when the final 32-bit
     // value differs from DC_BACKGROUND_KEY. A weak LCD stripe can affect the
@@ -10321,7 +10354,7 @@ fn straight_rgba_with_binary_coverage(
     // the diagnostic pair as coverage grows a one-pixel fringe that native
     // GDI+ deliberately leaves transparent.
     let color_key = _color_key;
-    let color_covered = color_key
+    let color_covered = *color_key
       != [
         GDI_PLUS_DC_BACKGROUND_KEY.r,
         GDI_PLUS_DC_BACKGROUND_KEY.g,
@@ -10838,8 +10871,7 @@ fn draw_glyph_5x7(
 
 fn draw_glyph_5x7_rotated(
   state: &mut EmfVectorState,
-  baseline_x: f32,
-  baseline_y: f32,
+  (baseline_x, baseline_y): (f32, f32),
   cursor_advance: f32,
   rotation_degrees: f32,
   ch: char,
@@ -10974,7 +11006,7 @@ fn visit_polygon_scanline_spans(
       }
     }
     intersections.sort_by(|a, b| a.total_cmp(b));
-    for pair in intersections.chunks_exact(2) {
+    for pair in intersections.as_chunks::<2>().0 {
       // Sample coverage at pixel centers and keep the trailing polygon edge
       // half-open. Adjacent polygons emitted for GDI gradients share that
       // edge; rounding both intersections outward paints it twice, which is
@@ -11511,7 +11543,9 @@ fn emr_ext_text_out_w_units(
   let end = start.checked_add(byte_len)?;
   let bytes = data.get(start..end)?;
   let units = bytes
-    .chunks_exact(2)
+    .as_chunks::<2>()
+    .0
+    .iter()
     .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
     .collect::<Vec<_>>();
   Some(units)
@@ -11691,7 +11725,9 @@ fn read_logfont_object(
   )?;
   let family = String::from_utf16_lossy(
     &face_bytes
-      .chunks_exact(2)
+      .as_chunks::<2>()
+      .0
+      .iter()
       .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
       .take_while(|unit| *unit != 0)
       .collect::<Vec<_>>(),
@@ -13059,6 +13095,443 @@ mod tests {
       .data
     };
     assert_eq!(decode(false), decode(true));
+  }
+
+  fn embedded_emf_test_graphic() -> Vec<u8> {
+    let mut emf = metafile_with_header_bounds(
+      57,
+      37,
+      vec![
+        create_solid_brush_record(1, 0x0000_00ff),
+        select_object_record(1),
+        source_less_bit_blt_rect_record(52, 32, 4, 4, 0x00F0_0021),
+      ],
+    );
+    // An eight-pixel frame with a nonzero origin. Its red rectangle fills
+    // the central half of each axis, independent of the outer WMF viewport.
+    for (offset, value) in [
+      (8, 50_i32),
+      (12, 30),
+      (24, 5000),
+      (28, 3000),
+      (32, 5800),
+      (36, 3800),
+      (72, 100),
+      (76, 100),
+      (80, 100),
+      (84, 100),
+    ] {
+      emf[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    emf
+  }
+
+  fn embedded_emf_test_wmf(emf: &[u8], chunk_size: usize) -> WmfMetafile {
+    use crate::wmf::{WmfEscapeData, WmfEscapeRecord};
+    let mut records = Vec::new();
+    let checksum = crate::wmf::compute_enhanced_metafile_checksum(emf).unwrap();
+    let chunk_count = emf.len().div_ceil(chunk_size);
+    let mut remaining = emf.len();
+    for chunk in emf.chunks(chunk_size) {
+      remaining -= chunk.len();
+      records.push(
+        WmfRecordData::Escape(
+          WmfEscapeRecord::from_typed_data(
+            WmfEscapeData::EnhancedMetafile {
+              comment_identifier: crate::wmf::WMF_EMF_COMMENT_IDENTIFIER,
+              comment_type: crate::wmf::WMF_EMF_COMMENT_TYPE,
+              version: crate::wmf::WMF_EMF_INTEROP_VERSION,
+              checksum,
+              flags: 0,
+              comment_record_count: chunk_count as u32,
+              current_record_size: chunk.len() as u32,
+              remaining_bytes: remaining as u32,
+              enhanced_metafile_data_size: emf.len() as u32,
+              enhanced_metafile_data: chunk,
+            },
+            Vec::new(),
+          )
+          .unwrap(),
+        )
+        .to_record()
+        .unwrap(),
+      );
+    }
+    records.extend([
+      WmfRecordData::SetWindowExt(WmfPointRecord { x: 16, y: 8 })
+        .to_record()
+        .unwrap(),
+      // Deliberately conflicting fallback ink. It must appear only when
+      // the optional EMF cannot be recovered, never over a valid EMF.
+      WmfRecordData::SetPixel(WmfSetPixelRecord {
+        color: ColorRef {
+          red: 0,
+          green: 0,
+          blue: 255,
+          reserved: 0,
+        },
+        x: 0,
+        y: 0,
+      })
+      .to_record()
+      .unwrap(),
+      WmfRecordData::Eof(crate::wmf::WmfEofRecord::default())
+        .to_record()
+        .unwrap(),
+    ]);
+    WmfMetafile {
+      placeable_header: None,
+      header: WmfHeader {
+        metafile_type: WmfMetafileType::Memory.raw(),
+        header_size_words: 9,
+        version: WmfMetafileVersion::Version300.raw(),
+        file_size_words: 0,
+        number_of_objects: 0,
+        max_record_words: 0,
+        number_of_parameters: 0,
+      },
+      records,
+      trailing_data: Vec::new(),
+    }
+  }
+
+  fn embedded_emf_test_bytes(mut metafile: WmfMetafile, windows_checksum: bool) -> Vec<u8> {
+    if windows_checksum {
+      for record in &mut metafile.records {
+        if let WmfRecordData::Escape(mut escape) = record.parse_data().unwrap() {
+          escape.escape_data[12..14].copy_from_slice(&0_u16.to_le_bytes());
+          *record = WmfRecordData::Escape(escape).to_record().unwrap();
+        }
+      }
+    }
+    metafile.header.file_size_words = metafile.computed_file_size_words().unwrap();
+    metafile.header.max_record_words = metafile.computed_max_record_words().unwrap();
+    let mut bytes = metafile.to_bytes().unwrap();
+    if windows_checksum {
+      balance_embedded_wmf_test_checksum(&mut bytes);
+    }
+    bytes
+  }
+
+  fn balance_embedded_wmf_test_checksum(bytes: &mut [u8]) {
+    let start = if WmfMetafileRef::from_bytes(bytes)
+      .unwrap()
+      .placeable_header
+      .is_some()
+    {
+      22
+    } else {
+      0
+    };
+    // Standard WMF header + record header + escape header + checksum offset.
+    let checksum_offset = start + 18 + 6 + 4 + 12;
+    bytes[checksum_offset..checksum_offset + 2].fill(0);
+    let sum = bytes[start..]
+      .as_chunks::<2>()
+      .0
+      .iter()
+      .fold(0_u16, |sum, word| {
+        sum.wrapping_add(u16::from_le_bytes([word[0], word[1]]))
+      });
+    bytes[checksum_offset..checksum_offset + 2].copy_from_slice(&sum.wrapping_neg().to_le_bytes());
+  }
+
+  fn embedded_emf_test_rgb(bytes: &[u8], options: RenderOptions) -> image::RgbImage {
+    let decoded = decode_metafile_as_raster_with_options(bytes, Some("image/x-wmf"), options)
+      .unwrap()
+      .unwrap();
+    image::load_from_memory(&decoded.data).unwrap().to_rgb8()
+  }
+
+  #[test]
+  fn wmf_embedded_emf_chunks_replace_fallback_with_the_host_viewport() {
+    let emf = embedded_emf_test_graphic();
+    // Offset 124 falls inside the 24-byte EMR_CREATEBRUSHINDIRECT that
+    // starts at 108, reproducing a chunk boundary through a real record.
+    assert!(
+      decode_emf_as_raster(
+        &emf[..124],
+        RenderOptions::default(),
+        true,
+        GdiTextSurface::Color,
+        GdiPlusDcMode::Direct
+      )
+      .is_err()
+    );
+    let single = embedded_emf_test_bytes(embedded_emf_test_wmf(&emf, emf.len()), false);
+    let split = embedded_emf_test_bytes(embedded_emf_test_wmf(&emf, 124), false);
+    let windows = embedded_emf_test_bytes(embedded_emf_test_wmf(&emf, 124), true);
+    let expected = embedded_emf_test_rgb(&single, RenderOptions::default());
+    assert_eq!(expected.dimensions(), (16, 8));
+    assert_eq!(expected.get_pixel(5, 3).0, [255, 0, 0]);
+    assert_eq!(expected.get_pixel(0, 0).0, [255, 255, 255]);
+    for bytes in [&split, &windows] {
+      assert_eq!(
+        embedded_emf_test_rgb(bytes, RenderOptions::default()),
+        expected
+      );
+      assert_eq!(
+        crate::wmf::embedded_enhanced_metafile(bytes)
+          .unwrap()
+          .unwrap()
+          .data,
+        emf
+      );
+    }
+
+    let options = RenderOptions {
+      target_width_px: Some(32),
+      target_height_px: Some(16),
+      playback_width_px: Some(24),
+      playback_height_px: Some(12),
+      ..RenderOptions::default()
+    };
+    let direct = decode_metafile_as_raster_with_options(&emf, Some("image/x-emf"), options)
+      .unwrap()
+      .unwrap();
+    let direct = image::load_from_memory(&direct.data).unwrap().to_rgb8();
+    assert_eq!(direct.dimensions(), (32, 16));
+    assert_eq!(direct.get_pixel(8, 4).0, [255, 0, 0]);
+    for bytes in [&single, &split, &windows] {
+      assert_eq!(embedded_emf_test_rgb(bytes, options), direct);
+    }
+  }
+
+  #[test]
+  fn wmf_embedded_emf_preserves_placeable_external_and_transparent_playback() {
+    let emf = embedded_emf_test_graphic();
+    let mut placeable = embedded_emf_test_wmf(&emf, 124);
+    placeable.placeable_header = Some(
+      crate::wmf::WmfPlaceableHeader {
+        key: crate::wmf::PLACEABLE_KEY,
+        handle: 0,
+        left: 11,
+        top: 17,
+        right: 27,
+        bottom: 25,
+        inch: 1440,
+        reserved: 0,
+        checksum: 0,
+      }
+      .with_computed_checksum(),
+    );
+    let placeable = embedded_emf_test_bytes(placeable, true);
+    let standard = embedded_emf_test_bytes(embedded_emf_test_wmf(&emf, 124), true);
+    let external = RenderOptions {
+      wmf_external_header: Some(WmfExternalHeader {
+        width_hundredths_mm: 2540,
+        height_hundredths_mm: 1270,
+        reference_device_dpi_x: 32,
+        reference_device_dpi_y: 32,
+      }),
+      ..RenderOptions::default()
+    };
+    assert_eq!(
+      embedded_emf_test_rgb(&placeable, external).dimensions(),
+      (16, 8)
+    );
+    let external_image = embedded_emf_test_rgb(&standard, external);
+    assert_eq!(external_image.dimensions(), (32, 16));
+    assert_eq!(external_image.get_pixel(9, 5).0, [255, 0, 0]);
+    assert_eq!(external_image.get_pixel(0, 0).0, [255, 255, 255]);
+
+    let options = RenderOptions {
+      transparent_background: true,
+      ..RenderOptions::default()
+    };
+    let decoded = decode_metafile_as_raster_with_options(&standard, Some("image/x-wmf"), options)
+      .unwrap()
+      .unwrap();
+    let rgba = image::load_from_memory(&decoded.data).unwrap().to_rgba8();
+    assert_eq!(rgba.get_pixel(5, 3).0, [255, 0, 0, 255]);
+    assert_eq!(rgba.get_pixel(0, 0).0[3], 0);
+  }
+
+  #[test]
+  fn wmf_embedded_emf_windows_checksum_covers_the_container_and_keeps_strict_api() {
+    let emf = embedded_emf_test_graphic();
+    let bytes = embedded_emf_test_bytes(embedded_emf_test_wmf(&emf, 124), true);
+    let metafile = WmfMetafile::from_bytes(&bytes).unwrap();
+    let mut strict = crate::wmf::WmfEnhancedMetafileAssembler::new();
+    let WmfRecordData::Escape(first) = metafile.records[0].parse_data().unwrap() else {
+      panic!()
+    };
+    let WmfRecordData::Escape(second) = metafile.records[1].parse_data().unwrap() else {
+      panic!()
+    };
+    assert_eq!(&second.escape_data[12..14], &[0, 0]);
+    assert!(strict.push(&first).unwrap().is_none());
+    assert!(strict.push(&second).is_err());
+    assert_eq!(
+      crate::wmf::embedded_enhanced_metafile(&bytes)
+        .unwrap()
+        .unwrap()
+        .data,
+      emf
+    );
+
+    let mut corrupt_sum = bytes.clone();
+    corrupt_sum[42] ^= 1;
+    assert!(crate::wmf::embedded_enhanced_metafile(&corrupt_sum).is_err());
+    assert_eq!(
+      embedded_emf_test_rgb(&corrupt_sum, RenderOptions::default())
+        .get_pixel(0, 0)
+        .0,
+      [0, 0, 255]
+    );
+
+    let mut later_checksum = metafile.clone();
+    let mut second = second;
+    second.escape_data[12..14].copy_from_slice(&1_u16.to_le_bytes());
+    later_checksum.records[1] = WmfRecordData::Escape(second).to_record().unwrap();
+    let mut later_checksum = embedded_emf_test_bytes(later_checksum, false);
+    balance_embedded_wmf_test_checksum(&mut later_checksum);
+    // A native SetWinMetaFileBits control recovers the same original EMF
+    // when a later checksum is nonzero but the whole-container sum is zero.
+    // Zero later fields are a producer convention, not a playback condition.
+    assert_eq!(
+      crate::wmf::embedded_enhanced_metafile(&later_checksum)
+        .unwrap()
+        .unwrap()
+        .data,
+      emf
+    );
+    assert_eq!(
+      embedded_emf_test_rgb(&later_checksum, RenderOptions::default()),
+      embedded_emf_test_rgb(&bytes, RenderOptions::default())
+    );
+  }
+
+  #[test]
+  fn wmf_embedded_emf_invalid_sequences_preserve_wmf_fallback() {
+    let emf = embedded_emf_test_graphic();
+    let base = embedded_emf_test_wmf(&emf, 124);
+    let mut missing = base.clone();
+    missing.records.remove(1);
+    let mut reordered = base.clone();
+    reordered.records.swap(0, 1);
+    let mut interrupted = base.clone();
+    interrupted
+      .records
+      .insert(1, WmfRecordData::SaveDc.to_record().unwrap());
+    let mut wrong_remaining = base.clone();
+    let WmfRecordData::Escape(mut second) = wrong_remaining.records[1].parse_data().unwrap() else {
+      panic!()
+    };
+    second.escape_data[26..30].copy_from_slice(&2_u32.to_le_bytes());
+    wrong_remaining.records[1] = WmfRecordData::Escape(second).to_record().unwrap();
+    let mut oversized = base.clone();
+    let WmfRecordData::Escape(mut first) = oversized.records[0].parse_data().unwrap() else {
+      panic!()
+    };
+    first.escape_data[26..30].copy_from_slice(&(u32::MAX - 124).to_le_bytes());
+    first.escape_data[30..34].copy_from_slice(&u32::MAX.to_le_bytes());
+    oversized.records[0] = WmfRecordData::Escape(first).to_record().unwrap();
+    let broken_emf = embedded_emf_test_wmf(&emf[..emf.len() - 4], 124);
+    for invalid in [
+      missing,
+      reordered,
+      interrupted,
+      wrong_remaining,
+      oversized,
+      broken_emf,
+    ] {
+      // Recompute a valid container checksum so recovery depends on the
+      // invalid structure, not merely on stale integrity metadata.
+      let bytes = embedded_emf_test_bytes(invalid, true);
+      assert!(crate::wmf::embedded_enhanced_metafile(&bytes).is_err());
+      let image = embedded_emf_test_rgb(&bytes, RenderOptions::default());
+      assert_eq!(image.get_pixel(0, 0).0, [0, 0, 255]);
+      assert_eq!(image.get_pixel(5, 3).0, [255, 255, 255]);
+    }
+  }
+
+  #[test]
+  fn wmf_embedded_emf_layer_extractors_follow_the_replayed_alternative() {
+    let emf = metafile_with_header_bounds(
+      99,
+      99,
+      vec![
+        create_solid_brush_record(1, 0x0000_00ff),
+        select_object_record(1),
+        source_less_bit_blt_rect_record(20, 30, 40, 20, 0x00F0_0021),
+        ext_text_out_w_record(10, 10, "Embedded"),
+        select_object_record(NULL_PEN),
+        triangle_polygon16_record(),
+      ],
+    );
+    let fallback_bitmap = copy_bitmap_wmf();
+    assert_eq!(
+      extract_metafile_bitmap_layers(&fallback_bitmap, Some("image/x-wmf")).len(),
+      1
+    );
+    let mut wrapped = embedded_emf_test_wmf(&emf, 124);
+    let insert_at = wrapped.records.len() - 1;
+    wrapped.records.insert(
+      insert_at,
+      WmfMetafile::from_bytes(&fallback_bitmap).unwrap().records[1].clone(),
+    );
+    wrapped.records.insert(
+      insert_at,
+      WmfRecordData::TextOut(crate::wmf::WmfTextOutRecord {
+        string: b"Fallback".to_vec(),
+        string_padding: Vec::new(),
+        x_start: 0,
+        y_start: 0,
+      })
+      .to_record()
+      .unwrap(),
+    );
+    let bytes = embedded_emf_test_bytes(wrapped, true);
+    let expected_runs = extract_metafile_text_runs(&emf, Some("image/x-emf"));
+    assert_eq!(expected_runs.len(), 1);
+    assert_eq!(expected_runs[0].text, "Embedded");
+    let actual_runs = extract_metafile_text_runs(&bytes, Some("image/x-wmf"));
+    assert_eq!(actual_runs.len(), expected_runs.len());
+    for (actual, expected) in actual_runs.iter().zip(&expected_runs) {
+      assert_eq!(
+        (
+          &actual.text,
+          actual.x,
+          actual.y,
+          actual.width,
+          &actual.advances,
+          &actual.font_family
+        ),
+        (
+          &expected.text,
+          expected.x,
+          expected.y,
+          expected.width,
+          &expected.advances,
+          &expected.font_family
+        )
+      );
+    }
+    let expected_rects = extract_metafile_solid_rects(&emf, Some("image/x-emf"));
+    assert_eq!(expected_rects.len(), 1);
+    assert_eq!(
+      extract_metafile_solid_rects(&bytes, Some("image/x-wmf")),
+      expected_rects
+    );
+    assert!(extract_metafile_bitmap_layers(&bytes, Some("image/x-wmf")).is_empty());
+
+    let options = RenderOptions {
+      suppress_text: true,
+      suppress_solid_pattern_rects: true,
+      ..RenderOptions::default()
+    };
+    let expected_scene =
+      extract_metafile_vector_scene_with_options(&emf, Some("image/x-emf"), options)
+        .unwrap()
+        .unwrap();
+    assert!(!expected_scene.fills.is_empty());
+    assert_eq!(
+      extract_metafile_vector_scene_with_options(&bytes, Some("image/x-wmf"), options)
+        .unwrap()
+        .unwrap(),
+      expected_scene
+    );
   }
 
   #[test]

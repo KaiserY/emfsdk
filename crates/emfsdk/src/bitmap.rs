@@ -600,7 +600,7 @@ impl DibBitmapInfo {
       DibColorUsage::RgbColors => {
         let (table, trailing_data) = split_color_table_bytes(color_table, entry_count, 4)?;
         let mut entries = Vec::with_capacity(entry_count);
-        for chunk in table.chunks_exact(4) {
+        for chunk in table.as_chunks::<4>().0 {
           let entry = RgbQuad {
             blue: chunk[0],
             green: chunk[1],
@@ -618,7 +618,9 @@ impl DibBitmapInfo {
       DibColorUsage::PalColors => {
         let (table, trailing_data) = split_color_table_bytes(color_table, entry_count, 2)?;
         let entries = table
-          .chunks_exact(2)
+          .as_chunks::<2>()
+          .0
+          .iter()
           .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
           .collect();
         Ok(DibColorTable::PaletteIndices {

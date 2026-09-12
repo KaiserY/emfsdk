@@ -3893,6 +3893,16 @@ impl WmfEnhancedMetafileAssembler {
   }
 
   pub fn push(&mut self, record: &WmfEscapeRecord) -> Result<Option<WmfEnhancedMetafile>> {
+    self.push_with_checksum_policy(record, false)
+  }
+
+  // The compatibility caller first validates the complete enclosing WMF.
+  // Public incremental assembly retains the MS-WMF embedded-EMF checksum.
+  fn push_with_checksum_policy(
+    &mut self,
+    record: &WmfEscapeRecord,
+    validated_wmf_checksum: bool,
+  ) -> Result<Option<WmfEnhancedMetafile>> {
     let WmfEscapeData::EnhancedMetafile {
       version,
       checksum,
@@ -3920,8 +3930,9 @@ impl WmfEnhancedMetafileAssembler {
         total_size: enhanced_metafile_data_size,
         data: Vec::with_capacity(enhanced_metafile_data_size as usize),
       });
+    let checksum_matches = validated_wmf_checksum || state.checksum == checksum;
     if state.version != version
-      || state.checksum != checksum
+      || !checksum_matches
       || state.record_count != comment_record_count
       || state.total_size != enhanced_metafile_data_size
     {
@@ -3972,7 +3983,7 @@ impl WmfEnhancedMetafileAssembler {
         checksum: state.checksum,
         data: state.data,
       };
-      if value.checksum != value.computed_checksum()? {
+      if !validated_wmf_checksum && value.checksum != value.computed_checksum()? {
         return Err(Error::invalid(
           0,
           "META_ESCAPE_ENHANCED_METAFILE Checksum is invalid",
@@ -4001,6 +4012,109 @@ impl WmfEnhancedMetafileAssembler {
   }
 }
 
+// Return one complete alternative representation, never an individual payload
+// segment. The caller can retain WMF playback when this optional stream fails.
+#[cfg(feature = "render")]
+pub(crate) fn embedded_enhanced_metafile(data: &[u8]) -> Result<Option<WmfEnhancedMetafile>> {
+  let metafile = WmfMetafileRef::from_bytes(data)?;
+  let mut records = metafile.records().enumerate();
+  let mut first = None;
+  for (index, record) in records.by_ref() {
+    if record.normalized_function_kind() != Some(WmfRecordFunction::Escape) {
+      continue;
+    }
+    if let Ok(WmfRecordData::Escape(escape)) = record.parse_data()
+      && matches!(
+        escape.typed_data(),
+        Ok(WmfEscapeData::EnhancedMetafile { .. })
+      )
+    {
+      first = Some((index, escape));
+      break;
+    }
+  }
+  let Some((first_index, first)) = first else {
+    return Ok(None);
+  };
+  let WmfEscapeData::EnhancedMetafile {
+    comment_record_count,
+    enhanced_metafile_data_size,
+    ..
+  } = first.typed_data()?
+  else {
+    unreachable!("the first escape was checked above");
+  };
+  // An embedded stream and its chunk count cannot exceed their container.
+  // Check before the incremental assembler reserves its declared capacity.
+  if comment_record_count as usize > metafile.record_count()
+    || enhanced_metafile_data_size as usize > data.len()
+  {
+    return Err(Error::invalid(
+      0,
+      "embedded EMF sequence exceeds its WMF container",
+    ));
+  }
+  let mut chunks = vec![first];
+  for _ in 1..comment_record_count {
+    let Some((_, record)) = records.next() else {
+      return Err(Error::invalid(0, "embedded EMF sequence is incomplete"));
+    };
+    let WmfRecordData::Escape(escape) = record.parse_data()? else {
+      return Err(Error::invalid(0, "embedded EMF chunks are not consecutive"));
+    };
+    chunks.push(escape);
+  }
+  let assemble = |validated_wmf_checksum| -> Result<Option<WmfEnhancedMetafile>> {
+    let mut assembler = WmfEnhancedMetafileAssembler::new();
+    for chunk in &chunks {
+      if let Some(value) = assembler.push_with_checksum_policy(chunk, validated_wmf_checksum)? {
+        crate::emf::EmfMetafileRef::from_bytes(&value.data)?;
+        if !crate::emf::looks_like_emf(&value.data) {
+          return Err(Error::invalid(0, "embedded EMF header is invalid"));
+        }
+        return Ok(Some(value));
+      }
+    }
+    assembler.finish()?;
+    Ok(None)
+  };
+  let strict = assemble(false);
+  if strict.is_ok() {
+    return strict;
+  }
+
+  // GetWinMetaFileBits uses another checksum convention: all WORDs of the
+  // standard WMF sum to zero. Its writer puts the correction in the first
+  // leading WMFC comment, but SetWinMetaFileBits also accepts nonzero later
+  // checksum fields when the whole-container sum is valid. Native Windows
+  // recovery preserves the exact embedded EMF in both cases; changing only
+  // the total sum instead selects the WMF fallback. Wine's getwinmetafilebits
+  // test covers the writer convention and its extractor validates the sum.
+  // This is distinct from MS-WMF 2.3.6.25's one's-complement EMF XOR; accept
+  // either validated convention without weakening the public strict assembler.
+  let start = if metafile.placeable_header.is_some() {
+    PLACEABLE_HEADER_SIZE
+  } else {
+    0
+  };
+  let end = data.len() - metafile.trailing_data().len();
+  let standard_wmf = &data[start..end];
+  let word_sum = standard_wmf
+    .as_chunks::<2>()
+    .0
+    .iter()
+    .fold(0_u16, |sum, word| {
+      sum.wrapping_add(u16::from_le_bytes([word[0], word[1]]))
+    });
+  if first_index == 0
+    && u64::from(metafile.header.file_size_words) * 2 == standard_wmf.len() as u64
+    && word_sum == 0
+  {
+    return assemble(true);
+  }
+  strict
+}
+
 pub fn compute_enhanced_metafile_checksum(data: &[u8]) -> Result<u16> {
   if !data.len().is_multiple_of(2) {
     return Err(Error::invalid(
@@ -4008,7 +4122,7 @@ pub fn compute_enhanced_metafile_checksum(data: &[u8]) -> Result<u16> {
       "embedded EMF stream must contain complete WORDs",
     ));
   }
-  let xor = data.chunks_exact(2).fold(0u16, |value, word| {
+  let xor = data.as_chunks::<2>().0.iter().fold(0u16, |value, word| {
     value ^ u16::from_le_bytes([word[0], word[1]])
   });
   Ok(!xor)

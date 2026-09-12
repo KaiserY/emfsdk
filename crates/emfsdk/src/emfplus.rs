@@ -4210,11 +4210,8 @@ impl EmfPlusSetTsClipData {
 
     if compressed {
       let mut rects = Vec::with_capacity(usize::from(rect_count));
-      for chunk in data.chunks_exact(4) {
-        let bytes = chunk
-          .try_into()
-          .map_err(|_| Error::invalid(0, "EmfPlusSetTSClip compressed rect is malformed"))?;
-        rects.push(EmfPlusSetTsClipCompressedRect::read_from_bytes(bytes)?);
+      for chunk in data.as_chunks::<4>().0 {
+        rects.push(EmfPlusSetTsClipCompressedRect::read_from_bytes(*chunk)?);
       }
       Ok(Self {
         compressed,

@@ -89,6 +89,8 @@ pub fn extract_metafile_vector_scene_with_options(
 
   let result = if is_emf(data) {
     extract_emf_scene(data, options)
+  } else if let Ok(Some(embedded)) = crate::wmf::embedded_enhanced_metafile(data) {
+    extract_emf_scene(&embedded.data, options)
   } else {
     extract_wmf_scene(data, options)
   };
@@ -454,9 +456,7 @@ fn extract_emf_scene(
   let mut emf_plus_playback = false;
   let mut emf_device_context = None;
   let mut pending_line = None;
-  let mut records = metafile.records();
-
-  while let Some(record) = records.next() {
+  for record in metafile.records() {
     let record = record.parse_data().map_err(|error| error.to_string())?;
     let is_emf_plus_comment = matches!(&record, EmfRecordData::Comment(EmrComment::EmfPlus { .. }));
     if is_emf_plus_comment && let Some(bridge) = emf_device_context.take() {
