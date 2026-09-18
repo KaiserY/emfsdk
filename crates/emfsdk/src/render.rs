@@ -40,6 +40,7 @@ use crate::emfplus::{
   EmfPlusRotateWorldTransformData, EmfPlusScaleWorldTransformData,
   EmfPlusTranslateWorldTransformData, EmfPlusUnitType,
 };
+use crate::font::vdmx_vertical_device_metrics;
 use crate::wmf::{
   WmfBinaryRasterOperation, WmfBrushStyle, WmfExtTextOutOptions, WmfMetafileRef, WmfPenLineStyle,
   WmfRecordData, WmfTernaryRasterOperationCode, WmfTextAlignmentModeFlags,
@@ -2897,11 +2898,37 @@ struct EmfDeviceContextBridge {
 enum EmfPlusRenderObject {
   Brush(Option<EmfPlusRenderBrush>),
   Pen(Option<EmfPen>),
-  Path(Vec<EmfPoint>),
+  Path(EmfPlusRenderPath),
   Region(EmfPlusRenderRegion),
   Image(RasterPixels),
   Font(EmfPlusFontObject),
   Unsupported,
+}
+
+#[derive(Clone, Debug, Default)]
+struct EmfPlusRenderPath {
+  subpaths: Vec<EmfPlusRenderSubpath>,
+}
+
+impl EmfPlusRenderPath {
+  fn flattened_points(&self) -> Vec<EmfPoint> {
+    let mut points = Vec::new();
+    for subpath in &self.subpaths {
+      points.extend_from_slice(&subpath.points);
+      if subpath.closed
+        && let Some(first) = subpath.points.first().copied()
+      {
+        points.push(first);
+      }
+    }
+    points
+  }
+}
+
+#[derive(Clone, Debug)]
+struct EmfPlusRenderSubpath {
+  points: Vec<EmfPoint>,
+  closed: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -3033,100 +3060,6 @@ struct RenderFontCache {
   source_cache: SourceCache,
   faces: HashMap<RenderFontKey, Option<RenderFontFace>>,
   hinting_instances: HashMap<RenderHintingKey, HintingInstance>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct GdiVerticalDeviceMetrics {
-  ascent: i32,
-  descent: i32,
-}
-
-fn vdmx_vertical_device_metrics(
-  table: &[u8],
-  ppem: u16,
-  char_set: u8,
-) -> Option<GdiVerticalDeviceMetrics> {
-  const ANSI_CHARSET: u8 = 0;
-  const HEADER_SIZE: usize = 6;
-  const RATIO_SIZE: usize = 4;
-  const GROUP_HEADER_SIZE: usize = 4;
-  const ENTRY_SIZE: usize = 6;
-
-  let read_u16 = |offset: usize| {
-    table
-      .get(offset..offset + 2)
-      .map(|bytes| u16::from_be_bytes([bytes[0], bytes[1]]))
-  };
-  let version = read_u16(0)?;
-  if version > 1 || read_u16(2)? == 0 {
-    return None;
-  }
-  let ratio_count = usize::from(read_u16(4)?);
-  let ratio_bytes = ratio_count.checked_mul(RATIO_SIZE)?;
-  let offsets_start = HEADER_SIZE.checked_add(ratio_bytes)?;
-  let offsets_end = offsets_start.checked_add(ratio_count.checked_mul(2)?)?;
-  if offsets_end > table.len() {
-    return None;
-  }
-
-  let mut group_offset = None;
-  for index in 0..ratio_count {
-    let ratio_offset = HEADER_SIZE + index * RATIO_SIZE;
-    let ratio = table.get(ratio_offset..ratio_offset + RATIO_SIZE)?;
-    let char_set_matches = match version {
-      // Version 0 uses 1 for the Windows ANSI subset; 0 is the complete
-      // symbol/dingbat repertoire. Microsoft specifies that Windows ignores
-      // non-ANSI-subset entries for ANSI_CHARSET.
-      0 => {
-        (ratio[0] == 1 && char_set == ANSI_CHARSET) || (ratio[0] == 0 && char_set != ANSI_CHARSET)
-      }
-      // Version 1 uses 1 for the complete repertoire; 0 is additionally
-      // available to ANSI_CHARSET consumers.
-      1 => ratio[0] == 1 || (ratio[0] == 0 && char_set == ANSI_CHARSET),
-      _ => false,
-    };
-    if !char_set_matches {
-      continue;
-    }
-    let aspect_matches = (ratio[1] == 0 && ratio[2] == 0 && ratio[3] == 0)
-      || (ratio[1] == 1 && ratio[2] <= 1 && ratio[3] >= 1);
-    if aspect_matches {
-      group_offset = Some(usize::from(read_u16(offsets_start + index * 2)?));
-      break;
-    }
-  }
-
-  let group_offset = group_offset?;
-  let record_count = usize::from(read_u16(group_offset)?);
-  let start_ppem = *table.get(group_offset + 2)?;
-  let end_ppem = *table.get(group_offset + 3)?;
-  if ppem < u16::from(start_ppem) || ppem > u16::from(end_ppem) {
-    return None;
-  }
-  let entries_start = group_offset.checked_add(GROUP_HEADER_SIZE)?;
-  let entries_end = entries_start.checked_add(record_count.checked_mul(ENTRY_SIZE)?)?;
-  if entries_end > table.len() {
-    return None;
-  }
-  for index in 0..record_count {
-    let entry_offset = entries_start + index * ENTRY_SIZE;
-    let entry_ppem = read_u16(entry_offset)?;
-    if entry_ppem > ppem {
-      break;
-    }
-    if entry_ppem == ppem {
-      let y_max = i32::from(read_u16(entry_offset + 2)? as i16);
-      let y_min = i32::from(read_u16(entry_offset + 4)? as i16);
-      if y_max <= 0 || y_min > 0 {
-        return None;
-      }
-      return Some(GdiVerticalDeviceMetrics {
-        ascent: y_max,
-        descent: y_min.saturating_abs(),
-      });
-    }
-  }
-  None
 }
 
 /// Destination class used by GDI when selecting a glyph bitmap format.
@@ -6361,6 +6294,21 @@ impl EmfVectorState {
     });
   }
 
+  fn fill_path(&mut self, path: &EmfPlusRenderPath) {
+    let Some(color) = self.current_brush else {
+      return;
+    };
+    let mapped = self.map_path_contours(path);
+    let contours = mapped.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let width = self.width;
+    let height = self.height;
+    visit_path_scanline_spans(&contours, width, height, |y, start, end| {
+      for x in start..end {
+        self.set_vector_pixel(x as i32, y as i32, color);
+      }
+    });
+  }
+
   fn fill_polygon_with_wmf_pattern(
     &mut self,
     points: &[EmfPoint],
@@ -6406,6 +6354,37 @@ impl EmfVectorState {
         self.set_pixel_with_alpha(x as i32, y as i32, color.color, color.alpha);
       }
     });
+  }
+
+  fn fill_path_with_emf_plus_brush(
+    &mut self,
+    path: &EmfPlusRenderPath,
+    brush: &EmfPlusRenderBrush,
+  ) {
+    let mapped = self.map_path_contours(path);
+    let contours = mapped.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let width = self.width;
+    let height = self.height;
+    visit_path_scanline_spans(&contours, width, height, |y, start, end| {
+      for x in start..end {
+        let color = brush.color_at(x as i32, y as i32);
+        self.set_pixel_with_alpha(x as i32, y as i32, color.color, color.alpha);
+      }
+    });
+  }
+
+  fn map_path_contours(&self, path: &EmfPlusRenderPath) -> Vec<Vec<(f32, f32)>> {
+    path
+      .subpaths
+      .iter()
+      .map(|subpath| {
+        subpath
+          .points
+          .iter()
+          .map(|point| self.map_point(*point))
+          .collect()
+      })
+      .collect()
   }
 
   fn draw_polyline(&mut self, points: &[EmfPoint], closed: bool) {
@@ -9184,18 +9163,20 @@ fn process_emf_plus_record(
     }
     EmfPlusRecordData::FillPath(value) => {
       if let Some(brush) = emf_plus_brush_ref(value.brush, state)
-        && let Some(points) = emf_plus_path_points(value.object_id, state)
+        && let Some(path) = emf_plus_path(value.object_id, state)
       {
-        state.fill_polygon_with_emf_plus_brush(&points, &brush);
+        state.fill_path_with_emf_plus_brush(&path, &brush);
       }
     }
     EmfPlusRecordData::DrawPath(value) => {
       if let Some(pen) = emf_plus_pen(value.pen_id, state)
-        && let Some(points) = emf_plus_path_points(value.object_id, state)
+        && let Some(path) = emf_plus_path(value.object_id, state)
       {
         let old = state.current_pen;
         state.current_pen = Some(pen);
-        state.draw_polyline(&points, true);
+        for subpath in path.subpaths {
+          state.draw_polyline(&subpath.points, subpath.closed);
+        }
         state.current_pen = old;
       }
     }
@@ -9240,13 +9221,15 @@ fn process_emf_plus_record(
         .emf_plus_objects
         .iter()
         .filter_map(|object| match object {
-          Some(EmfPlusRenderObject::Path(points)) => Some(points.clone()),
+          Some(EmfPlusRenderObject::Path(path)) => Some(path.clone()),
           _ => None,
         })
         .collect::<Vec<_>>();
-      for points in paths {
-        state.fill_polygon(&points);
-        state.draw_polyline(&points, true);
+      for path in paths {
+        state.fill_path(&path);
+        for subpath in path.subpaths {
+          state.draw_polyline(&subpath.points, true);
+        }
       }
     }
     EmfPlusRecordData::DrawBeziers(value) => draw_emf_plus_beziers(value, state),
@@ -9361,9 +9344,7 @@ fn process_complete_emf_plus_object(value: EmfPlusObjectRecordData, state: &mut 
       EmfPlusRenderObject::Brush(emf_plus_brush_object(&brush))
     }
     Ok(EmfPlusObjectData::Pen(pen)) => EmfPlusRenderObject::Pen(emf_plus_pen_object(&pen)),
-    Ok(EmfPlusObjectData::Path(path)) => {
-      EmfPlusRenderObject::Path(emf_plus_path_object_points(&path))
-    }
+    Ok(EmfPlusObjectData::Path(path)) => EmfPlusRenderObject::Path(emf_plus_render_path(&path)),
     Ok(EmfPlusObjectData::Region(region)) => emf_plus_region_object(&region)
       .map(EmfPlusRenderObject::Region)
       .unwrap_or(EmfPlusRenderObject::Unsupported),
@@ -9705,41 +9686,65 @@ fn emf_plus_points_to_emf_points(points: &EmfPlusPointData) -> Vec<EmfPoint> {
   }
 }
 
-fn emf_plus_path_object_points(path: &EmfPlusPathObject) -> Vec<EmfPoint> {
+fn emf_plus_render_path(path: &EmfPlusPathObject) -> EmfPlusRenderPath {
   let points = emf_plus_points_to_emf_points(&path.points);
   let types = expanded_path_point_types(&path.point_types);
   if types.is_empty() {
-    return points;
+    return EmfPlusRenderPath {
+      subpaths: vec![EmfPlusRenderSubpath {
+        points,
+        closed: false,
+      }],
+    };
   }
-  let mut result = Vec::with_capacity(points.len());
+  let mut path = EmfPlusRenderPath::default();
+  let mut current = EmfPlusRenderSubpath {
+    points: Vec::new(),
+    closed: false,
+  };
   let mut index = 0usize;
   while index < points.len() && index < types.len() {
     let point = points[index];
     let point_type = types[index];
+    if point_type.path_point_type() == Some(EmfPlusPathPointType::Start) {
+      if !current.points.is_empty() {
+        path.subpaths.push(current);
+      }
+      current = EmfPlusRenderSubpath {
+        points: vec![point],
+        closed: point_type
+          .path_point_flags()
+          .contains(EmfPlusPathPointTypeFlags::CLOSE_SUBPATH),
+      };
+      index += 1;
+      continue;
+    }
     if point_type.path_point_type() == Some(EmfPlusPathPointType::Bezier)
       && index + 2 < points.len()
-      && let Some(start) = result.last().copied()
+      && let Some(start) = current.points.last().copied()
     {
-      result.extend(sample_cubic_bezier(
+      current.points.extend(sample_cubic_bezier(
         start,
         points[index],
         points[index + 1],
         points[index + 2],
       ));
+      current.closed = types[index + 2]
+        .path_point_flags()
+        .contains(EmfPlusPathPointTypeFlags::CLOSE_SUBPATH);
       index += 3;
       continue;
     }
-    result.push(point);
-    if point_type
+    current.points.push(point);
+    current.closed = point_type
       .path_point_flags()
-      .contains(EmfPlusPathPointTypeFlags::CLOSE_SUBPATH)
-      && let Some(first) = result.first().copied()
-    {
-      result.push(first);
-    }
+      .contains(EmfPlusPathPointTypeFlags::CLOSE_SUBPATH);
     index += 1;
   }
-  result
+  if !current.points.is_empty() {
+    path.subpaths.push(current);
+  }
+  path
 }
 
 fn flatten_bezier_sequence(points: &[EmfPoint]) -> Vec<EmfPoint> {
@@ -9862,11 +9867,15 @@ fn expanded_path_point_types(types: &EmfPlusPathPointTypes) -> Vec<EmfPlusPathPo
   }
 }
 
-fn emf_plus_path_points(id: u8, state: &EmfVectorState) -> Option<Vec<EmfPoint>> {
+fn emf_plus_path(id: u8, state: &EmfVectorState) -> Option<EmfPlusRenderPath> {
   match state.emf_plus_objects.get(id as usize)? {
-    Some(EmfPlusRenderObject::Path(points)) => Some(points.clone()),
+    Some(EmfPlusRenderObject::Path(path)) => Some(path.clone()),
     _ => None,
   }
+}
+
+fn emf_plus_path_points(id: u8, state: &EmfVectorState) -> Option<Vec<EmfPoint>> {
+  emf_plus_path(id, state).map(|path| path.flattened_points())
 }
 
 fn emf_plus_region(id: u8, state: &EmfVectorState) -> Option<EmfPlusRenderRegion> {
@@ -9896,7 +9905,8 @@ fn emf_plus_region_node(node: &crate::emfplus::EmfPlusRegionNode) -> Option<EmfP
     }
     crate::emfplus::EmfPlusRegionNodeData::Path(path) => path
       .path()
-      .map(emf_plus_path_object_points)
+      .map(emf_plus_render_path)
+      .map(|path| path.flattened_points())
       .map(EmfPlusRenderRegion::Polygon),
     crate::emfplus::EmfPlusRegionNodeData::Empty => Some(EmfPlusRenderRegion::Empty),
     crate::emfplus::EmfPlusRegionNodeData::Infinite => Some(EmfPlusRenderRegion::Infinite),
@@ -10969,18 +10979,29 @@ fn visit_polygon_scanline_spans(
   points: &[(f32, f32)],
   width: usize,
   height: usize,
+  visit: impl FnMut(usize, usize, usize),
+) {
+  visit_path_scanline_spans(std::slice::from_ref(&points), width, height, visit);
+}
+
+fn visit_path_scanline_spans(
+  contours: &[&[(f32, f32)]],
+  width: usize,
+  height: usize,
   mut visit: impl FnMut(usize, usize, usize),
 ) {
-  if points.len() < 3 || width == 0 || height == 0 {
+  if width == 0 || height == 0 {
     return;
   }
 
   let mut min_y = f32::INFINITY;
   let mut max_y = f32::NEG_INFINITY;
-  for &(_, y) in points {
-    if y.is_finite() {
-      min_y = min_y.min(y);
-      max_y = max_y.max(y);
+  for points in contours.iter().filter(|points| points.len() >= 3) {
+    for &(_, y) in *points {
+      if y.is_finite() {
+        min_y = min_y.min(y);
+        max_y = max_y.max(y);
+      }
     }
   }
   if !min_y.is_finite() || !max_y.is_finite() {
@@ -10997,12 +11018,14 @@ fn visit_polygon_scanline_spans(
   for y in start_y..end_y {
     let scan_y = y as f32 + 0.5;
     intersections.clear();
-    for index in 0..points.len() {
-      let (x1, y1) = points[index];
-      let (x2, y2) = points[(index + 1) % points.len()];
-      if (y1 <= scan_y && y2 > scan_y) || (y2 <= scan_y && y1 > scan_y) {
-        let t = (scan_y - y1) / (y2 - y1);
-        intersections.push(x1 + t * (x2 - x1));
+    for points in contours.iter().filter(|points| points.len() >= 3) {
+      for index in 0..points.len() {
+        let (x1, y1) = points[index];
+        let (x2, y2) = points[(index + 1) % points.len()];
+        if (y1 <= scan_y && y2 > scan_y) || (y2 <= scan_y && y1 > scan_y) {
+          let t = (scan_y - y1) / (y2 - y1);
+          intersections.push(x1 + t * (x2 - x1));
+        }
       }
     }
     intersections.sort_by(|a, b| a.total_cmp(b));
@@ -11811,6 +11834,7 @@ mod tests {
     EmfPlusGraphicsVersion, EmfPlusGraphicsVersionValue, EmfPlusHeaderData, EmfPlusRegionObject,
     EmfPlusSetPageTransformData, EmfPlusStream,
   };
+  use crate::font::GdiVerticalDeviceMetrics;
   use crate::wmf::{
     WmfColorRecord, WmfDibCreatePatternBrushRecord, WmfDibStretchBltRecord, WmfDibTarget,
     WmfExtTextOutRecord, WmfLogBrushObject, WmfMetafileType, WmfMetafileVersion,
@@ -14500,6 +14524,22 @@ mod tests {
   }
 
   #[test]
+  fn path_scanlines_apply_alternate_fill_across_subpaths() {
+    let outer = [(0.0, 0.0), (6.0, 0.0), (6.0, 6.0), (0.0, 6.0)];
+    let inner = [(2.0, 2.0), (4.0, 2.0), (4.0, 4.0), (2.0, 4.0)];
+    let mut filled = [[false; 6]; 6];
+
+    visit_path_scanline_spans(&[&outer, &inner], 6, 6, |y, start, end| {
+      filled[y][start..end].fill(true);
+    });
+
+    assert!(filled[1][1]);
+    assert!(!filled[2][2]);
+    assert!(!filled[3][3]);
+    assert!(filled[4][4]);
+  }
+
+  #[test]
   fn axis_aligned_polygon_clip_uses_the_same_pixel_center_bounds() {
     let points = [(2.2, 10.8), (5.2, 10.8), (5.2, 13.2), (2.2, 13.2)];
     assert_eq!(
@@ -14748,6 +14788,58 @@ mod tests {
       let image = image::load_from_memory(&decoded.data).unwrap().to_rgb8();
       assert_eq!(image.get_pixel(0, 0).0, [255, 255, 255]);
     }
+  }
+
+  #[test]
+  fn emf_plus_path_starts_preserve_independent_closed_subpaths() {
+    let point_type = |value| EmfPlusPathPointTypeValue::new(value).unwrap();
+    let path = EmfPlusPathObject {
+      version: EmfPlusGraphicsVersion::from_graphics_version(
+        EmfPlusGraphicsVersionValue::Version1_1,
+      ),
+      path_point_flags: u32::from(EmfPlusRecordFlags::COMPRESSED.bits()),
+      points: EmfPlusPointData::Compressed(vec![
+        crate::PointS { x: 0, y: 0 },
+        crate::PointS { x: 2, y: 0 },
+        crate::PointS { x: 2, y: 2 },
+        crate::PointS { x: 0, y: 2 },
+        crate::PointS { x: 4, y: 0 },
+        crate::PointS { x: 6, y: 0 },
+        crate::PointS { x: 6, y: 2 },
+        crate::PointS { x: 4, y: 2 },
+      ]),
+      point_types: EmfPlusPathPointTypes::Values(vec![
+        point_type(0x00),
+        point_type(0x01),
+        point_type(0x01),
+        point_type(0x81),
+        point_type(0x00),
+        point_type(0x01),
+        point_type(0x01),
+        point_type(0x81),
+      ]),
+      alignment_padding: Vec::new(),
+    };
+
+    let path = emf_plus_render_path(&path);
+
+    assert_eq!(path.subpaths.len(), 2);
+    assert!(path.subpaths.iter().all(|subpath| subpath.closed));
+    assert_eq!(
+      path
+        .subpaths
+        .iter()
+        .map(|subpath| subpath
+          .points
+          .iter()
+          .map(|point| (point.x, point.y))
+          .collect::<Vec<_>>())
+        .collect::<Vec<_>>(),
+      vec![
+        vec![(0, 0), (2, 0), (2, 2), (0, 2)],
+        vec![(4, 0), (6, 0), (6, 2), (4, 2)],
+      ]
+    );
   }
 
   #[test]

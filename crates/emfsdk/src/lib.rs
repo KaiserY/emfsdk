@@ -8,6 +8,7 @@ pub mod bitmap;
 pub mod common;
 pub mod emf;
 pub mod emfplus;
+pub mod font;
 #[cfg(feature = "render")]
 pub mod render;
 pub mod string;
