@@ -9,6 +9,7 @@ use skrifa::outline::{
   DrawSettings, HintingInstance, HintingOptions, OutlinePen, SmoothMode, Target,
 };
 use skrifa::prelude::{FontRef, LocationRef, MetadataProvider, Size as FontSize};
+use skrifa::raw::TableProvider;
 use skrifa::raw::types::Tag as FontTableTag;
 use std::collections::HashMap;
 use thiserror::Error;
@@ -18,6 +19,10 @@ use tiny_skia::{
 };
 
 mod area_raster;
+mod gdi_hinting;
+mod text_layer;
+
+pub use gdi_hinting::GdiNaturalMetrics;
 
 use area_raster::rasterize_nonzero_path;
 
@@ -200,6 +205,29 @@ pub struct WmfExternalHeader {
   pub reference_device_dpi_y: u32,
 }
 
+/// Reference DC used when a host converts WMF to EMF before GDI+ playback.
+///
+/// The logical DPI realizes METAFILEPICT's viewport. EMF's physical frame
+/// subsequently uses the separate Device/Millimeters ratio; rounding that
+/// ratio back to the logical DPI changes text positions. GDI+ maps this frame
+/// to the destination rectangle's last pixel coordinate, rather than its size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WmfConversionProfile {
+  pub dpi: [u32; 2],
+  pub device_pixels: [u32; 2],
+  pub device_millimeters: [u32; 2],
+}
+
+/// Coordinate quantization used by a host that lifts EMF text into fixed output.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EmfTextAdvanceQuantization {
+  #[default]
+  CumulativeOrigins,
+  /// Truncate each rotated logical Dx vector before measuring its length.
+  /// Word's VML EMF fixed-output adapter uses this cell-by-cell realization.
+  IndividualProjectedCells,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RenderOptions {
   pub target_width_px: Option<u32>,
@@ -297,6 +325,14 @@ pub struct RenderOptions {
   /// byte stream: a standard WMF does not contain `METAFILEPICT.xExt/yExt`.
   /// Placeable WMFs retain their authored header and EMFs retain `Frame`.
   pub wmf_external_header: Option<WmfExternalHeader>,
+  /// Reference DC geometry used by a host that imports WMF through
+  /// `SetWinMetaFileBits`. Natural text advances are measured on this device
+  /// and stored in logical units before the final raster playback. `None`
+  /// retains direct WMF playback. The physical frame and final pixel endpoint
+  /// also determine the imported text mapping, without resizing the surface.
+  pub wmf_conversion_profile: Option<WmfConversionProfile>,
+  /// Host policy for semantic EMF text extraction. Raster playback is unchanged.
+  pub emf_text_advance_quantization: EmfTextAdvanceQuantization,
 }
 
 impl RenderOptions {
@@ -358,7 +394,8 @@ pub type RenderResult<T> = std::result::Result<T, RenderError>;
 mod vector;
 
 pub use vector::{
-  MetafileVectorFill, MetafileVectorFillRule, MetafileVectorPoint, MetafileVectorScene,
+  MetafileVectorDraw, MetafileVectorDrawing, MetafileVectorFill, MetafileVectorFillRule,
+  MetafileVectorPoint, MetafileVectorScene, extract_metafile_vector_drawing_with_options,
   extract_metafile_vector_scene, extract_metafile_vector_scene_with_options,
 };
 
@@ -438,7 +475,7 @@ fn decode_transparent_metafile_as_raster(
   content_type: Option<&str>,
   options: RenderOptions,
 ) -> Result<Option<DecodedMetafile>, String> {
-  let uses_binary_coverage_surface = emf_uses_binary_coverage_surface(data)?;
+  let uses_binary_coverage_surface = metafile_uses_binary_coverage_surface(data)?;
   let mut black_options = options;
   black_options.transparent_background = false;
   black_options.background_color = Some([0; 3]);
@@ -566,6 +603,10 @@ pub struct MetafileTextRun {
   pub font_family: Option<String>,
   pub bold: bool,
   pub italic: bool,
+  /// The GDI text COLORREF, converted to RGB.
+  pub color: [u8; 3],
+  /// An axis-aligned DC clip, normalized as left/top/right/bottom edges.
+  pub clip: Option<[f32; 4]>,
   pub width: Option<f32>,
   /// Normalized distances between consecutive character-cell origins.
   ///
@@ -612,6 +653,13 @@ pub fn extract_metafile_text_runs(data: &[u8], content_type: Option<&str>) -> Ve
   extract_metafile_text_runs_with_options(data, content_type, RenderOptions::default())
 }
 
+/// Whether classic EMF text can be painted after the remaining graphics
+/// without changing their composition. Unsupported transforms, text modes,
+/// raster dependencies and later graphics covering text retain raster replay.
+pub fn metafile_text_can_be_lifted(data: &[u8], content_type: Option<&str>) -> bool {
+  looks_like_metafile(data, content_type) && is_emf(data) && text_layer::can_lift(data)
+}
+
 pub fn extract_metafile_text_runs_with_options(
   data: &[u8],
   content_type: Option<&str>,
@@ -621,13 +669,13 @@ pub fn extract_metafile_text_runs_with_options(
     return Vec::new();
   }
   if is_emf(data) {
-    return extract_emf_text_runs(data);
+    return extract_emf_text_runs(data, options);
   }
   if crate::wmf::looks_like_wmf(data) {
     if let Ok(Some(embedded)) = crate::wmf::embedded_enhanced_metafile(data) {
-      return extract_emf_text_runs(&embedded.data);
+      return extract_emf_text_runs(&embedded.data, options);
     }
-    return extract_wmf_text_runs(data, options.wmf_external_header);
+    return extract_wmf_text_runs(data, options);
   }
   Vec::new()
 }
@@ -695,11 +743,11 @@ pub fn extract_metafile_bitmap_layers_with_options(
   extract_wmf_bitmap_layers(data, options.wmf_external_header)
 }
 
-fn extract_emf_text_runs(data: &[u8]) -> Vec<MetafileTextRun> {
+fn extract_emf_text_runs(data: &[u8], options: RenderOptions) -> Vec<MetafileTextRun> {
   let Some(mut pos) = emf_header_record_size(data) else {
     return Vec::new();
   };
-  let mut state = match EmfTextState::new(data) {
+  let mut state = match EmfTextState::new(data, options.emf_text_advance_quantization) {
     Ok(state) => state,
     Err(_) => return Vec::new(),
   };
@@ -752,6 +800,30 @@ fn extract_emf_text_runs(data: &[u8]) -> Vec<MetafileTextRun> {
         state.text_alignment = WmfTextAlignmentModeFlags::from_bits_retain(
           read_u32(data, pos + 8).unwrap_or_default() as u16,
         );
+      }
+      EMR_SET_TEXT_COLOR if record_size >= 12 => {
+        let color = read_u32(data, pos + 8).unwrap_or_default();
+        state.text_color = [color as u8, (color >> 8) as u8, (color >> 16) as u8];
+      }
+      EMR_INTERSECT_CLIP_RECT if record_size >= 24 => {
+        let left_top = state.map_point(EmfPoint {
+          x: read_i32(data, pos + 8).unwrap_or_default(),
+          y: read_i32(data, pos + 12).unwrap_or_default(),
+        });
+        let right_bottom = state.map_point(EmfPoint {
+          x: read_i32(data, pos + 16).unwrap_or_default(),
+          y: read_i32(data, pos + 20).unwrap_or_default(),
+        });
+        let mut edges = [left_top.0, left_top.1, right_bottom.0, right_bottom.1];
+        if let Some(previous) = state.clip {
+          edges = [
+            edges[0].max(previous[0]),
+            edges[1].max(previous[1]),
+            edges[2].min(previous[2]),
+            edges[3].min(previous[3]),
+          ];
+        }
+        state.clip = Some(edges);
       }
       EMR_MOVE_TO_EX if record_size >= 16 => {
         state.current_pos = EmfPoint {
@@ -1285,6 +1357,8 @@ struct WmfTextSnapshot {
   current_pos_x: i32,
   current_pos_y: i32,
   current_font_height: i32,
+  current_font_raw_height: i32,
+  current_font_width: i32,
   current_font_escapement: i32,
   current_font_family: Option<String>,
   current_font_char_set: u8,
@@ -1295,8 +1369,14 @@ struct WmfTextSnapshot {
   text_alignment: WmfTextAlignmentModeFlags,
 }
 
+struct WmfTextAlignment {
+  flags: WmfTextAlignmentModeFlags,
+  logical_origin: Option<EmfPoint>,
+}
+
 #[derive(Clone, Debug)]
 struct WmfTextFont {
+  width: i32,
   height: i32,
   escapement: i32,
   family: Option<String>,
@@ -1307,6 +1387,7 @@ struct WmfTextFont {
 }
 
 struct WmfTextState {
+  conversion_canvas: Option<(f32, f32)>,
   natural_width: f32,
   natural_height: f32,
   window_org_x: i32,
@@ -1321,6 +1402,8 @@ struct WmfTextState {
   current_pos_y: i32,
   objects: Vec<Option<WmfTextFont>>,
   current_font_height: i32,
+  current_font_raw_height: i32,
+  current_font_width: i32,
   current_font_escapement: i32,
   current_font_family: Option<String>,
   current_font_char_set: u8,
@@ -1339,6 +1422,7 @@ impl WmfTextState {
     let (window_org_x, window_org_y, window_ext_x, window_ext_y) =
       wmf_initial_window(metafile, external_header);
     Self {
+      conversion_canvas: None,
       natural_width: window_ext_x.unsigned_abs().max(1) as f32,
       natural_height: window_ext_y.unsigned_abs().max(1) as f32,
       window_org_x,
@@ -1353,6 +1437,8 @@ impl WmfTextState {
       current_pos_y: 0,
       objects: vec![None; metafile.header.number_of_objects as usize],
       current_font_height: 12,
+      current_font_raw_height: 12,
+      current_font_width: 0,
       current_font_escapement: 0,
       current_font_family: None,
       current_font_char_set: crate::wmf::WmfCharacterSet::Ansi.raw(),
@@ -1369,6 +1455,7 @@ impl WmfTextState {
 
   fn insert_object(&mut self, font: Option<WmfTextFont>) {
     let object = font.unwrap_or(WmfTextFont {
+      width: 0,
       height: 0,
       escapement: 0,
       family: None,
@@ -1389,6 +1476,8 @@ impl WmfTextState {
       && font.height != 0
     {
       self.current_font_height = font.height.abs().max(7);
+      self.current_font_raw_height = font.height;
+      self.current_font_width = font.width;
       self.current_font_escapement = font.escapement;
       self.current_font_family = font.family.clone();
       self.current_font_char_set = font.char_set;
@@ -1412,6 +1501,8 @@ impl WmfTextState {
       current_pos_x: self.current_pos_x,
       current_pos_y: self.current_pos_y,
       current_font_height: self.current_font_height,
+      current_font_raw_height: self.current_font_raw_height,
+      current_font_width: self.current_font_width,
       current_font_escapement: self.current_font_escapement,
       current_font_family: self.current_font_family.clone(),
       current_font_char_set: self.current_font_char_set,
@@ -1438,6 +1529,8 @@ impl WmfTextState {
     self.current_pos_x = snapshot.current_pos_x;
     self.current_pos_y = snapshot.current_pos_y;
     self.current_font_height = snapshot.current_font_height;
+    self.current_font_raw_height = snapshot.current_font_raw_height;
+    self.current_font_width = snapshot.current_font_width;
     self.current_font_escapement = snapshot.current_font_escapement;
     self.current_font_family = snapshot.current_font_family;
     self.current_font_char_set = snapshot.current_font_char_set;
@@ -1470,6 +1563,29 @@ impl WmfTextState {
     }
     let scale_x = self.viewport_ext_x as f32 / self.window_ext_x as f32;
     let scale_y = self.viewport_ext_y as f32 / self.window_ext_y as f32;
+    let converted_advances = logical_advances
+      .is_none()
+      .then(|| {
+        let (width, height) = self.conversion_canvas?;
+        let font = WmfTextFont {
+          width: self.current_font_width,
+          height: self.current_font_raw_height,
+          escapement: self.current_font_escapement,
+          family: self.current_font_family.clone(),
+          char_set: self.current_font_char_set,
+          weight: self.current_font_weight,
+          italic: self.current_font_italic,
+          quality: self.current_font_quality,
+        };
+        self.font_cache.wmf_converted_advances(
+          &font,
+          &text,
+          width / self.natural_width * scale_x,
+          height / self.natural_height * scale_y,
+        )
+      })
+      .flatten();
+    let logical_advances = logical_advances.or(converted_advances.as_deref());
     let logical_width = logical_advances.map(|values| {
       values.iter().fold(0i32, |total, advance| {
         total.saturating_add(i32::from(*advance))
@@ -1527,6 +1643,7 @@ impl WmfTextState {
     let mapped_aligned_x = mapped_reference_x - alignment_shift as f32 * mapped_axis_x;
     let mapped_aligned_y = mapped_reference_y - alignment_shift as f32 * mapped_axis_y;
     let font = WmfTextFont {
+      width: 0,
       height: self.current_font_height,
       escapement: self.current_font_escapement,
       family: self.current_font_family.clone(),
@@ -1603,6 +1720,8 @@ impl WmfTextState {
       font_family: self.current_font_family.clone(),
       bold: self.current_font_bold,
       italic: self.current_font_italic,
+      color: [0; 3],
+      clip: None,
       width: advances
         .as_ref()
         .map(|values| values.iter().copied().sum::<f32>().abs())
@@ -1895,22 +2014,32 @@ fn same_wmf_dib_geometry(
     && first.src_height == second.src_height
 }
 
-fn full_wmf_dib_source(value: &crate::wmf::WmfDibStretchBltRecord) -> Option<RasterPixels> {
+fn wmf_dib_source(value: &crate::wmf::WmfDibStretchBltRecord) -> Option<RasterPixels> {
   let bytes = value.target.source_bytes()?;
   let image = packed_dib_to_rgb(bytes, DibColorUsage::RgbColors)
     .ok()
     .flatten()?;
-  // Keep partial source rectangles in the ordinary raster replay until their
-  // bottom-up DIB coordinate and mirroring semantics can be represented by a
-  // standalone layer without ambiguity. The transparent previews emitted by
-  // Office use the complete DIB here.
   let source_width = i32::from(value.src_width).unsigned_abs() as usize;
   let source_height = i32::from(value.src_height).unsigned_abs() as usize;
-  (value.x_src == 0
+  if value.x_src == 0
     && value.y_src == 0
     && source_width == image.width
-    && source_height == image.height)
-    .then_some(image)
+    && source_height == image.height
+  {
+    return Some(image);
+  }
+  // The decoded DIB is top-down. WMF source coordinates select its upper-left
+  // rectangle, including the upper plane of a double-height icon mask.
+  // Signed partial rectangles retain the ordinary raster fallback.
+  crop_raster_pixels(
+    &image,
+    (
+      i32::from(value.x_src),
+      i32::from(value.y_src),
+      i32::from(value.src_width),
+      i32::from(value.src_height),
+    ),
+  )
 }
 
 fn wmf_masked_bitmap_pair(
@@ -1931,11 +2060,11 @@ fn wmf_masked_bitmap_pair(
     ) => false,
     _ => return None,
   };
-  let mask = full_wmf_dib_source(first)?;
+  let mask = wmf_dib_source(first)?;
   if !is_binary_monochrome_raster(&mask) {
     return None;
   }
-  let source = full_wmf_dib_source(second)?;
+  let source = wmf_dib_source(second)?;
   if source.width != mask.width || source.height != mask.height {
     return None;
   }
@@ -1994,7 +2123,7 @@ fn wmf_copy_bitmap_layer(
   if value.raster_operation_code() != WmfTernaryRasterOperationCode::SRCCOPY {
     return None;
   }
-  let source = full_wmf_dib_source(value)?;
+  let source = wmf_dib_source(value)?;
   let (x, y, width, height, mapped_flip_horizontal, mapped_flip_vertical) = state.normalized_rect(
     i32::from(value.x_dest),
     i32::from(value.y_dest),
@@ -2152,6 +2281,7 @@ fn wmf_text_font(value: &crate::wmf::WmfFontObject) -> WmfTextFont {
     value.char_set
   };
   WmfTextFont {
+    width: i32::from(value.width),
     height: i32::from(value.height),
     escapement: i32::from(value.escapement),
     family,
@@ -2162,14 +2292,12 @@ fn wmf_text_font(value: &crate::wmf::WmfFontObject) -> WmfTextFont {
   }
 }
 
-fn extract_wmf_text_runs(
-  data: &[u8],
-  external_header: Option<WmfExternalHeader>,
-) -> Vec<MetafileTextRun> {
+fn extract_wmf_text_runs(data: &[u8], options: RenderOptions) -> Vec<MetafileTextRun> {
   let Ok(metafile) = WmfMetafileRef::from_bytes(data) else {
     return Vec::new();
   };
-  let mut state = WmfTextState::new(&metafile, external_header);
+  let mut state = WmfTextState::new(&metafile, options.wmf_external_header);
+  state.conversion_canvas = wmf_conversion_canvas_size(&metafile, options);
   let mut runs = Vec::new();
   let mut requires_raster_backdrop = false;
   for record in metafile.records() {
@@ -2494,6 +2622,7 @@ fn emf_pen_from_style(style: u32, pen: EmfPen) -> Option<EmfPen> {
 #[derive(Clone, Debug)]
 struct EmfFont {
   height: i32,
+  escapement: i32,
   family: Option<String>,
   char_set: u8,
   weight: u16,
@@ -2516,6 +2645,8 @@ struct EmfTextSnapshot {
   current_pos: EmfPoint,
   current_font: Option<u32>,
   text_alignment: WmfTextAlignmentModeFlags,
+  text_color: [u8; 3],
+  clip: Option<[f32; 4]>,
 }
 
 struct EmfTextState {
@@ -2539,12 +2670,15 @@ struct EmfTextState {
   fonts: std::collections::HashMap<u32, EmfFont>,
   current_font: Option<u32>,
   text_alignment: WmfTextAlignmentModeFlags,
+  text_color: [u8; 3],
+  clip: Option<[f32; 4]>,
   saved: Vec<EmfTextSnapshot>,
   font_cache: RenderFontCache,
+  advance_quantization: EmfTextAdvanceQuantization,
 }
 
 impl EmfTextState {
-  fn new(data: &[u8]) -> Result<Self, String> {
+  fn new(data: &[u8], advance_quantization: EmfTextAdvanceQuantization) -> Result<Self, String> {
     let geometry = emf_playback_geometry(data)?;
 
     Ok(Self {
@@ -2568,8 +2702,11 @@ impl EmfTextState {
       fonts: std::collections::HashMap::new(),
       current_font: None,
       text_alignment: WmfTextAlignmentModeFlags::empty(),
+      text_color: [0; 3],
+      clip: None,
       saved: Vec::new(),
       font_cache: RenderFontCache::load(),
+      advance_quantization,
     })
   }
 
@@ -2588,6 +2725,8 @@ impl EmfTextState {
       current_pos: self.current_pos,
       current_font: self.current_font,
       text_alignment: self.text_alignment,
+      text_color: self.text_color,
+      clip: self.clip,
     });
   }
 
@@ -2608,10 +2747,21 @@ impl EmfTextState {
     self.current_pos = snapshot.current_pos;
     self.current_font = snapshot.current_font;
     self.text_alignment = snapshot.text_alignment;
+    self.text_color = snapshot.text_color;
+    self.clip = snapshot.clip;
   }
 
   fn map_point(&self, point: EmfPoint) -> (f32, f32) {
-    let (x, y) = self.world_transform.apply(point);
+    self.map_text_point(point.x as f32, point.y as f32)
+  }
+
+  fn map_text_point(&self, logical_x: f32, logical_y: f32) -> (f32, f32) {
+    let x = logical_x * self.world_transform.m11
+      + logical_y * self.world_transform.m21
+      + self.world_transform.dx;
+    let y = logical_x * self.world_transform.m12
+      + logical_y * self.world_transform.m22
+      + self.world_transform.dy;
     let (scale_x, scale_y) = emf_window_viewport_scale(
       self.map_mode,
       self.window_ext_x,
@@ -2650,8 +2800,8 @@ impl EmfTextState {
     };
     let origin = self.map_point(logical_origin);
     let endpoint = self.map_point(endpoint);
-    let x = endpoint.0.round() - origin.0.round();
-    let y = endpoint.1.round() - origin.1.round();
+    let x = gdi_device_coordinate(endpoint.0) - gdi_device_coordinate(origin.0);
+    let y = gdi_device_coordinate(endpoint.1) - gdi_device_coordinate(origin.1);
     x.hypot(y).copysign(logical_width as f32)
   }
 
@@ -2677,6 +2827,14 @@ impl EmfTextState {
         y: text_record.y,
       }
     };
+    let selected_font = self
+      .current_font
+      .and_then(|id| self.fonts.get(&id))
+      .cloned();
+    let angle =
+      (selected_font.as_ref().map_or(0, |font| font.escapement) as f32 / 10.0).to_radians();
+    let (axis_x, axis_y) = (angle.cos(), -angle.sin());
+    let (normal_x, normal_y) = (angle.sin(), angle.cos());
     let aligned_x = if self
       .text_alignment
       .contains(WmfTextAlignmentModeFlags::CENTER)
@@ -2694,19 +2852,16 @@ impl EmfTextState {
     } else {
       reference.x
     };
-    let (x, reference_y) = self.map_point(EmfPoint {
-      x: aligned_x,
-      y: reference.y,
-    });
-    let selected_font = self
-      .current_font
-      .and_then(|id| self.fonts.get(&id))
-      .cloned();
+    let alignment_shift = reference.x.saturating_sub(aligned_x) as f32;
+    let logical_x = reference.x as f32 - alignment_shift * axis_x;
+    let logical_y = reference.y as f32 - alignment_shift * axis_y;
+    let (mut x, reference_y) = self.map_text_point(logical_x, logical_y);
     let current_font = selected_font
       .as_ref()
       .map(|font| WmfTextFont {
+        width: 0,
         height: font.height,
-        escapement: 0,
+        escapement: font.escapement,
         family: font.family.clone(),
         char_set: font.char_set,
         weight: font.weight,
@@ -2714,6 +2869,7 @@ impl EmfTextState {
         quality: font.quality,
       })
       .unwrap_or(WmfTextFont {
+        width: 0,
         height: 12,
         escapement: 0,
         family: None,
@@ -2722,40 +2878,98 @@ impl EmfTextState {
         italic: false,
         quality: crate::wmf::WmfFontQuality::Default.raw(),
       });
-    let font_size = self.map_height(current_font.height);
+    let mapped_axis_origin = self.map_text_point(0.0, 0.0);
+    let mapped_axis_point = self.map_text_point(axis_x, axis_y);
+    let mapped_normal_point = self.map_text_point(normal_x, normal_y);
+    let mapped_axis = (
+      mapped_axis_point.0 - mapped_axis_origin.0,
+      mapped_axis_point.1 - mapped_axis_origin.1,
+    );
+    let mapped_normal = (
+      mapped_normal_point.0 - mapped_axis_origin.0,
+      mapped_normal_point.1 - mapped_axis_origin.1,
+    );
+    let normal_length = mapped_normal.0.hypot(mapped_normal.1).max(f32::EPSILON);
+    let rotated = current_font.escapement != 0;
+    let font_size = if rotated {
+      current_font.height.unsigned_abs() as f32 * normal_length
+    } else {
+      self.map_height(current_font.height)
+    };
     // [MS-EMF] 2.3.11.25 and 2.3.5 define these as reference coordinates.
     // Their meaning comes from EMR_SETTEXTALIGN, so semantic text must use
     // the same aligned origin and realized-font baseline as vector replay.
-    let y = self.font_cache.baseline_for_alignment(
+    let baseline_y = self.font_cache.baseline_for_alignment(
       &current_font,
       font_size.round().max(1.0),
       reference_y.round(),
       self.text_alignment,
     );
+    let y = if rotated {
+      let shift = baseline_y - reference_y.round();
+      x += shift * mapped_normal.0 / normal_length;
+      reference_y + shift * mapped_normal.1 / normal_length
+    } else {
+      baseline_y
+    };
+    let mapped_distance = |width: i64| {
+      if !rotated {
+        return self.map_horizontal_distance(
+          EmfPoint {
+            x: aligned_x,
+            y: reference.y,
+          },
+          width,
+        );
+      }
+      let origin = self.map_text_point(logical_x, logical_y);
+      let endpoint = self.map_text_point(
+        logical_x + width as f32 * axis_x,
+        logical_y + width as f32 * axis_y,
+      );
+      let dx = gdi_device_coordinate(endpoint.0) - gdi_device_coordinate(origin.0);
+      let dy = gdi_device_coordinate(endpoint.1) - gdi_device_coordinate(origin.1);
+      dx.hypot(dy).copysign(width as f32)
+    };
     let advances = logical_advances.as_deref().map(|values| {
+      if rotated
+        && self.advance_quantization == EmfTextAdvanceQuantization::IndividualProjectedCells
+      {
+        // Native Word PDF/XPS angle and authored-Dx controls establish this
+        // conversion boundary: quantize each logical cell's two components,
+        // then map its vector. Accumulating before truncation preserves a
+        // residue that Word's EMF adapter has already discarded.
+        return values
+          .iter()
+          .map(|advance| {
+            let advance = *advance as f32;
+            let origin = self.map_text_point(0.0, 0.0);
+            let endpoint =
+              self.map_text_point((advance * axis_x).trunc(), (advance * axis_y).trunc());
+            let (dx, dy) = (endpoint.0 - origin.0, endpoint.1 - origin.1);
+            dx.hypot(dy).copysign(advance) / self.width.max(1) as f32
+          })
+          .collect();
+      }
       cumulative_mapped_advances(values, |logical_cumulative| {
         // Wine win32u/font.c ExtTextOutW follows GDI's integer device-grid
         // contract: accumulate authored Dx in logical units, map that total
         // through LPtoDP (GDI_ROUND), then subtract the preceding mapped
         // total.  Rounding only after normalization lets fractional residue
         // leak between character-cell origins.
-        self
-          .map_horizontal_distance(
-            EmfPoint {
-              x: aligned_x,
-              y: reference.y,
-            },
-            logical_cumulative,
-          )
-          .round()
-          / self.width.max(1) as f32
+        let distance = mapped_distance(logical_cumulative);
+        // LPtoDP has already rounded both coordinates. A rotated baseline
+        // keeps the Euclidean distance between those device origins; rounding
+        // that distance again shortens diagonal character cells.
+        let distance = if rotated { distance } else { distance.round() };
+        distance / self.width.max(1) as f32
       })
     });
     let run = MetafileTextRun {
       text,
       x: x / self.width.max(1) as f32,
       y: y / self.height.max(1) as f32,
-      rotation_degrees: 0.0,
+      rotation_degrees: mapped_axis.1.atan2(mapped_axis.0).to_degrees(),
       font_size: selected_font
         .as_ref()
         .map(|_| font_size / self.height.max(1) as f32),
@@ -2771,6 +2985,15 @@ impl EmfTextState {
         .current_font
         .and_then(|id| self.fonts.get(&id))
         .is_some_and(|font| font.italic),
+      color: self.text_color,
+      clip: self.clip.map(|edges| {
+        [
+          edges[0] / self.width.max(1) as f32,
+          edges[1] / self.height.max(1) as f32,
+          edges[2] / self.width.max(1) as f32,
+          edges[3] / self.height.max(1) as f32,
+        ]
+      }),
       // [MS-EMF] §2.2.5 defines Dx as the logical spacing between
       // consecutive character-cell origins. Map that logical distance
       // through the current page/world transform, then normalize it against
@@ -2778,15 +3001,7 @@ impl EmfTextState {
       // using it as the canvas makes identical text wider whenever a
       // metafile happens to have tighter ink bounds.
       width: logical_width
-        .map(|width| {
-          self.map_horizontal_distance(
-            EmfPoint {
-              x: aligned_x,
-              y: reference.y,
-            },
-            i64::from(width),
-          ) / self.width.max(1) as f32
-        })
+        .map(|width| mapped_distance(i64::from(width)) / self.width.max(1) as f32)
         .filter(|width| width.is_finite() && *width > 0.0),
       advances,
       requires_raster_backdrop: false,
@@ -2796,8 +3011,10 @@ impl EmfTextState {
       // alignment first shifts the text rectangle, then TA_UPDATECP moves to
       // that rectangle's final authored character-cell origin.
       self.current_pos = EmfPoint {
-        x: aligned_x.saturating_add(displacement.x),
-        y: reference.y.saturating_add(displacement.y),
+        x: (logical_x + displacement.x as f32 * axis_x + displacement.y as f32 * normal_x).round()
+          as i32,
+        y: (logical_y + displacement.x as f32 * axis_y + displacement.y as f32 * normal_y).round()
+          as i32,
       };
     }
     Some(run)
@@ -3102,9 +3319,47 @@ enum GdiGlyphFormat {
   Monochrome,
   Grayscale,
   Lcd,
+  LcdSymmetric,
 }
 
 const GDI_CLEARTYPE_X_SAMPLES: i32 = 6;
+
+impl GdiGlyphFormat {
+  fn is_lcd(self) -> bool {
+    matches!(self, Self::Lcd | Self::LcdSymmetric)
+  }
+}
+
+/// GDI's symmetric ClearType choice for a physical ppem. Version 1 gasp
+/// requests one-row sampling when symmetric grid fitting is enabled without
+/// symmetric smoothing. Missing/legacy tables retain the device default.
+/// Native uninstructed rectangle controls cover all sixteen version-1 flags.
+fn gdi_cleartype_symmetric_smoothing(gasp: Option<&[u8]>, ppem: u16) -> bool {
+  let Some(table) = gasp else {
+    return true;
+  };
+  let word = |offset: usize| -> Option<u16> {
+    Some(u16::from_be_bytes(
+      table.get(offset..offset + 2)?.try_into().ok()?,
+    ))
+  };
+  if word(0) != Some(1) {
+    return true;
+  }
+  let Some(count) = word(2) else {
+    return true;
+  };
+  for index in 0..usize::from(count) {
+    let offset = 4 + index * 4;
+    let Some(maximum) = word(offset) else {
+      return true;
+    };
+    if ppem <= maximum {
+      return word(offset + 2).is_none_or(|flags| flags & 0x000c != 0x0004);
+    }
+  }
+  true
+}
 
 impl GdiTextSurface {
   fn glyph_format(self, quality: u8) -> GdiGlyphFormat {
@@ -3148,8 +3403,8 @@ struct TextRenderRequest<'a> {
   x: f32,
   baseline_y: f32,
   rotation_degrees: f32,
-  /// Font mapper size used by the TrueType interpreter before the DC
-  /// transform is applied.
+  /// Physical font height before the font's ppem policy is applied.
+  /// LCD rendering retains fractional mapped sizes until interpretation.
   hinting_height: f32,
   /// Device height retained for alignment and the built-in fallback font.
   height: f32,
@@ -3157,16 +3412,151 @@ struct TextRenderRequest<'a> {
   horizontal_scale: f32,
   vertical_scale: f32,
   advances: Option<&'a [f32]>,
+  /// Alignment still to apply when WMF supplies no explicit character widths.
+  natural_alignment: WmfTextAlignmentModeFlags,
   surface: GdiTextSurface,
 }
 
 impl RenderFontCache {
+  fn logical_font_width_scale(&mut self, font: &WmfTextFont) -> f32 {
+    if font.width == 0 || font.height == 0 {
+      return 1.0;
+    }
+    let scale = self.resolve_face(font).and_then(|face_data| {
+      let face = FontRef::from_index(face_data.font_data.as_ref(), face_data.face_index).ok()?;
+      let os2 = face.os2().ok()?;
+      let units_per_em = face.head().ok()?.units_per_em();
+      let average = os2.x_avg_char_width().unsigned_abs();
+      if average == 0 || units_per_em == 0 {
+        return None;
+      }
+      // LOGFONT Width is the requested average character width, not the em
+      // width. GDI scales the face's OS/2 xAvgCharWidth to this logical width;
+      // window/viewport scaling is applied independently at the consumer.
+      // Native SetWinMetaFileBits controls preserve 0/25/50/100 widths.
+      Some(
+        font.width.unsigned_abs() as f32 * f32::from(units_per_em)
+          / (font.height.unsigned_abs() as f32 * f32::from(average)),
+      )
+    });
+    scale
+      .filter(|scale| scale.is_finite() && *scale > 0.0)
+      .unwrap_or(1.0)
+  }
+
+  fn wmf_converted_advances(
+    &mut self,
+    font: &WmfTextFont,
+    text: &str,
+    scale_x: f32,
+    scale_y: f32,
+  ) -> Option<Vec<i16>> {
+    if font.height >= 0 {
+      return None;
+    }
+    let angle = (font.escapement as f32 / 10.0).to_radians();
+    let (axis_x, axis_y) = (angle.cos(), -angle.sin());
+    let baseline_scale = (axis_x * scale_x).hypot(axis_y * scale_y);
+    let normal_scale = (axis_y * scale_x).hypot(axis_x * scale_y);
+    if baseline_scale <= f32::EPSILON || normal_scale <= f32::EPSILON {
+      return None;
+    }
+    let ppem = (font.height.unsigned_abs() as f32 * normal_scale)
+      .round()
+      .max(1.0);
+    let font_width_scale = self.logical_font_width_scale(font);
+    let horizontal_ppem = ppem * font_width_scale * baseline_scale / normal_scale;
+    let horizontal_ppem = if font.width == 0 {
+      horizontal_ppem.round()
+    } else {
+      horizontal_ppem
+    }
+    .max(1.0);
+    let advances = self.character_advances(font, text, horizontal_ppem)?;
+    // SetWinMetaFileBits records differences of cumulative device-to-logical
+    // positions. Rounding each width independently would accumulate error.
+    wmf_logical_advances(&advances, baseline_scale)
+  }
+
+  fn character_advances(&mut self, font: &WmfTextFont, text: &str, ppem: f32) -> Option<Vec<f32>> {
+    let face_data = self.resolve_face(font)?.clone();
+    let face = FontRef::from_index(face_data.font_data.as_ref(), face_data.face_index).ok()?;
+    let location = face
+      .axes()
+      .location(face_data.synthesis.variation_settings().iter().copied());
+    if font.width != 0 {
+      // A requested LOGFONT average width stretches the realized face. GDI
+      // rounds each scaled design advance, without re-hinting it at an
+      // independently rounded horizontal ppem. In particular Arial -148/25
+      // at 280/2873 maps 'P' to four pixels; a separate 5-ppem face gives three.
+      let metrics = face.glyph_metrics(FontSize::new(ppem), LocationRef::from(&location));
+      let charmap = face.charmap();
+      return text
+        .chars()
+        .map(|ch| Some(metrics.advance_width(charmap.map(ch)?)?.round()))
+        .collect();
+    }
+    let outlines = face.outline_glyphs();
+    let key = RenderHintingKey {
+      font: RenderFontKey {
+        family: font.family.clone(),
+        weight: font.weight,
+        italic: font.italic,
+      },
+      pixel_height_bits: ppem.to_bits(),
+      format: GdiGlyphFormat::Monochrome,
+    };
+    if !self.hinting_instances.contains_key(&key) {
+      let hinting = HintingInstance::new(
+        &outlines,
+        FontSize::new(ppem),
+        LocationRef::from(&location),
+        HintingOptions {
+          engine: Default::default(),
+          target: Target::Mono,
+        },
+      )
+      .ok()?;
+      self.hinting_instances.insert(key.clone(), hinting);
+    }
+    let hinting = self.hinting_instances.get(&key)?;
+    let charmap = face.charmap();
+    let metrics = face.glyph_metrics(FontSize::new(ppem), LocationRef::from(&location));
+    let synthetic_advance = if face_data.synthesis.embolden() && font.weight > 550 {
+      1.0
+    } else {
+      0.0
+    };
+    text
+      .chars()
+      .map(|ch| {
+        let glyph_id = charmap.map(ch)?;
+        let hinted_advance = outlines.get(glyph_id).and_then(|outline| {
+          outline
+            .draw(
+              DrawSettings::hinted(hinting, false),
+              &mut skrifa::raw::model::pen::NullPen,
+            )
+            .ok()?
+            .advance_width
+        });
+        Some(
+          hinted_advance
+            .or_else(|| metrics.advance_width(glyph_id))?
+            .round()
+            + synthetic_advance,
+        )
+      })
+      .collect()
+  }
+
   fn load() -> Self {
+    let collection = FontCollection::new(FontCollectionOptions {
+      shared: false,
+      system_fonts: true,
+    });
     Self {
-      collection: FontCollection::new(FontCollectionOptions {
-        shared: false,
-        system_fonts: true,
-      }),
+      collection,
       source_cache: SourceCache::default(),
       faces: HashMap::new(),
       hinting_instances: HashMap::new(),
@@ -3280,7 +3670,17 @@ impl RenderFontCache {
     let data = face_data.font_data.as_ref();
     let face = FontRef::from_index(data, face_data.face_index).ok()?;
     let vertical_ppem = request.hinting_height.max(1.0);
-    let format = request.surface.glyph_format(request.font.quality);
+    let mut format = request.surface.glyph_format(request.font.quality);
+    if format.is_lcd()
+      && gdi_cleartype_symmetric_smoothing(
+        face
+          .table_data(FontTableTag::new(b"gasp"))
+          .map(|data| data.as_bytes()),
+        vertical_ppem.round().clamp(1.0, f32::from(u16::MAX)) as u16,
+      )
+    {
+      format = GdiGlyphFormat::LcdSymmetric;
+    }
     let requested_horizontal_scale = if request.horizontal_scale.is_finite() {
       request.horizontal_scale.abs()
     } else {
@@ -3289,15 +3689,15 @@ impl RenderFontCache {
     let horizontal_device_ppem =
       gdi_realized_font_metric(vertical_ppem * requested_horizontal_scale).max(1.0);
     let horizontal_advance_scale = horizontal_device_ppem / vertical_ppem;
-    let horizontal_outline_samples = if format == GdiGlyphFormat::Lcd {
-      GDI_CLEARTYPE_X_SAMPLES as f32
+    // Hint at the physical font size, before the LCD sampling transform.
+    // In particular, TrueType head.flags FORCE_INTEGER_PPEM applies here,
+    // not to a fictitious font six times as large. The interpreter also
+    // needs the physical MPPEM for size-dependent instructions.
+    let horizontal_outline_ppem = if format.is_lcd() {
+      (vertical_ppem * requested_horizontal_scale).max(1.0)
     } else {
-      1.0
+      horizontal_device_ppem
     };
-    let horizontal_outline_ppem = gdi_realized_font_metric(
-      vertical_ppem * requested_horizontal_scale * horizontal_outline_samples,
-    )
-    .max(1.0);
     let vertical_scale = if request.vertical_scale.is_finite() {
       request.vertical_scale.abs()
     } else {
@@ -3322,11 +3722,6 @@ impl RenderFontCache {
       pixel_height_bits: vertical_ppem.to_bits(),
       format,
     };
-    let horizontal_device_hinting_key = RenderHintingKey {
-      font: font_key.clone(),
-      pixel_height_bits: horizontal_device_ppem.to_bits(),
-      format,
-    };
     let horizontal_outline_hinting_key = RenderHintingKey {
       font: font_key,
       pixel_height_bits: horizontal_outline_ppem.to_bits(),
@@ -3335,18 +3730,16 @@ impl RenderFontCache {
     let target = match format {
       GdiGlyphFormat::Monochrome => Target::Mono,
       GdiGlyphFormat::Grayscale => SmoothMode::Normal.into(),
-      GdiGlyphFormat::Lcd => Target::Smooth {
+      GdiGlyphFormat::Lcd | GdiGlyphFormat::LcdSymmetric => Target::Smooth {
         mode: SmoothMode::Lcd,
-        // Classic GDI exposes rasterizer version 37: ClearType is enabled,
-        // but the version-40 symmetric-rendering GETINFO bit is not.  The
-        // output is consequently 6x1 rather than the later 6x5 mode.
-        symmetric_rendering: false,
+        // Hinting and scan conversion must agree on the symmetric mode
+        // reported to the font through GETINFO.
+        symmetric_rendering: format == GdiGlyphFormat::LcdSymmetric,
         preserve_linear_metrics: false,
       },
     };
     for (hinting_key, ppem) in [
       (&vertical_hinting_key, vertical_ppem),
-      (&horizontal_device_hinting_key, horizontal_device_ppem),
       (&horizontal_outline_hinting_key, horizontal_outline_ppem),
     ] {
       if self.hinting_instances.contains_key(hinting_key) {
@@ -3355,22 +3748,49 @@ impl RenderFontCache {
       // Wine maps GGO_BITMAP to FT_LOAD_TARGET_MONO, GGO_GRAY* to
       // FT_LOAD_TARGET_NORMAL and horizontal subpixel output to
       // FT_LOAD_TARGET_LCD. Skrifa exposes those interpreter targets
-      // directly; the high-resolution X instance above supplies the separate
-      // six-sample grid used by classic GDI ClearType.
-      // Rasterization below independently maps the result to the six-sample
-      // color-filter grid.
+      // directly. Rasterization expands the hinted physical outline onto
+      // the six-sample color-filter grid only after bytecode execution.
       let hinting = HintingInstance::new(
         &outlines,
         FontSize::new(ppem),
         LocationRef::from(&location),
         HintingOptions {
-          engine: Default::default(),
+          // GDI uses the font's instructions, including its ppem policy;
+          // it does not replace an uninstructed TrueType glyph with the
+          // automatic hinter's independently fitted outline.
+          engine: if format.is_lcd() {
+            skrifa::outline::Engine::Interpreter
+          } else {
+            Default::default()
+          },
           target,
         },
       )
       .ok()?;
       self.hinting_instances.insert(hinting_key.clone(), hinting);
     }
+    let gdi_vertical = format
+      .is_lcd()
+      .then(|| {
+        gdi_hinting::GdiHinting::new(
+          &face,
+          vertical_ppem,
+          format == GdiGlyphFormat::LcdSymmetric,
+          request.font.quality != 6,
+        )
+      })
+      .flatten();
+    let gdi_horizontal = (format.is_lcd()
+      && horizontal_outline_hinting_key != vertical_hinting_key)
+      .then(|| {
+        gdi_hinting::GdiHinting::new(
+          &face,
+          horizontal_outline_ppem,
+          format == GdiGlyphFormat::LcdSymmetric,
+          request.font.quality != 6,
+        )
+      })
+      .flatten();
     let rotation_radians = request.rotation_degrees.to_radians();
     let baseline_axis_x = rotation_radians.cos();
     let baseline_axis_y = rotation_radians.sin();
@@ -3408,27 +3828,23 @@ impl RenderFontCache {
       };
       let (_, vertical_path) =
         draw_hinted_path(self.hinting_instances.get(&vertical_hinting_key)?)?;
-      let (adjusted_metrics, horizontal_device_path) =
-        draw_hinted_path(self.hinting_instances.get(&horizontal_device_hinting_key)?)?;
-      let horizontal_outline_path =
-        if horizontal_outline_hinting_key == horizontal_device_hinting_key {
-          horizontal_device_path
-        } else {
-          draw_hinted_path(
-            self
-              .hinting_instances
-              .get(&horizontal_outline_hinting_key)?,
-          )?
-          .1
-        };
+      let (adjusted_metrics, horizontal_path) = draw_hinted_path(
+        self
+          .hinting_instances
+          .get(&horizontal_outline_hinting_key)?,
+      )?;
+      let vertical_path = gdi_vertical
+        .as_ref()
+        .and_then(|hinting| hinting.draw(&face, glyph_id))
+        .unwrap_or(vertical_path);
+      let horizontal_path = gdi_horizontal
+        .as_ref()
+        .and_then(|hinting| hinting.draw(&face, glyph_id))
+        .unwrap_or(horizontal_path);
       let path = if horizontal_outline_hinting_key == vertical_hinting_key {
         vertical_path
       } else {
-        combine_gdi_hinted_axes(
-          &horizontal_outline_path,
-          &vertical_path,
-          horizontal_outline_samples.recip(),
-        )?
+        combine_gdi_hinted_axes(&horizontal_path, &vertical_path, 1.0)?
       };
       let path = synthesize_gdi_font_path(
         path,
@@ -3458,8 +3874,40 @@ impl RenderFontCache {
         .copied()
         .unwrap_or(advance + synthetic_advance * horizontal_advance_scale);
     }
+    let (dx, dy) = natural_text_alignment_shift(request, cursor_advance);
+    for glyph in &mut glyphs {
+      glyph.left += dx;
+      glyph.top += dy;
+    }
     Some(glyphs)
   }
+}
+
+fn natural_text_alignment_shift(request: &TextRenderRequest<'_>, advance: f32) -> (i32, i32) {
+  // SetTextAlign centers the character-cell extent, not the ink bounds.
+  // TextOut has no Dx array: use the advances of the realized glyphs instead
+  // of treating the missing array as zero width. Explicit Dx is aligned by
+  // the caller in logical coordinates and never reaches this branch.
+  text_alignment_device_shift(request.natural_alignment, request.rotation_degrees, advance)
+}
+
+fn text_alignment_device_shift(
+  alignment: WmfTextAlignmentModeFlags,
+  rotation_degrees: f32,
+  advance: f32,
+) -> (i32, i32) {
+  let shift = if alignment.contains(WmfTextAlignmentModeFlags::CENTER) {
+    (advance / 2.0).floor()
+  } else if alignment.contains(WmfTextAlignmentModeFlags::RIGHT) {
+    advance
+  } else {
+    0.0
+  };
+  let radians = rotation_degrees.to_radians();
+  (
+    (-shift * radians.cos()).round() as i32,
+    (-shift * radians.sin()).round() as i32,
+  )
 }
 
 /// Combines independently grid-fitted X and Y outlines.
@@ -3652,7 +4100,7 @@ fn rasterize_gdi_glyph(
   vertical_scale: f32,
   format: GdiGlyphFormat,
 ) -> Option<RenderedGlyph> {
-  let x_samples = if format == GdiGlyphFormat::Lcd {
+  let x_samples = if format.is_lcd() {
     GDI_CLEARTYPE_X_SAMPLES
   } else {
     1
@@ -3703,16 +4151,28 @@ fn rasterize_gdi_glyph(
     }
     GdiGlyphFormat::Grayscale => rasterize_gdi_grayscale_path(&path, width, height)?,
     GdiGlyphFormat::Lcd => rasterize_gdi_cleartype_path(&path, width as usize, height as usize)?,
+    GdiGlyphFormat::LcdSymmetric => {
+      rasterize_gdi_symmetric_cleartype_path(&path, width as usize, height as usize)?
+    }
   };
   let top = (baseline_y.floor() as i32).saturating_add(i32::try_from(local_top).ok()?);
 
   match format {
-    GdiGlyphFormat::Lcd => {
+    GdiGlyphFormat::Lcd | GdiGlyphFormat::LcdSymmetric => {
       let high_resolution_left = (cursor_x.floor() as i32)
         .saturating_mul(GDI_CLEARTYPE_X_SAMPLES)
         .saturating_add(i32::try_from(local_left).ok()?);
-      let (left, width, coverage) =
-        cleartype_box_decimate(&data, width as usize, height as usize, high_resolution_left);
+      let (left, width, coverage) = if format == GdiGlyphFormat::LcdSymmetric {
+        cleartype_decimate(
+          &data,
+          width as usize,
+          height as usize,
+          high_resolution_left,
+          true,
+        )
+      } else {
+        cleartype_box_decimate(&data, width as usize, height as usize, high_resolution_left)
+      };
       Some(RenderedGlyph {
         left,
         top,
@@ -3760,16 +4220,52 @@ fn rasterize_gdi_grayscale_path(path: &TinySkiaPath, width: u32, height: u32) ->
 /// Microsoft's displaced-filtering paper defines RGB decimation over an
 /// input sampled at least six times horizontally and illustrates the source
 /// as a bi-level monochrome signal. Native Win32 playback into a white 32-bpp
-/// DIB confirms that each output channel is one of exactly seven values: the
-/// count of six covered source samples. `gasp` symmetric smoothing still
-/// affects the TrueType interpreter target above; it does not turn this GDI
-/// source bitmap into analytical area coverage.
+/// DIB confirms seven output coverage levels. Both the one-row and symmetric
+/// modes quantize to those levels, so the color levels alone do not identify
+/// the vertical sampling mode. This function handles the one-row source;
+/// symmetric smoothing uses the separate five-row weighted source below.
 fn rasterize_gdi_cleartype_path(
   path: &TinySkiaPath,
   width: usize,
   height: usize,
 ) -> Option<Vec<u8>> {
   rasterize_gdi_cleartype_scanlines(path, width, height)
+}
+
+/// Symmetric ClearType integrates five vertical samples as well as the six
+/// horizontal samples consumed by the displaced RGB filter. Returns integer
+/// vertical weights in 0..=9, rather than eight-bit alpha; decimation resolves
+/// and quantizes both axes together.
+fn rasterize_gdi_symmetric_cleartype_path(
+  path: &TinySkiaPath,
+  width: usize,
+  height: usize,
+) -> Option<Vec<u8>> {
+  let high_height = height.checked_mul(5)?;
+  let path = path
+    .clone()
+    .transform(TinySkiaTransform::from_scale(1.0, 5.0))?;
+  let mut high = vec![0; width.checked_mul(high_height)?];
+  apply_gdi_smart_dropout_control(&path, &mut high, width, high_height, true, false);
+  let mut coverage = vec![0; width.checked_mul(height)?];
+  for y in 0..height {
+    for x in 0..width {
+      // The five-sample vertical tent has weights 1,2,3,2,1. Keep its
+      // integer sum until the horizontal filter quantizes the joint result.
+      coverage[y * width + x] = [1, 2, 3, 2, 1]
+        .into_iter()
+        .enumerate()
+        .map(|(row, weight)| {
+          if high[(y * 5 + row) * width + x] != 0 {
+            weight
+          } else {
+            0
+          }
+        })
+        .sum();
+    }
+  }
+  Some(coverage)
 }
 
 /// Produces classic 6x1 ClearType scanlines on the Win32 black-raster grid.
@@ -3781,16 +4277,14 @@ fn rasterize_gdi_cleartype_scanlines(
   if width == 0 || height == 0 {
     return None;
   }
-  // The high-resolution ClearType X grid samples F26Dot6 coordinates at
-  // integer positions. The black raster below represents pixel centres by
-  // subtracting half a pixel during quantization, so translate X by that
-  // half sample before reusing its proven profile/drop-out machinery. Y is
-  // deliberately unchanged: GDI ClearType renders it on the normal B/W grid.
-  let path = path
-    .clone()
-    .transform(TinySkiaTransform::from_translate(0.5, 0.0))?;
+  // ClearType samples at the centres of its six horizontal subpixels,
+  // just as the black raster samples at device-pixel centres vertically.
+  // An additional half-sample translation would move the sampling lattice
+  // onto the outline grid. Native GDI controls with unhinted rectangular
+  // glyphs at 1/64-pixel phases distinguish these two contracts without
+  // depending on a font interpreter or its compatible-width adjustments.
   let mut coverage = vec![0_u8; width.checked_mul(height)?];
-  apply_gdi_smart_dropout_control(&path, &mut coverage, width, height, true, true);
+  apply_gdi_smart_dropout_control(path, &mut coverage, width, height, true, true);
   Some(coverage)
 }
 
@@ -3803,7 +4297,6 @@ fn rasterize_gdi_cleartype_scanlines(
 const GDI_DROPOUT_PRECISION_BITS: u32 = 12;
 const GDI_DROPOUT_PRECISION: i64 = 1 << GDI_DROPOUT_PRECISION_BITS;
 const GDI_DROPOUT_HALF: i64 = GDI_DROPOUT_PRECISION / 2;
-const GDI_DROPOUT_PRECISION_STEP: i64 = GDI_DROPOUT_PRECISION / 16;
 const GDI_OUTLINE_FRACTION: f64 = 64.0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4323,15 +4816,7 @@ fn apply_gdi_dropout_profiles(
         if draw_regular_spans && matches!(axis, GdiDropoutAxis::Horizontal) {
           apply_gdi_dropout_regular_span(scan_index, x1, x2, coverage, width, height);
         } else if matches!(axis, GdiDropoutAxis::Vertical) {
-          apply_gdi_dropout_aligned_edges(
-            scan_index,
-            [x1, x2],
-            coverage,
-            width,
-            height,
-            axis,
-            close_cleartype_perpendicular_dropouts,
-          );
+          apply_gdi_dropout_aligned_edges(scan_index, [x1, x2], coverage, width, height, axis);
         }
         continue;
       }
@@ -4609,14 +5094,12 @@ fn apply_gdi_dropout_aligned_edges(
   width: usize,
   height: usize,
   axis: GdiDropoutAxis,
-  close_cleartype_perpendicular_edges: bool,
 ) {
   for coordinate in edges {
+    // The perpendicular black sweep marks grid-aligned edges exactly. A
+    // near-grid tolerance turns curved bowls into extra ClearType pixels.
     let aligned_coordinate = if coordinate == gdi_dropout_ceil(coordinate) {
       Some(coordinate)
-    } else if close_cleartype_perpendicular_edges {
-      let nearest = gdi_dropout_floor(coordinate + GDI_DROPOUT_HALF);
-      ((coordinate - nearest).abs() <= GDI_DROPOUT_PRECISION_STEP).then_some(nearest)
     } else {
       None
     };
@@ -4792,6 +5275,22 @@ fn cleartype_box_decimate(
   height: usize,
   high_resolution_left: i32,
 ) -> (i32, usize, Vec<[u8; 3]>) {
+  cleartype_decimate(
+    high_resolution,
+    high_resolution_width,
+    height,
+    high_resolution_left,
+    false,
+  )
+}
+
+fn cleartype_decimate(
+  high_resolution: &[u8],
+  high_resolution_width: usize,
+  height: usize,
+  high_resolution_left: i32,
+  symmetric: bool,
+) -> (i32, usize, Vec<[u8; 3]>) {
   const SAMPLES_PER_PIXEL: i32 = 6;
   if high_resolution_width == 0 || height == 0 {
     return (0, 0, Vec::new());
@@ -4824,7 +5323,13 @@ fn cleartype_box_decimate(
         // samples are 127 (765 / 6), not 128.  Native PlayEnhMetaFile sweeps
         // over independent destination RGB values distinguish that one-byte
         // midpoint from a rounded average after the font gamma ramp.
-        channels[channel] = (sum / SAMPLES_PER_PIXEL as u16) as u8;
+        channels[channel] = if symmetric {
+          // The vertical tent sums to nine. Native two-axis rectangle
+          // controls show rounding to six coverage levels after both filters.
+          (((sum + 4) / 9) * 255 / SAMPLES_PER_PIXEL as u16) as u8
+        } else {
+          (sum / SAMPLES_PER_PIXEL as u16) as u8
+        };
       }
       output[y * width + (output_x - left) as usize] = channels;
     }
@@ -5527,20 +6032,12 @@ impl EmfVectorState {
     (mapped_x * scale_x, mapped_y * scale_y)
   }
 
-  fn map_vector(&self, x: f32, y: f32) -> (f32, f32) {
-    let mapped_x = x * self.world_transform.m11 + y * self.world_transform.m21;
-    let mapped_y = x * self.world_transform.m12 + y * self.world_transform.m22;
-    let (page_scale_x, page_scale_y) = self.emf_plus_page_device_scale();
-    let (extent_scale_x, extent_scale_y) = emf_window_viewport_scale(
-      self.map_mode,
-      self.window_ext_x,
-      self.window_ext_y,
-      self.viewport_ext_x,
-      self.viewport_ext_y,
-    );
-    let scale_x = extent_scale_x * page_scale_x * self.playback_scale_x * self.output_scale_x;
-    let scale_y = extent_scale_y * page_scale_y * self.playback_scale_y * self.output_scale_y;
-    (mapped_x * scale_x, mapped_y * scale_y)
+  fn map_text_point(&self, point: EmfPoint) -> (f32, f32) {
+    let (x, y) = self.map_point(point);
+    (
+      x * self.text_output_scale_x / self.output_scale_x,
+      y * self.text_output_scale_y / self.output_scale_y,
+    )
   }
 
   fn mapped_horizontal_distance(&self, logical_origin: EmfPoint, logical_width: i64) -> f32 {
@@ -5572,6 +6069,7 @@ impl EmfVectorState {
       text,
       color,
       &WmfTextFont {
+        width: 0,
         height,
         escapement: 0,
         family: None,
@@ -5591,56 +6089,144 @@ impl EmfVectorState {
     color: EmfColor,
     font: &WmfTextFont,
   ) {
-    self.draw_wmf_text(x, y, text, color, font, None);
+    self.draw_wmf_text(
+      EmfPoint { x, y },
+      text,
+      color,
+      font,
+      None,
+      WmfTextAlignment {
+        flags: WmfTextAlignmentModeFlags::empty(),
+        logical_origin: None,
+      },
+    );
   }
 
   fn draw_wmf_text(
     &mut self,
-    x: i32,
-    y: i32,
+    baseline: EmfPoint,
     text: &str,
     color: EmfColor,
     font: &WmfTextFont,
     logical_advances: Option<&[i16]>,
+    text_alignment: WmfTextAlignment,
   ) {
-    let (mapped_x, mapped_y) = self.map_point(EmfPoint { x, y });
+    let WmfTextAlignment {
+      flags: alignment,
+      logical_origin: logical_alignment_origin,
+    } = text_alignment;
+    let advances = logical_advances.map(|values| {
+      values
+        .iter()
+        .map(|value| i32::from(*value))
+        .collect::<Vec<_>>()
+    });
+    self.draw_oriented_text(
+      baseline,
+      text,
+      color,
+      font,
+      advances.as_deref(),
+      WmfTextAlignment {
+        flags: alignment,
+        logical_origin: logical_alignment_origin,
+      },
+    );
+  }
+
+  fn draw_oriented_text(
+    &mut self,
+    baseline: EmfPoint,
+    text: &str,
+    color: EmfColor,
+    font: &WmfTextFont,
+    logical_advances: Option<&[i32]>,
+    text_alignment: WmfTextAlignment,
+  ) {
+    let WmfTextAlignment {
+      flags: alignment,
+      logical_origin: logical_alignment_origin,
+    } = text_alignment;
+    let (mapped_x, mapped_y) = self.map_text_point(baseline);
     let escapement_radians = (font.escapement as f32 / 10.0).to_radians();
     let logical_axis_x = escapement_radians.cos();
     let logical_axis_y = -escapement_radians.sin();
-    let (mapped_axis_x, mapped_axis_y) = self.map_vector(logical_axis_x, logical_axis_y);
+    let (mapped_axis_x, mapped_axis_y) = self.map_text_vector(logical_axis_x, logical_axis_y);
     let rotation_degrees = mapped_axis_y.atan2(mapped_axis_x).to_degrees();
     let logical_normal_x = escapement_radians.sin();
     let logical_normal_y = escapement_radians.cos();
-    let (mapped_normal_x, mapped_normal_y) = self.map_vector(logical_normal_x, logical_normal_y);
-    let height = ((if font.height == 0 { 12 } else { font.height }).unsigned_abs() as f32
-      * mapped_normal_x.hypot(mapped_normal_y))
-    .round()
-    .max(1.0);
+    let (mapped_normal_x, mapped_normal_y) =
+      self.map_text_vector(logical_normal_x, logical_normal_y);
+    let mapped_font_height = (if font.height == 0 { 12 } else { font.height }).unsigned_abs()
+      as f32
+      * mapped_normal_x.hypot(mapped_normal_y);
+    let height = mapped_font_height.round().max(1.0);
+    let hinting_height = if self.text_surface.glyph_format(font.quality) == GdiGlyphFormat::Lcd {
+      mapped_font_height.max(1.0)
+    } else {
+      height
+    };
     let advances = logical_advances.map(|values| {
-      let values = values
-        .iter()
-        .map(|value| i32::from(*value))
-        .collect::<Vec<_>>();
-      cumulative_mapped_advances(&values, |logical_cumulative| {
+      cumulative_mapped_advances(values, |logical_cumulative| {
         let logical_cumulative = logical_cumulative as f32;
-        let x = (logical_cumulative * mapped_axis_x).round();
-        let y = (logical_cumulative * mapped_axis_y).round();
+        // LPtoDP rounds absolute glyph origins. The fractional first origin
+        // must participate, just as in EMR_EXTTEXTOUTW playback.
+        let x = gdi_device_coordinate(mapped_x + logical_cumulative * mapped_axis_x)
+          - gdi_device_coordinate(mapped_x);
+        let y = gdi_device_coordinate(mapped_y + logical_cumulative * mapped_axis_y)
+          - gdi_device_coordinate(mapped_y);
         x.hypot(y).copysign(logical_cumulative)
       })
     });
+    let alignment_shift = logical_alignment_origin.map_or_else(
+      || {
+        logical_advances.map_or((0, 0), |values| {
+          // GDI aligns the already-realized character cells in device space.
+          // Measure their extent independently from the fractional reference
+          // point used for the Dx positions above. Moving the logical origin
+          // before LPtoDP changes individual glyph positions by one pixel.
+          let width = values.iter().map(|value| *value as f32).sum::<f32>();
+          let width = (width * mapped_axis_x)
+            .round()
+            .hypot((width * mapped_axis_y).round());
+          text_alignment_device_shift(alignment, rotation_degrees, width)
+        })
+      },
+      |origin| {
+        // SetWinMetaFileBits records the aligned origin in logical coordinates.
+        // Convert its displacement from the text reference through LPtoDP, but
+        // retain the reference point's phase for the authored character cells.
+        // Rounding the whole device width before halving loses one pixel when a
+        // centered logical extent crosses a fractional playback endpoint.
+        let (aligned_x, aligned_y) = self.map_text_point(origin);
+        (
+          (aligned_x - mapped_x).round() as i32,
+          (aligned_y - mapped_y).round() as i32,
+        )
+      },
+    );
+    let font_width_scale = self.font_cache.logical_font_width_scale(font);
     self.draw_text_at_device(
       color,
       TextRenderRequest {
         font,
         text,
-        x: mapped_x.round(),
-        baseline_y: mapped_y.round(),
+        x: gdi_device_coordinate(mapped_x) + alignment_shift.0 as f32,
+        baseline_y: gdi_device_coordinate(mapped_y) + alignment_shift.1 as f32,
         rotation_degrees,
-        hinting_height: height,
+        hinting_height,
         height,
-        horizontal_scale: 1.0,
+        // Keep both physical font axes independent until the font's
+        // own ppem policy is applied, as in EMR_EXTTEXTOUTW playback.
+        horizontal_scale: font_width_scale * mapped_axis_x.hypot(mapped_axis_y)
+          / mapped_normal_x.hypot(mapped_normal_y).max(f32::EPSILON),
         vertical_scale: 1.0,
         advances: advances.as_deref(),
+        natural_alignment: if advances.is_none() {
+          alignment
+        } else {
+          WmfTextAlignmentModeFlags::empty()
+        },
         surface: self.text_surface,
       },
     );
@@ -5655,6 +6241,61 @@ impl EmfVectorState {
     logical_advances: Option<&[i32]>,
     logical_displacement: Option<EmfPoint>,
   ) {
+    if font.escapement != 0 {
+      let reference = if self
+        .text_alignment
+        .contains(WmfTextAlignmentModeFlags::UPDATE_CP)
+      {
+        self.current_pos
+      } else {
+        EmfPoint {
+          x: text_record.x,
+          y: text_record.y,
+        }
+      };
+      self.draw_oriented_text(
+        reference,
+        text,
+        color,
+        font,
+        logical_advances,
+        WmfTextAlignment {
+          flags: self.text_alignment,
+          logical_origin: None,
+        },
+      );
+      if self
+        .text_alignment
+        .contains(WmfTextAlignmentModeFlags::UPDATE_CP)
+        && let Some(displacement) = logical_displacement
+      {
+        let width = displacement.x as f32;
+        let shift = if self
+          .text_alignment
+          .contains(WmfTextAlignmentModeFlags::CENTER)
+        {
+          width / 2.0
+        } else if self
+          .text_alignment
+          .contains(WmfTextAlignmentModeFlags::RIGHT)
+        {
+          width
+        } else {
+          0.0
+        };
+        let angle = (font.escapement as f32 / 10.0).to_radians();
+        self.current_pos = EmfPoint {
+          x: (reference.x as f32
+            + (width - shift) * angle.cos()
+            + displacement.y as f32 * angle.sin())
+          .round() as i32,
+          y: (reference.y as f32 - (width - shift) * angle.sin()
+            + displacement.y as f32 * angle.cos())
+          .round() as i32,
+        };
+      }
+      return;
+    }
     let font_height = if font.height == 0 { 12 } else { font.height };
     let logical_width = logical_displacement.map(|displacement| displacement.x);
     let update_current_position = self
@@ -5689,15 +6330,19 @@ impl EmfVectorState {
       x: aligned_x,
       y: reference.y,
     });
-    let mapped_x = mapped_x.round();
-    let reference_y = reference_y.round();
-    // PlayEnhMetaFile switches to the record's GM_COMPATIBLE mode and
-    // reselects the current font before ExtTextOut. Native GetGlyphOutlineW
-    // exposes integer device ppem grids for both axes; render_text combines
-    // their independently hinted coordinates below.
+    let mapped_x = gdi_device_coordinate(mapped_x);
+    let reference_y = gdi_device_coordinate(reference_y);
+    // Keep integer device metrics for alignment, but pass the physical
+    // mapped size to LCD hinting. The font's head.flags decides whether
+    // fractional ppem survives; GetGlyphOutline's integer metrics alone
+    // do not describe ClearType outline scaling.
     let mapped_font_height = self.mapped_vertical_length(font_height);
     let height = mapped_font_height.round().max(1.0);
-    let hinting_height = height;
+    let hinting_height = if self.text_surface.glyph_format(font.quality) == GdiGlyphFormat::Lcd {
+      mapped_font_height.max(1.0)
+    } else {
+      height
+    };
     let mapped_y =
       self
         .font_cache
@@ -5738,6 +6383,7 @@ impl EmfVectorState {
         horizontal_scale,
         vertical_scale,
         advances: advances.as_deref(),
+        natural_alignment: WmfTextAlignmentModeFlags::empty(),
         surface: self.text_surface,
       },
     );
@@ -5749,7 +6395,7 @@ impl EmfVectorState {
     }
   }
 
-  fn draw_text_at_device(&mut self, color: EmfColor, request: TextRenderRequest<'_>) {
+  fn draw_text_at_device(&mut self, color: EmfColor, mut request: TextRenderRequest<'_>) {
     if self.suppress_text {
       return;
     }
@@ -5761,6 +6407,21 @@ impl EmfVectorState {
     }
 
     let scale = ((request.height as usize).max(7) / 7).max(1);
+    let width = request
+      .text
+      .chars()
+      .enumerate()
+      .map(|(index, ch)| {
+        request
+          .advances
+          .and_then(|values| values.get(index))
+          .copied()
+          .unwrap_or((if ch.is_whitespace() { 4 } else { 6 } * scale) as f32)
+      })
+      .sum();
+    let (dx, dy) = natural_text_alignment_shift(&request, width);
+    request.x += dx as f32;
+    request.baseline_y += dy as f32;
     if request.rotation_degrees.abs() > f32::EPSILON {
       let mut cursor_advance = 0.0;
       for (index, ch) in request.text.chars().enumerate() {
@@ -7393,6 +8054,30 @@ fn decode_emf_masked_blt_pair(
   }))
 }
 
+fn metafile_uses_binary_coverage_surface(data: &[u8]) -> Result<bool, String> {
+  if crate::wmf::looks_like_wmf(data) {
+    if let Ok(Some(embedded)) = crate::wmf::embedded_enhanced_metafile(data) {
+      return emf_uses_binary_coverage_surface(&embedded.data);
+    }
+    let metafile = WmfMetafileRef::from_bytes(data).map_err(|err| err.to_string())?;
+    let mut records = metafile.records().peekable();
+    while let Some(record) = records.next() {
+      if let Ok(WmfRecordData::DibStretchBlt(first)) = record.parse_data()
+        && let Some(Ok(WmfRecordData::DibStretchBlt(second))) =
+          records.peek().map(|record| record.parse_data())
+        && wmf_masked_bitmap_pair(&first, &second).is_some()
+      {
+        // Native Word/GDI+ icon controls retain every changed scratch-color
+        // pixel, including the LCD fringe of text following the mask pair.
+        // A separate monochrome glyph mask alone loses those covered pixels.
+        return Ok(true);
+      }
+    }
+    return Ok(false);
+  }
+  emf_uses_binary_coverage_surface(data)
+}
+
 fn emf_uses_binary_coverage_surface(data: &[u8]) -> Result<bool, String> {
   let Some(mut record_offset) = emf_header_record_size(data) else {
     return Ok(false);
@@ -7824,6 +8509,7 @@ enum WmfRenderObject {
 
 struct WmfRenderState {
   canvas: EmfVectorState,
+  conversion_canvas: Option<(f32, f32)>,
   objects: Vec<Option<WmfRenderObject>>,
   current_pos: EmfPoint,
   text_color: EmfColor,
@@ -7847,22 +8533,31 @@ impl WmfRenderState {
     let natural_width = window_ext_x.unsigned_abs().max(1) as usize;
     let natural_height = window_ext_y.unsigned_abs().max(1) as usize;
     let (width, height) = options.resolved_canvas_size(natural_width, natural_height);
+    let conversion_frame_scale = wmf_conversion_frame_scale(metafile, options);
+    let output_scale = |playback: Option<u32>, canvas, natural| {
+      let playback = if conversion_frame_scale.is_some() {
+        Some(playback.unwrap_or(canvas as u32).saturating_sub(1).max(1))
+      } else {
+        playback
+      };
+      options.output_scale(playback, canvas, natural)
+    };
     let output_scale_x = options.output_scale(options.playback_width_px, width, natural_width);
     let output_scale_y = options.output_scale(options.playback_height_px, height, natural_height);
-    let text_output_scale_x = options.output_scale(
+    let text_output_scale_x = output_scale(
       options
         .text_playback_width(text_surface)
         .or(options.playback_width_px),
       width,
       natural_width,
-    );
-    let text_output_scale_y = options.output_scale(
+    ) * conversion_frame_scale.map_or(1.0, |scale| scale.0);
+    let text_output_scale_y = output_scale(
       options
         .text_playback_height(text_surface)
         .or(options.playback_height_px),
       height,
       natural_height,
-    );
+    ) * conversion_frame_scale.map_or(1.0, |scale| scale.1);
     let object_count = metafile.header.number_of_objects as usize;
     let background_color = options.background_color.unwrap_or([255; 3]);
     let mut rgb = vec![0; width * height * RGB_BYTES_PER_PIXEL];
@@ -7871,6 +8566,7 @@ impl WmfRenderState {
     }
 
     let mut state = Self {
+      conversion_canvas: wmf_conversion_canvas_size(metafile, options),
       canvas: EmfVectorState {
         width,
         height,
@@ -7948,6 +8644,7 @@ impl WmfRenderState {
       current_pattern_brush: None,
       current_solid_brush: false,
       current_font: WmfTextFont {
+        width: 0,
         height: 12,
         escapement: 0,
         family: None,
@@ -8059,6 +8756,23 @@ impl WmfRenderState {
         y: i32::from(y),
       }
     }
+  }
+
+  fn converted_text_advances(&mut self, text: &str) -> Option<Vec<i16>> {
+    let (width, height) = self.conversion_canvas?;
+    // Negative lfHeight specifies character height. Positive cell-height
+    // realization needs its own font-mapper contract and keeps direct playback.
+    if self.current_font.height >= 0 {
+      return None;
+    }
+    let scale_x = width / self.canvas.natural_width as f32 * self.canvas.viewport_ext_x as f32
+      / self.canvas.window_ext_x as f32;
+    let scale_y = height / self.canvas.natural_height as f32 * self.canvas.viewport_ext_y as f32
+      / self.canvas.window_ext_y as f32;
+    self
+      .canvas
+      .font_cache
+      .wmf_converted_advances(&self.current_font, text, scale_x, scale_y)
   }
 
   fn text_origin(&self, x: i16, y: i16, logical_width: Option<i32>) -> EmfPoint {
@@ -8531,16 +9245,26 @@ fn decode_wmf_as_raster(
       ),
       WmfRecordData::TextOut(value) => {
         let text = decode_wmf_text(&value.string, state.current_font.char_set);
-        let origin = state.text_origin(value.x_start, value.y_start, None);
-        let baseline = state.text_baseline(origin);
-        state.canvas.draw_text_with_font(
-          baseline.x,
-          baseline.y,
+        let advances = state.converted_text_advances(&text);
+        let logical_width = advances
+          .as_ref()
+          .map(|values| values.iter().map(|v| i32::from(*v)).sum());
+        let origin = state.text_origin(value.x_start, value.y_start, logical_width);
+        let baseline =
+          state.text_baseline(state.text_reference_point(value.x_start, value.y_start));
+        state.canvas.draw_wmf_text(
+          baseline,
           &text,
           state.text_color,
           &state.current_font,
+          advances.as_deref(),
+          WmfTextAlignment {
+            flags: state.text_alignment,
+            logical_origin: (state.conversion_canvas.is_some() && advances.is_some())
+              .then(|| state.text_baseline(origin)),
+          },
         );
-        state.update_current_position_after_text(origin, None);
+        state.update_current_position_after_text(origin, logical_width);
       }
       WmfRecordData::ExtTextOut(value) => {
         if let Some(rectangle) = value.rectangle
@@ -8558,13 +9282,23 @@ fn decode_wmf_as_raster(
         }
 
         let text = decode_wmf_text(&value.string, state.current_font.char_set);
-        let logical_width = (!value.dx.is_empty()).then(|| {
-          value.dx.iter().fold(0i32, |total, advance| {
+        let converted_advances = value
+          .dx
+          .is_empty()
+          .then(|| state.converted_text_advances(&text))
+          .flatten();
+        let advances = if value.dx.is_empty() {
+          converted_advances.as_deref()
+        } else {
+          Some(value.dx.as_slice())
+        };
+        let logical_width = advances.map(|values| {
+          values.iter().fold(0i32, |total, advance| {
             total.saturating_add(i32::from(*advance))
           })
         });
         let origin = state.text_origin(value.x, value.y, logical_width);
-        let baseline = state.text_baseline(origin);
+        let baseline = state.text_baseline(state.text_reference_point(value.x, value.y));
         let saved_clip = value
           .rectangle
           .filter(|_| value.options.contains(WmfExtTextOutOptions::CLIPPED))
@@ -8592,12 +9326,16 @@ fn decode_wmf_as_raster(
             saved
           });
         state.canvas.draw_wmf_text(
-          baseline.x,
-          baseline.y,
+          baseline,
           &text,
           state.text_color,
           &state.current_font,
-          (!value.dx.is_empty()).then_some(value.dx.as_slice()),
+          advances,
+          WmfTextAlignment {
+            flags: state.text_alignment,
+            logical_origin: (state.conversion_canvas.is_some() && advances.is_some())
+              .then(|| state.text_baseline(origin)),
+          },
         );
         state.update_current_position_after_text(origin, logical_width);
         if let Some((clip_rect, clip_mask)) = saved_clip {
@@ -8664,11 +9402,30 @@ fn decode_wmf_as_raster(
         }
       }
       WmfRecordData::DibStretchBlt(value) => {
+        let next = records
+          .peek()
+          .copied()
+          .and_then(|record| record.parse_data().ok());
+        if !options.suppress_bitmap_layers
+          && value.raster_operation_code() == WmfTernaryRasterOperationCode::SRCAND
+          && let Some(WmfRecordData::DibStretchBlt(second)) = next.as_ref()
+          && second.raster_operation_code() == WmfTernaryRasterOperationCode::SRCINVERT
+          && let Some(pair) = wmf_masked_bitmap_pair(&value, second)
+        {
+          // Native GDI+ uses the same filtered source branch for the WMF
+          // and EMF forms of this two-record transparent icon operation.
+          state.canvas.draw_masked_rgb_image(
+            i32::from(value.x_dest),
+            i32::from(value.y_dest),
+            i32::from(value.dest_width),
+            i32::from(value.dest_height),
+            &pair.source,
+            &pair.mask,
+          );
+          records.next();
+          continue;
+        }
         if options.suppress_bitmap_layers {
-          let next = records
-            .peek()
-            .copied()
-            .and_then(|record| record.parse_data().ok());
           if let Some(WmfRecordData::DibStretchBlt(second)) = next
             && wmf_masked_bitmap_pair(&value, &second).is_some()
           {
@@ -8676,7 +9433,7 @@ fn decode_wmf_as_raster(
             continue;
           }
           if value.raster_operation_code() == WmfTernaryRasterOperationCode::SRCCOPY
-            && full_wmf_dib_source(&value).is_some()
+            && wmf_dib_source(&value).is_some()
           {
             continue;
           }
@@ -8684,6 +9441,20 @@ fn decode_wmf_as_raster(
         if let Some(bytes) = value.target.source_bytes()
           && let Some(image) = packed_dib_to_rgb(bytes, DibColorUsage::RgbColors)?
         {
+          // [MS-WMF] 2.3.1.3 selects an upper-left source rectangle before
+          // stretching. Icon masks can store two stacked planes in one DIB;
+          // replaying the entire bitmap compresses the unused plane into the
+          // icon. Preserve existing signed/mirrored handling separately.
+          let image = crop_raster_pixels(
+            &image,
+            (
+              i32::from(value.x_src),
+              i32::from(value.y_src),
+              i32::from(value.src_width),
+              i32::from(value.src_height),
+            ),
+          )
+          .unwrap_or(image);
           state.canvas.draw_rgb_image_with_rop(
             i32::from(value.x_dest),
             i32::from(value.y_dest),
@@ -8740,6 +9511,85 @@ fn decode_wmf_as_raster(
     )?,
     content_type: "image/png",
   }))
+}
+
+fn wmf_logical_advances(advances: &[f32], device_scale: f32) -> Option<Vec<i16>> {
+  let mut device_position = 0.0;
+  let mut logical_position = 0i32;
+  advances
+    .iter()
+    .map(|advance| {
+      device_position += advance;
+      let next = (device_position / device_scale).round() as i32;
+      let delta = i16::try_from(next.checked_sub(logical_position)?).ok()?;
+      logical_position = next;
+      Some(delta)
+    })
+    .collect()
+}
+
+fn wmf_conversion_physical_frame(
+  metafile: &WmfMetafileRef<'_>,
+  options: RenderOptions,
+) -> Option<(f32, f32)> {
+  if let Some(placeable) = metafile.placeable_header.as_ref() {
+    if placeable.inch == 0 {
+      return None;
+    }
+    let axis = |extent: i32| {
+      // Word truncates the placeable extent when creating METAFILEPICT's
+      // integer hundredths-of-a-millimetre XExt/YExt. Rounding the rational
+      // value first changes GDI+'s eventual EMF frame and can alter a small
+      // hinted glyph even though the bitmap dimensions stay unchanged.
+      (f64::from(extent.unsigned_abs()) * 2540.0 / f64::from(placeable.inch)).floor() as f32
+    };
+    Some((
+      axis(placeable.bounding_box_width()),
+      axis(placeable.bounding_box_height()),
+    ))
+  } else {
+    let header = options.wmf_external_header?;
+    Some((
+      header.width_hundredths_mm as f32,
+      header.height_hundredths_mm as f32,
+    ))
+  }
+}
+
+fn wmf_conversion_canvas_size(
+  metafile: &WmfMetafileRef<'_>,
+  options: RenderOptions,
+) -> Option<(f32, f32)> {
+  let profile = options.wmf_conversion_profile?;
+  let (width, height) = wmf_conversion_physical_frame(metafile, options)?;
+  if profile.dpi.contains(&0) || width <= 0.0 || height <= 0.0 {
+    return None;
+  }
+  Some((
+    (width * profile.dpi[0] as f32 / 2540.0).round().max(1.0),
+    (height * profile.dpi[1] as f32 / 2540.0).round().max(1.0),
+  ))
+}
+
+fn wmf_conversion_frame_scale(
+  metafile: &WmfMetafileRef<'_>,
+  options: RenderOptions,
+) -> Option<(f32, f32)> {
+  let profile = options.wmf_conversion_profile?;
+  let viewport = wmf_conversion_canvas_size(metafile, options)?;
+  let frame = wmf_conversion_physical_frame(metafile, options)?;
+  if profile.device_pixels.contains(&0) || profile.device_millimeters.contains(&0) {
+    return None;
+  }
+  let axis = |viewport: f32, frame: f32, index: usize| {
+    // Preserve the physical frame span. Native GDI+ DrawImage recorded into
+    // an EMF exposes this exact text transform for both 1918- and 2406-unit
+    // frames. The destination pixel endpoint is handled by output_scale;
+    // subtracting another unit here changes character-origin rounding.
+    viewport * profile.device_millimeters[index] as f32 * 100.0
+      / (frame * profile.device_pixels[index] as f32)
+  };
+  Some((axis(viewport.0, frame.0, 0), axis(viewport.1, frame.1, 1)))
 }
 
 fn wmf_external_canvas_size(
@@ -10171,8 +11021,9 @@ fn emf_current_font(state: &EmfVectorState) -> WmfTextFont {
     .current_font
     .and_then(|id| state.fonts.get(&id))
     .map(|font| WmfTextFont {
+      width: 0,
       height: font.height,
-      escapement: 0,
+      escapement: font.escapement,
       family: font.family.clone(),
       char_set: font.char_set,
       weight: font.weight,
@@ -10180,6 +11031,7 @@ fn emf_current_font(state: &EmfVectorState) -> WmfTextFont {
       quality: font.quality,
     })
     .unwrap_or(WmfTextFont {
+      width: 0,
       height: 12,
       escapement: 0,
       family: None,
@@ -11695,6 +12547,14 @@ fn ext_text_displacement(
   Some(displacement)
 }
 
+/// GDI transforms through POINTFIX (28.4) before producing integer device
+/// coordinates. Native LPtoDP and ExtTextOut controls agree at all 1/64 phases:
+/// +30/64 rounds to 1; -34/64 rounds to -1, while -33/64 rounds to 0.
+/// See XFORMOBJ_bApplyXform / XF_LTOL and ReactOS's fixed-point transform path.
+fn gdi_device_coordinate(value: f32) -> f32 {
+  (((f64::from(value) * 16.0).round() + 8.0) / 16.0).floor() as f32
+}
+
 fn cumulative_mapped_advances(
   logical_advances: &[i32],
   mut map_cumulative: impl FnMut(i64) -> f32,
@@ -11725,6 +12585,7 @@ fn read_logfont_object(
   const OBJECT_ID_OFFSET: usize = 8;
   const LOGFONT_OFFSET: usize = 12;
   const LOGFONT_HEIGHT_OFFSET: usize = LOGFONT_OFFSET;
+  const LOGFONT_ESCAPEMENT_OFFSET: usize = LOGFONT_OFFSET + 8;
   const LOGFONT_WEIGHT_OFFSET: usize = LOGFONT_OFFSET + 16;
   const LOGFONT_ITALIC_OFFSET: usize = LOGFONT_OFFSET + 20;
   const LOGFONT_CHAR_SET_OFFSET: usize = LOGFONT_OFFSET + 23;
@@ -11736,6 +12597,7 @@ fn read_logfont_object(
   }
   let object_id = read_u32(data, record_offset + OBJECT_ID_OFFSET).ok()?;
   let height = read_i32(data, record_offset + LOGFONT_HEIGHT_OFFSET).ok()?;
+  let escapement = read_i32(data, record_offset + LOGFONT_ESCAPEMENT_OFFSET).ok()?;
   let weight = read_i32(data, record_offset + LOGFONT_WEIGHT_OFFSET)
     .ok()?
     .clamp(0, 1000) as u16;
@@ -11759,6 +12621,7 @@ fn read_logfont_object(
     object_id,
     EmfFont {
       height,
+      escapement,
       family: (!family.is_empty()).then_some(family),
       char_set,
       weight,
@@ -11900,25 +12763,128 @@ mod tests {
   }
 
   #[test]
-  fn gdi_cleartype_realizes_x_on_the_six_sample_grid_before_rounding() {
-    let vertical_ppem = 8.0;
-    let horizontal_scale = 0.577_698_2;
-    let horizontal_device_ppem =
-      gdi_realized_font_metric(vertical_ppem * horizontal_scale).max(1.0);
-    let horizontal_outline_ppem =
-      gdi_realized_font_metric(vertical_ppem * horizontal_scale * GDI_CLEARTYPE_X_SAMPLES as f32)
-        .max(1.0);
-
-    assert_eq!(
-      horizontal_device_ppem, 5.0,
-      "GDI realizes its mapped X device grid independently"
-    );
-    assert_eq!(
-      horizontal_outline_ppem, 28.0,
-      "ClearType rounds after entering the six-sample X grid"
-    );
+  fn cleartype_hinting_honors_physical_ppem_and_head_flags() {
+    let font = WmfTextFont {
+      width: 0,
+      height: -64,
+      escapement: 0,
+      family: Some("EMF SDK Rectangle".into()),
+      char_set: 1,
+      weight: 400,
+      italic: false,
+      quality: 5,
+    };
+    for (integer, scale, expected) in [
+      (
+        false,
+        0.6,
+        [
+          [0, 0, 2],
+          [4, 6, 5],
+          [3, 1, 0],
+          [0, 0, 0],
+          [0, 0, 0],
+          [0, 0, 0],
+        ],
+      ),
+      (
+        true,
+        0.6,
+        [
+          [0, 1, 3],
+          [5, 6, 5],
+          [3, 1, 0],
+          [0, 0, 0],
+          [0, 0, 0],
+          [0, 0, 0],
+        ],
+      ),
+      (
+        false,
+        1.3,
+        [
+          [0, 0, 0],
+          [0, 0, 2],
+          [4, 6, 6],
+          [6, 6, 6],
+          [6, 4, 2],
+          [0, 0, 0],
+        ],
+      ),
+      (
+        true,
+        1.3,
+        [
+          [0, 0, 0],
+          [0, 0, 2],
+          [4, 6, 6],
+          [6, 6, 6],
+          [5, 3, 1],
+          [0, 0, 0],
+        ],
+      ),
+    ] {
+      let mut data = include_bytes!("render/testdata/cleartype-rectangle.ttf").to_vec();
+      let table_count = u16::from_be_bytes(data[4..6].try_into().unwrap()) as usize;
+      let entry = data[12..12 + table_count * 16]
+        .as_chunks::<16>()
+        .0
+        .iter()
+        .find(|r| &r[..4] == b"head")
+        .unwrap();
+      let offset = u32::from_be_bytes(entry[8..12].try_into().unwrap()) as usize;
+      if integer {
+        data[offset + 17] |= 8;
+      }
+      let mut cache = RenderFontCache::load();
+      cache.faces.insert(
+        RenderFontKey {
+          family: font.family.clone(),
+          weight: 400,
+          italic: false,
+        },
+        Some(RenderFontFace {
+          font_data: fontique::Blob::new(std::sync::Arc::new(data)),
+          face_index: 0,
+          synthesis: FontSynthesis::default(),
+        }),
+      );
+      let glyphs = cache
+        .render_text(&TextRenderRequest {
+          font: &font,
+          text: "A",
+          x: 10.0,
+          baseline_y: 10.0,
+          rotation_degrees: 0.0,
+          hinting_height: 64.0,
+          height: 64.0,
+          horizontal_scale: scale,
+          vertical_scale: 1.0,
+          advances: None,
+          natural_alignment: WmfTextAlignmentModeFlags::empty(),
+          surface: GdiTextSurface::Color,
+        })
+        .unwrap();
+      assert_eq!(glyphs.len(), 1);
+      let glyph = &glyphs[0];
+      let RenderedGlyphMask::Lcd(coverage) = &glyph.mask else {
+        panic!("expected LCD")
+      };
+      for (x, expected) in expected.into_iter().enumerate() {
+        let column = 10 + x as i32 - glyph.left;
+        let actual = if column < 0 || column as usize >= glyph.width {
+          [0; 3]
+        } else {
+          coverage[(7 - glyph.top) as usize * glyph.width + column as usize]
+        };
+        assert_eq!(
+          actual,
+          expected.map(|n: u16| (n * 255 / 6) as u8),
+          "integer ppem {integer}, scale {scale}, column {x}"
+        );
+      }
+    }
   }
-
   #[test]
   fn gdi_mono_control_box_uses_asymmetric_pixel_center_rounding() {
     assert_eq!(gdi_monochrome_axis_box(0.53125, 5.09375), Some((1, 5)));
@@ -12329,6 +13295,7 @@ mod tests {
     let mut record = vec![0; 104];
     record[8..12].copy_from_slice(&7u32.to_le_bytes());
     record[12..16].copy_from_slice(&(-11i32).to_le_bytes());
+    record[20..24].copy_from_slice(&450i32.to_le_bytes());
     record[28..32].copy_from_slice(&700i32.to_le_bytes());
     record[32] = 1;
     record[35] = crate::wmf::WmfCharacterSet::Greek.raw();
@@ -12341,11 +13308,260 @@ mod tests {
     let (object_id, font) = read_logfont_object(&record, 0, record.len()).unwrap();
     assert_eq!(object_id, 7);
     assert_eq!(font.height, -11);
+    assert_eq!(font.escapement, 450);
     assert_eq!(font.family.as_deref(), Some("Segoe UI"));
     assert_eq!(font.weight, 700);
     assert!(font.italic);
     assert_eq!(font.char_set, crate::wmf::WmfCharacterSet::Greek.raw());
     assert_eq!(font.quality, crate::wmf::WmfFontQuality::ClearType.raw());
+  }
+
+  #[test]
+  fn emf_escapement_rotates_semantic_origins_alignment_and_device_advances() {
+    // LOGFONT escapement rotates the whole baseline in compatible graphics
+    // mode. TA_CENTER moves half the authored Dx extent along that baseline,
+    // rather than subtracting it from the unrotated x coordinate.
+    for (angle, origin, rotation) in [
+      (0i32, (92.0, 100.0), 0.0f32),
+      (900, (100.0, 108.0), -90.0),
+      (1800, (108.0, 100.0), -180.0),
+      (2700, (100.0, 92.0), 90.0),
+    ] {
+      let mut font = vec![0; 96];
+      font[..4].copy_from_slice(&1u32.to_le_bytes());
+      font[4..8].copy_from_slice(&(-13i32).to_le_bytes());
+      font[12..16].copy_from_slice(&angle.to_le_bytes());
+      font[16..20].copy_from_slice(&angle.to_le_bytes());
+      let data = metafile_with_header_bounds(
+        199,
+        199,
+        vec![
+          EmfRecord::new(super::EMR_EXT_CREATE_FONT_INDIRECT_W, font),
+          select_object_record(1),
+          set_text_align_record(
+            WmfTextAlignmentModeFlags::CENTER | WmfTextAlignmentModeFlags::BASELINE,
+          ),
+          ext_text_out_w_record(100, 100, "AB"),
+        ],
+      );
+      let run = extract_metafile_text_runs(&data, Some("image/x-emf"))
+        .pop()
+        .unwrap();
+      assert!((run.x * 200.0 - origin.0).abs() < 0.001, "angle={angle}");
+      assert!((run.y * 200.0 - origin.1).abs() < 0.001, "angle={angle}");
+      assert!(
+        (run.rotation_degrees.abs() - rotation.abs()).abs() < 0.001,
+        "angle={angle}"
+      );
+      assert!((run.font_size.unwrap() * 200.0 - 13.0).abs() < 0.001);
+      assert!(
+        run
+          .advances
+          .unwrap()
+          .iter()
+          .all(|advance| (*advance * 200.0 - 8.0).abs() < 0.001)
+      );
+    }
+  }
+
+  #[test]
+  fn emf_fixed_output_quantizes_rotated_character_cells_individually() {
+    // Independent native Word controls cover increasing/decreasing authored
+    // Dx and 0, 30, +/-45, 90 degree escapements. Squared vector lengths keep
+    // this fixture independent of a string, font outline or fitted extent.
+    for (angle, squares) in [
+      (0i32, [1.0f32, 4.0, 9.0, 16.0, 25.0, 36.0, 49.0, 64.0, 81.0]),
+      (300, [0.0, 2.0, 5.0, 13.0, 20.0, 34.0, 45.0, 52.0, 65.0]),
+      (450, [0.0, 2.0, 8.0, 8.0, 18.0, 32.0, 32.0, 50.0, 72.0]),
+      (-450, [0.0, 2.0, 8.0, 8.0, 18.0, 32.0, 32.0, 50.0, 72.0]),
+      (900, [1.0, 4.0, 9.0, 16.0, 25.0, 36.0, 49.0, 64.0, 81.0]),
+    ] {
+      let mut font = vec![0; 96];
+      font[..4].copy_from_slice(&1u32.to_le_bytes());
+      font[4..8].copy_from_slice(&(-13i32).to_le_bytes());
+      font[12..16].copy_from_slice(&angle.to_le_bytes());
+      font[16..20].copy_from_slice(&angle.to_le_bytes());
+      let mut text = ext_text_out_w_record(100, 100, "ABCDEFGHI");
+      let dx_offset = u32::from_le_bytes(text.data[64..68].try_into().unwrap()) as usize - 8;
+      for (i, dx) in (1i32..=9).enumerate() {
+        text.data[dx_offset + i * 4..dx_offset + i * 4 + 4].copy_from_slice(&dx.to_le_bytes());
+      }
+      let data = metafile_with_header_bounds(
+        199,
+        199,
+        vec![
+          EmfRecord::new(super::EMR_EXT_CREATE_FONT_INDIRECT_W, font),
+          select_object_record(1),
+          set_text_align_record(WmfTextAlignmentModeFlags::BASELINE),
+          text,
+        ],
+      );
+      let run = super::extract_metafile_text_runs_with_options(
+        &data,
+        Some("image/x-emf"),
+        RenderOptions {
+          emf_text_advance_quantization:
+            super::EmfTextAdvanceQuantization::IndividualProjectedCells,
+          ..RenderOptions::default()
+        },
+      )
+      .pop()
+      .unwrap();
+      for (advance, square) in run.advances.unwrap().into_iter().zip(squares) {
+        assert!(
+          (advance * 200.0 - square.sqrt()).abs() < 0.001,
+          "angle={angle}"
+        );
+      }
+    }
+  }
+
+  #[test]
+  fn emf_text_layers_preserve_color_clip_and_saved_dc_ownership() {
+    let data = metafile_with_header_bounds(
+      199,
+      199,
+      vec![
+        EmfRecord::new(
+          super::EMR_SET_TEXT_COLOR,
+          0x0033_2211u32.to_le_bytes().to_vec(),
+        ),
+        EmfRecord::new(
+          super::EMR_INTERSECT_CLIP_RECT,
+          [10i32, 20, 90, 80]
+            .into_iter()
+            .flat_map(i32::to_le_bytes)
+            .collect(),
+        ),
+        EmfRecord::new(super::EMR_SAVE_DC, vec![]),
+        EmfRecord::new(
+          super::EMR_SET_TEXT_COLOR,
+          0x0066_5544u32.to_le_bytes().to_vec(),
+        ),
+        EmfRecord::new(
+          super::EMR_INTERSECT_CLIP_RECT,
+          [30i32, 40, 100, 100]
+            .into_iter()
+            .flat_map(i32::to_le_bytes)
+            .collect(),
+        ),
+        ext_text_out_w_record(40, 50, "A"),
+        EmfRecord::new(super::EMR_RESTORE_DC, (-1i32).to_le_bytes().to_vec()),
+        ext_text_out_w_record(40, 50, "B"),
+      ],
+    );
+    let runs = extract_metafile_text_runs(&data, Some("image/x-emf"));
+    assert_eq!(runs[0].color, [0x44, 0x55, 0x66]);
+    assert_eq!(runs[1].color, [0x11, 0x22, 0x33]);
+    for (run, expected) in runs
+      .iter()
+      .zip([[30.0, 40.0, 90.0, 80.0], [10.0, 20.0, 90.0, 80.0]])
+    {
+      for (actual, expected) in run.clip.unwrap().into_iter().zip(expected) {
+        assert!((actual * 200.0 - expected).abs() < 0.001);
+      }
+    }
+  }
+
+  #[test]
+  fn emf_text_layer_separation_rejects_covering_graphics_and_raster_dependencies() {
+    let text = || {
+      let mut record = ext_text_out_w_record(20, 20, "AB");
+      for (i, value) in [20i32, 20, 36, 34].into_iter().enumerate() {
+        record.data[i * 4..i * 4 + 4].copy_from_slice(&value.to_le_bytes());
+      }
+      record
+    };
+    let rectangle = |bounds: [i32; 4]| {
+      EmfRecord::new(
+        super::EMR_RECTANGLE,
+        bounds.into_iter().flat_map(i32::to_le_bytes).collect(),
+      )
+    };
+    let font = || {
+      let mut font = vec![0; 96];
+      font[..4].copy_from_slice(&1u32.to_le_bytes());
+      font[4..8].copy_from_slice(&(-13i32).to_le_bytes());
+      for (i, unit) in "Arial".encode_utf16().enumerate() {
+        font[32 + i * 2..34 + i * 2].copy_from_slice(&unit.to_le_bytes());
+      }
+      EmfRecord::new(super::EMR_EXT_CREATE_FONT_INDIRECT_W, font)
+    };
+    let data = |records| {
+      let mut prefix = vec![font(), select_object_record(1)];
+      prefix.extend(records);
+      metafile_with_header_bounds(199, 199, prefix)
+    };
+    let independent = data(vec![text(), rectangle([100, 100, 150, 150])]);
+    let covered = data(vec![text(), rectangle([15, 15, 50, 50])]);
+    let destination = data(vec![
+      text(),
+      stretch_blt_record(bitmap_info(2, 2, 32, BI_RGB), vec![0; 16], 0x0088_00C6),
+    ]);
+    let mut negative = text();
+    let dx_offset = u32::from_le_bytes(negative.data[64..68].try_into().unwrap()) as usize - 8;
+    negative.data[dx_offset..dx_offset + 4].copy_from_slice(&(-1i32).to_le_bytes());
+    assert!(super::metafile_text_can_be_lifted(
+      &independent,
+      Some("image/x-emf")
+    ));
+    assert!(!super::metafile_text_can_be_lifted(
+      &covered,
+      Some("image/x-emf")
+    ));
+    assert!(!super::metafile_text_can_be_lifted(
+      &destination,
+      Some("image/x-emf")
+    ));
+    let bridged = |page_scale, unit: EmfPlusUnitType, restore_font| {
+      let page = EmfPlusRecord::from_data(
+        &EmfPlusRecordData::SetPageTransform(EmfPlusSetPageTransformData { page_scale }),
+        EmfPlusRecordFlags::from_bits_retain(unit.raw() as u16),
+      )
+      .unwrap();
+      let mut records = vec![
+        emf_plus_header_comment(true),
+        emf_plus_comment_record(vec![page, emf_plus_record(EmfPlusRecordData::GetDc)]),
+        font(),
+        select_object_record(1),
+        select_object_record(0x8000_000d),
+      ];
+      if restore_font {
+        records.push(select_object_record(1));
+      }
+      records.push(text());
+      metafile_with_header_bounds(199, 199, records)
+    };
+    assert!(super::metafile_text_can_be_lifted(
+      &bridged(1.0, EmfPlusUnitType::Pixel, true),
+      Some("image/x-emf")
+    ));
+    for (index, unsupported) in [
+      bridged(1.0, EmfPlusUnitType::Pixel, false),
+      bridged(2.0, EmfPlusUnitType::Pixel, true),
+      bridged(1.0, EmfPlusUnitType::Point, true),
+      data(vec![emf_plus_header_comment(true), text()]),
+      data(vec![text(), text()]),
+      data(vec![negative]),
+      data(vec![
+        EmfRecord::new(
+          super::EMR_INTERSECT_CLIP_RECT,
+          [100i32, 100, 150, 150]
+            .into_iter()
+            .flat_map(i32::to_le_bytes)
+            .collect(),
+        ),
+        text(),
+      ]),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+      assert!(
+        !super::metafile_text_can_be_lifted(&unsupported, Some("image/x-emf")),
+        "unsupported boundary {index}"
+      );
+    }
   }
 
   #[test]
@@ -12564,6 +13780,8 @@ mod tests {
         suppress_solid_pattern_rects: false,
         suppress_bitmap_layers: false,
         wmf_external_header: None,
+        wmf_conversion_profile: None,
+        emf_text_advance_quantization: Default::default(),
       }
       .resolved_canvas_size(400, 300),
       (200, 100)
@@ -12588,6 +13806,8 @@ mod tests {
         suppress_solid_pattern_rects: false,
         suppress_bitmap_layers: false,
         wmf_external_header: None,
+        wmf_conversion_profile: None,
+        emf_text_advance_quantization: Default::default(),
       }
       .resolved_canvas_size(76, 76),
       (400, 300)
@@ -13059,6 +14279,302 @@ mod tests {
     assert_eq!(painted.get_pixel(2, 0).0, [255, 255, 255]);
     assert_eq!(lifted.get_pixel(1, 0).0, [255, 255, 255]);
     assert_eq!(lifted.get_pixel(2, 0).0, [255, 255, 255]);
+  }
+
+  #[test]
+  fn wmf_dib_stretch_uses_the_source_rectangle_before_resampling() {
+    // A two-plane icon mask selects only its upper scan line. The unused
+    // lower black line must not become part of the one-line destination.
+    let mut mask = bitmap_info(2, 2, 1, 0);
+    mask.extend_from_slice(&[0, 0, 0, 0, 255, 255, 255, 0]);
+    mask.extend_from_slice(&[0, 0, 0, 0, 0x40, 0, 0, 0]); // bottom-up rows
+    let bytes = masked_bitmap_wmf(mask, two_pixel_color_dib());
+    assert!(metafile_uses_binary_coverage_surface(&bytes).unwrap());
+    let layers = extract_metafile_bitmap_layers(&bytes, Some("image/x-wmf"));
+    assert_eq!(layers.len(), 1);
+    let decoded = decode_metafile_as_raster(&bytes, Some("image/x-wmf"))
+      .unwrap()
+      .unwrap();
+    let image = image::load_from_memory_with_format(&decoded.data, image::ImageFormat::Png)
+      .unwrap()
+      .to_rgb8();
+    assert_eq!(image.get_pixel(1, 0).0, [255, 0, 0]);
+    assert_eq!(image.get_pixel(2, 0).0, [255, 255, 255]);
+  }
+
+  #[test]
+  fn wmf_dx_alignment_translates_device_glyphs_after_realizing_their_origins() {
+    let bytes = copy_bitmap_wmf();
+    let metafile = WmfMetafileRef::from_bytes(&bytes).unwrap();
+    let render = |alignment| {
+      let mut state = WmfRenderState::new(
+        &metafile,
+        RenderOptions {
+          target_width_px: Some(300),
+          target_height_px: Some(106),
+          playback_width_px: Some(189),
+          ..RenderOptions::default()
+        },
+        GdiTextSurface::Color,
+        GdiPlusDcMode::Direct,
+      )
+      .unwrap();
+      state.canvas.window_ext_x = 90;
+      state.canvas.window_ext_y = 50;
+      let font = WmfTextFont {
+        width: 0,
+        height: -11,
+        escapement: 0,
+        family: Some("Arial".into()),
+        char_set: 0,
+        weight: 400,
+        italic: false,
+        quality: crate::wmf::WmfFontQuality::NonAntialiased.raw(),
+      };
+      state.canvas.draw_wmf_text(
+        EmfPoint { x: 45, y: 44 },
+        "ABCDEFGHIJKLM",
+        EmfColor { r: 0, g: 0, b: 0 },
+        &font,
+        Some(&[7, 6, 4, 5, 3, 7, 7, 8, 9, 4, 4, 5, 3]),
+        WmfTextAlignment {
+          flags: alignment,
+          logical_origin: None,
+        },
+      );
+      state.canvas.rgb
+    };
+    let left = render(WmfTextAlignmentModeFlags::empty());
+    let center = render(WmfTextAlignmentModeFlags::CENTER);
+    assert!(left.contains(&0));
+    // Native EMF/WMF 189x106 replay at scale 2.1x2.12 moves the complete
+    // 72-logical-unit string by floor(round(72 * 2.1) / 2) = 75 pixels.
+    for y in 0..106 {
+      assert_eq!(
+        &center[y * 900..y * 900 + 225 * 3],
+        &left[y * 900 + 75 * 3..(y + 1) * 900]
+      );
+    }
+  }
+
+  fn wmf_conversion_test_profile() -> WmfConversionProfile {
+    WmfConversionProfile {
+      dpi: [140, 140],
+      device_pixels: [3840, 2160],
+      device_millimeters: [697, 392],
+    }
+  }
+
+  #[test]
+  fn wmf_placeable_text_transform_matches_native_recording() {
+    // GDI+ DrawImage recorded into an EmfOnly metafile exposes the actual
+    // EMR_SETWORLDTRANSFORM at ExtTextOut, independently of font hinting.
+    for (width, height, inch, output, expected_x) in [
+      (71, 50, 94, (71, 51), 0.98900485),
+      (90, 50, 95, (189, 106), 2.095_911),
+    ] {
+      let bytes = copy_bitmap_wmf();
+      let mut metafile = WmfMetafileRef::from_bytes(&bytes).unwrap();
+      metafile.placeable_header = Some(
+        crate::wmf::WmfPlaceableHeader {
+          key: crate::wmf::PLACEABLE_KEY,
+          handle: 0,
+          left: 0,
+          top: 0,
+          right: width,
+          bottom: height,
+          inch,
+          reserved: 0,
+          checksum: 0,
+        }
+        .with_computed_checksum(),
+      );
+      let mut state = WmfRenderState::new(
+        &metafile,
+        RenderOptions {
+          target_width_px: Some(output.0),
+          target_height_px: Some(output.1),
+          wmf_conversion_profile: Some(wmf_conversion_test_profile()),
+          ..RenderOptions::default()
+        },
+        GdiTextSurface::Color,
+        GdiPlusDcMode::Direct,
+      )
+      .unwrap();
+      state.canvas.window_ext_x = i32::from(width);
+      state.canvas.window_ext_y = i32::from(height);
+      let (x, _) = state.canvas.map_text_vector(1.0, 0.0);
+      assert!((x - expected_x).abs() < 0.000001, "{x}");
+    }
+  }
+
+  #[test]
+  fn gdi_text_origin_rounding_matches_native_fixed_point_phases() {
+    // Native LPtoDP at the logical origin, translated through each signed
+    // phase; independent ExtTextOut rectangles move at these same cutoffs
+    // on both axes. These boundary values differ from ordinary float rounding.
+    for (phases, expected) in [(-64..=-34, -1.0), (-33..=29, 0.0), (30..=63, 1.0)] {
+      for phase in phases {
+        assert_eq!(
+          gdi_device_coordinate(phase as f32 / 64.0),
+          expected,
+          "{phase}"
+        );
+      }
+    }
+  }
+
+  #[test]
+  fn wmf_conversion_materializes_reference_device_advances_before_resizing() {
+    // Native SetWinMetaFileBits: Tahoma -11, a 90x50 / 95-inch placeable
+    // rectangle, and a 140-DPI reference DC. The realized 16-ppem widths
+    // become this logical Dx array in EMR_EXTTEXTOUTW.
+    assert_eq!(
+      wmf_logical_advances(
+        &[10., 9., 6., 8., 4., 11., 10., 11., 14., 5., 7., 7., 4.],
+        133. / 90.
+      ),
+      Some(vec![7, 6, 4, 5, 3, 7, 7, 8, 9, 4, 4, 5, 3])
+    );
+    let bytes = copy_bitmap_wmf();
+    let metafile = WmfMetafileRef::from_bytes(&bytes).unwrap();
+    let options = RenderOptions {
+      wmf_external_header: Some(WmfExternalHeader {
+        width_hundredths_mm: 2406,
+        height_hundredths_mm: 1337,
+        reference_device_dpi_x: 140,
+        reference_device_dpi_y: 140,
+      }),
+      wmf_conversion_profile: Some(wmf_conversion_test_profile()),
+      ..RenderOptions::default()
+    };
+    assert_eq!(
+      wmf_conversion_canvas_size(&metafile, options),
+      Some((133., 74.))
+    );
+    let make_state = |width, height, conversion| {
+      let mut state = WmfRenderState::new(
+        &metafile,
+        RenderOptions {
+          target_width_px: Some(width),
+          target_height_px: Some(height),
+          wmf_conversion_profile: conversion,
+          ..options
+        },
+        GdiTextSurface::Color,
+        GdiPlusDcMode::Direct,
+      )
+      .unwrap();
+      state.canvas.window_ext_x = 90;
+      state.canvas.window_ext_y = 50;
+      state.current_font.height = -11;
+      state.current_font.family = Some("Arial".into());
+      state
+    };
+    let mut small = make_state(189, 106, Some(wmf_conversion_test_profile()));
+    let mut large = make_state(378, 212, Some(wmf_conversion_test_profile()));
+    // Native GDI+ uses the converted EMF physical frame and the final pixel
+    // endpoint. Using 189/90 and 106/50 instead changes individual Dx origins.
+    let (x_axis, _) = small.canvas.map_text_vector(1.0, 0.0);
+    let (_, y_axis) = small.canvas.map_text_vector(0.0, 1.0);
+    assert!((x_axis - 2.095911).abs() < 0.00001);
+    assert!((y_axis - 2.109365).abs() < 0.00001);
+    // Bitmap playback keeps its full destination rectangle.
+    let origin = small.canvas.map_point(EmfPoint { x: 0, y: 0 });
+    let corner = small.canvas.map_point(EmfPoint { x: 90, y: 50 });
+    assert!((corner.0 - origin.0 - 189.0).abs() < 0.0001);
+    assert!((corner.1 - origin.1 - 106.0).abs() < 0.0001);
+    let advances = small.converted_text_advances("A BCD").unwrap();
+    assert!(advances.iter().all(|v| *v > 0));
+    assert_eq!(large.converted_text_advances("A BCD"), Some(advances));
+    assert!(
+      make_state(189, 106, None)
+        .converted_text_advances("A BCD")
+        .is_none()
+    );
+  }
+
+  #[test]
+  fn wmf_font_width_realizes_native_conversion_advances() {
+    let mut cache = RenderFontCache::load();
+    let mut font = WmfTextFont {
+      width: 50,
+      height: -148,
+      escapement: 0,
+      family: Some("Arial".into()),
+      char_set: 0,
+      weight: 400,
+      italic: false,
+      quality: 0,
+    };
+    // Captured SetWinMetaFileBits on the 140-DPI reference DC: a 2873-unit
+    // placeable square at 1437 units/inch becomes a 280-pixel viewport.
+    // Each value is the logical advance after cumulative device rounding.
+    for (width, expected) in [
+      (0, [92, 82, 52, 72, 82, 82, 82, 31]),
+      (25, [41, 31, 20, 31, 31, 31, 30, 11]),
+      (50, [72, 61, 41, 52, 61, 62, 61, 21]),
+      (100, [144, 123, 72, 112, 124, 123, 123, 51]),
+    ] {
+      font.width = width;
+      let ppem = 14.0 * cache.logical_font_width_scale(&font);
+      let advances = cache.character_advances(&font, "Personal", ppem).unwrap();
+      assert_eq!(
+        wmf_logical_advances(&advances, 280.0 / 2873.0).unwrap(),
+        expected,
+        "Width={width}, ppem={ppem}",
+      );
+    }
+  }
+
+  #[test]
+  fn wmf_natural_text_alignment_uses_realized_character_advances() {
+    let font = WmfTextFont {
+      width: 0,
+      height: -24,
+      escapement: 0,
+      family: Some("Arial".into()),
+      char_set: 0,
+      weight: 400,
+      italic: false,
+      quality: crate::wmf::WmfFontQuality::NonAntialiased.raw(),
+    };
+    let mut cache = RenderFontCache::load();
+    let bounds = |cache: &mut RenderFontCache, alignment| {
+      let glyphs = cache
+        .render_text(&TextRenderRequest {
+          font: &font,
+          text: "HHHH",
+          x: 150.0,
+          baseline_y: 50.0,
+          rotation_degrees: 0.0,
+          hinting_height: 24.0,
+          height: 24.0,
+          horizontal_scale: 1.0,
+          vertical_scale: 1.0,
+          advances: None,
+          natural_alignment: alignment,
+          surface: GdiTextSurface::Monochrome,
+        })
+        .expect("installed Arial or platform sans-serif fallback");
+      (
+        glyphs.iter().map(|g| g.left).min().unwrap(),
+        glyphs
+          .iter()
+          .map(|g| g.left + g.width as i32)
+          .max()
+          .unwrap(),
+      )
+    };
+    let left = bounds(&mut cache, WmfTextAlignmentModeFlags::empty());
+    let center = bounds(&mut cache, WmfTextAlignmentModeFlags::CENTER);
+    let right = bounds(&mut cache, WmfTextAlignmentModeFlags::RIGHT);
+    assert!(left.0 >= 150);
+    assert!(center.0 < 150 && center.1 > 150);
+    assert!((center.0 + center.1 - 300).abs() <= 3);
+    assert!(right.1 <= 151 && right.1 >= 147);
+    assert_eq!(left.1 - left.0, center.1 - center.0);
+    assert_eq!(left.1 - left.0, right.1 - right.0);
   }
 
   #[test]
@@ -13860,6 +15376,8 @@ mod tests {
         suppress_solid_pattern_rects: false,
         suppress_bitmap_layers: false,
         wmf_external_header: None,
+        wmf_conversion_profile: None,
+        emf_text_advance_quantization: Default::default(),
       },
     )
     .expect("minimal EMF bounds");
@@ -13903,6 +15421,8 @@ mod tests {
         suppress_solid_pattern_rects: false,
         suppress_bitmap_layers: false,
         wmf_external_header: None,
+        wmf_conversion_profile: None,
+        emf_text_advance_quantization: Default::default(),
       },
     )
     .expect("minimal EMF bounds");
@@ -14042,6 +15562,131 @@ mod tests {
       None,
       "a fill-only scene must not silently discard the default black outline"
     );
+  }
+
+  #[test]
+  fn classic_vector_drawing_retains_record_order_and_saved_rectangular_clips() {
+    let words = |values: &[i32]| {
+      values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect()
+    };
+    let metafile = metafile_with_header_bounds(
+      9,
+      9,
+      vec![
+        create_solid_brush_record(1, 0x0000_00ff),
+        select_object_record(1),
+        EmfRecord::new(33, Vec::new()),
+        EmfRecord::new(30, words(&[2, 2, 6, 6])),
+        EmfRecord::new(43, words(&[1, 1, 8, 8])),
+        EmfRecord::new(34, words(&[-1])),
+        EmfRecord::new(27, words(&[0, 4])),
+        EmfRecord::new(54, words(&[8, 4])),
+      ],
+    );
+    let drawing = super::extract_metafile_vector_drawing_with_options(
+      &metafile,
+      Some("image/x-emf"),
+      RenderOptions::default(),
+    )
+    .unwrap()
+    .expect("complete clipped rectangle followed by an independent line");
+    assert_eq!(drawing.operations.len(), 3);
+    let super::MetafileVectorDraw::Fill { fill, clip } = &drawing.operations[0] else {
+      panic!("rectangle fill must precede its outline");
+    };
+    assert_eq!(fill.color, [255, 0, 0]);
+    assert_eq!(*clip, Some([0.2, 0.2, 0.6, 0.6]));
+    assert!(matches!(
+      drawing.operations[1],
+      super::MetafileVectorDraw::Stroke {
+        closed: true,
+        clip: Some(_),
+        ..
+      }
+    ));
+    assert!(matches!(
+      drawing.operations[2],
+      super::MetafileVectorDraw::Stroke {
+        closed: false,
+        clip: None,
+        ..
+      }
+    ));
+    assert!(
+      extract_metafile_vector_scene(&metafile, Some("image/x-emf"))
+        .unwrap()
+        .is_none()
+    );
+  }
+
+  #[test]
+  fn classic_vector_drawing_requires_supported_complete_cosmetic_paint() {
+    let words = |values: &[i32]| {
+      values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect()
+    };
+    for (style, width, supported) in [(0, 0, true), (0, 1, true), (0, 2, false), (2, 1, false)] {
+      let metafile = metafile_with_header_bounds(
+        9,
+        9,
+        vec![
+          EmfRecord::new(38, words(&[2, style, width, 0, 0])),
+          select_object_record(2),
+          triangle_polygon16_record(),
+        ],
+      );
+      let drawing = super::extract_metafile_vector_drawing_with_options(
+        &metafile,
+        Some("image/x-emf"),
+        RenderOptions::default(),
+      )
+      .unwrap();
+      assert_eq!(drawing.is_some(), supported, "style={style}, width={width}");
+      if let Some(drawing) = drawing {
+        assert_eq!(drawing.operations.len(), 2);
+        assert!(matches!(
+          drawing.operations[0],
+          super::MetafileVectorDraw::Fill { .. }
+        ));
+        assert!(matches!(
+          drawing.operations[1],
+          super::MetafileVectorDraw::Stroke {
+            closed: true,
+            width: [0.1, 0.1],
+            ..
+          }
+        ));
+      }
+    }
+    for extra in [
+      EmfRecord::new(20, words(&[7])),
+      EmfRecord::new(42, words(&[1, 1, 8, 8])),
+    ] {
+      let metafile = metafile_with_header_bounds(
+        9,
+        9,
+        vec![
+          triangle_polygon16_record(),
+          extra,
+          triangle_polygon16_record(),
+        ],
+      );
+      assert!(
+        super::extract_metafile_vector_drawing_with_options(
+          &metafile,
+          Some("image/x-emf"),
+          RenderOptions::default()
+        )
+        .unwrap()
+        .is_none(),
+        "one unsupported operation must reject the complete drawing"
+      );
+    }
   }
 
   #[test]
@@ -15253,6 +16898,112 @@ mod tests {
   }
 
   #[test]
+  fn gdi_cleartype_samples_unhinted_rectangles_at_subpixel_centres() {
+    // Native ExtTextOutW, qualities 5 and 6, a synthetic 4096-unit font
+    // at 64 ppem, no bytecode. Clockwise rectangles are two pixels wide
+    // and five pixels tall. Each channel is the count of six source samples.
+    for (phase, samples) in [
+      (
+        0,
+        [
+          [0, 0, 2],
+          [4, 6, 6],
+          [6, 6, 4],
+          [2, 0, 0],
+          [0, 0, 0],
+          [0, 0, 0],
+        ],
+      ),
+      (
+        1,
+        [
+          [0, 0, 2],
+          [4, 6, 6],
+          [6, 6, 4],
+          [2, 0, 0],
+          [0, 0, 0],
+          [0, 0, 0],
+        ],
+      ),
+      (
+        16,
+        [
+          [0, 0, 1],
+          [3, 5, 6],
+          [6, 6, 6],
+          [4, 2, 0],
+          [0, 0, 0],
+          [0, 0, 0],
+        ],
+      ),
+      (
+        32,
+        [
+          [0, 0, 0],
+          [1, 3, 5],
+          [6, 6, 6],
+          [5, 3, 1],
+          [0, 0, 0],
+          [0, 0, 0],
+        ],
+      ),
+      (
+        48,
+        [
+          [0, 0, 0],
+          [0, 2, 4],
+          [6, 6, 6],
+          [6, 5, 3],
+          [1, 0, 0],
+          [0, 0, 0],
+        ],
+      ),
+      (
+        63,
+        [
+          [0, 0, 0],
+          [0, 0, 2],
+          [4, 6, 6],
+          [6, 6, 4],
+          [2, 0, 0],
+          [0, 0, 0],
+        ],
+      ),
+    ] {
+      let left = 1.0 + phase as f32 / 64.0;
+      let mut builder = TinySkiaPathBuilder::new();
+      builder.move_to(left, 5.0);
+      builder.line_to(left + 2.0, 5.0);
+      builder.line_to(left + 2.0, 0.0);
+      builder.line_to(left, 0.0);
+      builder.close();
+      let glyph = rasterize_gdi_glyph(
+        builder.finish().unwrap(),
+        10.0,
+        10.0,
+        0.0,
+        1.0,
+        1.0,
+        GdiGlyphFormat::Lcd,
+      )
+      .unwrap();
+      let RenderedGlyphMask::Lcd(coverage) = glyph.mask else {
+        panic!("expected LCD coverage")
+      };
+      for (x, samples) in samples.into_iter().enumerate() {
+        let column = 10 + x as i32 - glyph.left;
+        let actual = if column < 0 || column as usize >= glyph.width {
+          [0; 3]
+        } else {
+          coverage[(7 - glyph.top) as usize * glyph.width + column as usize]
+        };
+        let expected = samples.map(|count: u16| (count * 255 / 6) as u8);
+        assert_eq!(actual, expected, "phase {phase}/64, column {x}");
+      }
+    }
+  }
+
+  #[test]
   fn gdi_cleartype_scanline_uses_bilevel_six_sample_source() {
     let mut builder = TinySkiaPathBuilder::new();
     builder.move_to(0.25, 0.25);
@@ -15264,7 +17015,7 @@ mod tests {
 
     assert_eq!(
       rasterize_gdi_cleartype_scanlines(&path, 3, 3).unwrap(),
-      [0, 255, 0, 0, 255, 0, 0, 0, 0],
+      [255, 255, 0, 255, 255, 0, 0, 0, 0],
       "device-row and high-resolution X centres produce the bi-level ClearType source"
     );
   }
@@ -15281,7 +17032,7 @@ mod tests {
 
     assert_eq!(
       rasterize_gdi_cleartype_path(&path, 3, 3).unwrap(),
-      [0, 255, 0, 0, 255, 0, 0, 0, 0],
+      [255, 255, 0, 255, 255, 0, 0, 0, 0],
       "the path wrapper must not introduce analytical or vertical area coverage"
     );
   }
@@ -15889,5 +17640,214 @@ mod tests {
     assert!((runs[0].width.unwrap() - 0.12).abs() < 0.000_1);
     assert!((runs[1].x - 0.22).abs() < 0.000_1);
     assert!((runs[1].y - 0.20).abs() < 0.000_1);
+  }
+
+  #[test]
+  fn gdi_symmetric_cleartype_matches_native_two_axis_rectangles() {
+    // Native GDI quality 5, a project-generated uninstructed 4096-UPEM font,
+    // 64 ppem: 8 x 8 glyphs vary X and Y by one eighth of a pixel. These
+    // counts were recovered from a white DIB (seven distinct gamma values).
+    // Rows index the covered vertical samples; columns the horizontal ones.
+    let native_counts = [
+      [0, 0, 0, 0, 0, 0, 0],
+      [0, 0, 0, 0, 0, 1, 1],
+      [0, 0, 1, 1, 1, 2, 2],
+      [0, 1, 1, 2, 3, 3, 4],
+      [0, 1, 2, 3, 4, 4, 5],
+      [0, 1, 2, 3, 4, 5, 6],
+    ];
+    for phase_y in 0..8 {
+      for phase_x in 0..8 {
+        let dx = phase_x as f32 / 8.0;
+        let dy = phase_y as f32 / 8.0;
+        let left = 98.0 / 64.0 + dx;
+        let right = 226.0 / 64.0 + dx;
+        let mut builder = TinySkiaPathBuilder::new();
+        builder.move_to(left, 5.0 + dy);
+        builder.line_to(right, 5.0 + dy);
+        builder.line_to(right, dy);
+        builder.line_to(left, dy);
+        builder.close();
+        let glyph = rasterize_gdi_glyph(
+          builder.finish().unwrap(),
+          10.0,
+          10.0,
+          0.0,
+          1.0,
+          1.0,
+          GdiGlyphFormat::LcdSymmetric,
+        )
+        .unwrap();
+        let RenderedGlyphMask::Lcd(coverage) = &glyph.mask else {
+          panic!("expected LCD");
+        };
+        for row in 4..=10 {
+          let n = (0..5)
+            .filter(|&j| {
+              let y = row as f32 + (j as f32 + 0.5) / 5.0;
+              (10.0 - 5.0 - dy..=10.0 - dy).contains(&y)
+            })
+            .count();
+          for column in 9..=16 {
+            let index = if column >= glyph.left
+              && column < glyph.left + glyph.width as i32
+              && row >= glyph.top
+              && row < glyph.top + glyph.height as i32
+            {
+              Some((row - glyph.top) as usize * glyph.width + (column - glyph.left) as usize)
+            } else {
+              None
+            };
+            let actual = index.map_or([0; 3], |i| coverage[i]);
+            for (channel, shift) in [-2, 0, 2].into_iter().enumerate() {
+              let k = (0..6)
+                .filter(|&j| {
+                  let x = ((column - 10) * 6 + shift + j) as f32 / 6.0 + 1.0 / 12.0;
+                  (left..=right).contains(&x)
+                })
+                .count();
+              let expected = (native_counts[n][k] * 255 / 6) as u8;
+              assert_eq!(
+                actual[channel], expected,
+                "phase {phase_x},{phase_y}; sample {column},{row}; channel {channel}"
+              );
+            }
+          }
+        }
+      }
+    }
+  }
+
+  #[test]
+  fn gdi_cleartype_gasp_selects_native_vertical_smoothing() {
+    assert!(gdi_cleartype_symmetric_smoothing(None, 23));
+    assert!(gdi_cleartype_symmetric_smoothing(Some(&[]), 23));
+    for version in 0_u16..=1 {
+      for flags in 0_u16..16 {
+        let table = [version, 1, 65535, flags]
+          .into_iter()
+          .flat_map(u16::to_be_bytes)
+          .collect::<Vec<_>>();
+        let expected = version == 0 || !(4..8).contains(&flags);
+        assert_eq!(
+          gdi_cleartype_symmetric_smoothing(Some(&table), 23),
+          expected,
+          "version {version}, flags {flags}"
+        );
+      }
+    }
+    let ranges = [1_u16, 2, 16, 5, 65535, 15]
+      .into_iter()
+      .flat_map(u16::to_be_bytes)
+      .collect::<Vec<_>>();
+    assert!(!gdi_cleartype_symmetric_smoothing(Some(&ranges), 16));
+    assert!(gdi_cleartype_symmetric_smoothing(Some(&ranges), 17));
+  }
+  fn assert_gdi_instruction_sheet(font: &[u8], native: &[u8], compatible_widths: bool) {
+    let bytes = copy_bitmap_wmf();
+    let mf = WmfMetafileRef::from_bytes(&bytes).unwrap();
+    let face = FontRef::new(font).unwrap();
+    let hinting = gdi_hinting::GdiHinting::new(&face, 64.0, true, compatible_widths).unwrap();
+    let mut state = WmfRenderState::new(
+      &mf,
+      RenderOptions {
+        target_width_px: Some(280),
+        target_height_px: Some(32),
+        background_color: Some([13, 11, 12]),
+        font_smoothing_contrast: Some(1200),
+        ..RenderOptions::default()
+      },
+      GdiTextSurface::Color,
+      GdiPlusDcMode::Direct,
+    )
+    .unwrap();
+    for i in 0..64u32 {
+      let id = face.charmap().map(char::from_u32(33 + i).unwrap()).unwrap();
+      let path = hinting.draw(&face, id).unwrap();
+      let glyph = rasterize_gdi_glyph(
+        path,
+        (10 + i % 32 * 8) as f32,
+        (10 + i / 32 * 12) as f32,
+        0.0,
+        1.0,
+        1.0,
+        GdiGlyphFormat::LcdSymmetric,
+      )
+      .unwrap();
+      state
+        .canvas
+        .draw_gdi_glyph(&glyph, EmfColor { r: 0, g: 0, b: 0 });
+    }
+    let expected = image::load_from_memory(native).unwrap().to_rgba8();
+    for (i, (actual, expected)) in state
+      .canvas
+      .rgb
+      .as_chunks::<3>()
+      .0
+      .iter()
+      .zip(expected.pixels())
+      .enumerate()
+    {
+      let actual = if *actual == [13, 11, 12] {
+        [0, 0, 0, 0]
+      } else {
+        [actual[0], actual[1], actual[2], 255]
+      };
+      assert_eq!(
+        actual,
+        expected.0,
+        "native ClearType pixel ({}, {})",
+        i % 280,
+        i / 280
+      );
+    }
+  }
+
+  #[test]
+  fn gdi_cleartype_instructions_match_native_pixels() {
+    assert_gdi_instruction_sheet(
+      include_bytes!("render/testdata/cleartype-instructions.ttf"),
+      include_bytes!("render/testdata/cleartype-instructions.png"),
+      true,
+    );
+  }
+
+  #[test]
+  fn gdi_cleartype_getinfo_matches_native_qualities() {
+    assert_gdi_instruction_sheet(
+      include_bytes!("render/testdata/cleartype-version.ttf"),
+      include_bytes!("render/testdata/cleartype-version.png"),
+      true,
+    );
+    for (compatible, native) in [
+      (
+        true,
+        include_bytes!("render/testdata/cleartype-getinfo-compatible.png").as_slice(),
+      ),
+      (
+        false,
+        include_bytes!("render/testdata/cleartype-getinfo-natural.png").as_slice(),
+      ),
+    ] {
+      assert_gdi_instruction_sheet(
+        include_bytes!("render/testdata/cleartype-getinfo.ttf"),
+        native,
+        compatible,
+      );
+    }
+  }
+
+  #[test]
+  fn gdi_cleartype_adapter_preserves_uninstructed_fallback() {
+    let face = FontRef::new(include_bytes!("render/testdata/cleartype-rectangle.ttf")).unwrap();
+    let hinting = gdi_hinting::GdiHinting::new(&face, 64.0, true, true).unwrap();
+    assert!(
+      hinting
+        .draw(&face, face.charmap().map('A').unwrap())
+        .is_none()
+    );
+    for ppem in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+      assert!(gdi_hinting::GdiHinting::new(&face, ppem, true, true).is_none());
+    }
   }
 }

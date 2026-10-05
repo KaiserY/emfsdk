@@ -59,6 +59,55 @@ pub struct MetafileVectorScene {
   pub fills: Vec<MetafileVectorFill>,
 }
 
+/// An ordered classic GDI operation, including its device-space clipping.
+#[derive(Clone, Debug, PartialEq)]
+pub enum MetafileVectorDraw {
+  Fill {
+    fill: MetafileVectorFill,
+    clip: Option<[f32; 4]>,
+  },
+  Stroke {
+    subpaths: Vec<Vec<MetafileVectorPoint>>,
+    color: [u8; 3],
+    /// One cosmetic device pixel along the two normalized playback axes.
+    width: [f32; 2],
+    closed: bool,
+    clip: Option<[f32; 4]>,
+  },
+}
+
+/// A complete classic solid-brush/cosmetic-pen fixed-output drawing.
+///
+/// Kept separate from the established fill-only scene so existing callers
+/// retain their completeness and raster-fallback contract.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MetafileVectorDrawing {
+  pub operations: Vec<MetafileVectorDraw>,
+}
+
+/// Lift a complete classic EMF drawing after independent layers were removed.
+///
+/// This is the fixed-output path for solid fills, one-device-pixel pens and
+/// rectangular DC clips. Unsupported paint, pen styles, destination operations
+/// and non-rectangular clips still reject the entire scene. WMF and EMF+ retain
+/// their established paths.
+pub fn extract_metafile_vector_drawing_with_options(
+  data: &[u8],
+  content_type: Option<&str>,
+  options: RenderOptions,
+) -> RenderResult<Option<MetafileVectorDrawing>> {
+  if !looks_like_metafile(data, content_type) || !is_emf(data) {
+    return Ok(None);
+  }
+  extract_emf_interpreter(data, options, true)
+    .map(|interpreter| {
+      interpreter.map(|interpreter| MetafileVectorDrawing {
+        operations: interpreter.drawing.unwrap_or_default(),
+      })
+    })
+    .map_err(RenderError::from)
+}
+
 /// Extracts a vector scene using the metafile's self-contained playback
 /// geometry.
 pub fn extract_metafile_vector_scene(
@@ -198,6 +247,51 @@ impl VectorMapping {
     (x.is_finite() && y.is_finite()).then_some(MetafileVectorPoint { x, y })
   }
 
+  fn map_device_point(self, point: EmfPoint, centered: bool) -> Option<MetafileVectorPoint> {
+    let point = self.map_point(point)?;
+    // Classic polygon/line playback addresses device pixel centers. Its
+    // outer endpoint is separate from the inclusive GDI+ header surface.
+    // Rectangle records retain their explicit inclusive box below.
+    let offset = if centered { 0.5 } else { 0.0 };
+    let x = (point.x * self.surface_width + offset) / (self.surface_width - 1.0);
+    let y = (point.y * self.surface_height + offset) / (self.surface_height - 1.0);
+    (x.is_finite() && y.is_finite()).then_some(MetafileVectorPoint { x, y })
+  }
+
+  fn map_clip_rect(self, rect: crate::types::RectL) -> Option<[f32; 4]> {
+    if rect.right <= rect.left || rect.bottom <= rect.top {
+      return Some([0.0; 4]);
+    }
+    let points = [
+      EmfPoint {
+        x: rect.left,
+        y: rect.top,
+      },
+      EmfPoint {
+        x: rect.right,
+        y: rect.top,
+      },
+      EmfPoint {
+        x: rect.right,
+        y: rect.bottom,
+      },
+      EmfPoint {
+        x: rect.left,
+        y: rect.bottom,
+      },
+    ];
+    let mapped = points.map(|point| self.map_point(point));
+    let [Some(a), Some(b), Some(c), Some(d)] = mapped else {
+      return None;
+    };
+    if !((a.y == b.y && b.x == c.x && c.y == d.y && d.x == a.x)
+      || (a.x == b.x && b.y == c.y && c.x == d.x && d.y == a.y))
+    {
+      return None;
+    }
+    Some([a.x.min(c.x), a.y.min(c.y), a.x.max(c.x), a.y.max(c.y)])
+  }
+
   fn reset_for_emf_device_context(mut self) -> Self {
     let width = self.surface_width.max(1.0).round() as i32;
     let height = self.surface_height.max(1.0).round() as i32;
@@ -241,12 +335,14 @@ struct VectorGraphicsState {
   binary_raster_operation: Option<WmfBinaryRasterOperation>,
   fill_rule: MetafileVectorFillRule,
   current_pos: EmfPoint,
+  clip: Option<[f32; 4]>,
 }
 
 struct VectorInterpreter {
   graphics: VectorGraphicsState,
   saved: Vec<VectorGraphicsState>,
   fills: Vec<MetafileVectorFill>,
+  drawing: Option<Vec<MetafileVectorDraw>>,
 }
 
 impl VectorInterpreter {
@@ -260,9 +356,11 @@ impl VectorInterpreter {
         binary_raster_operation: Some(WmfBinaryRasterOperation::CopyPen),
         fill_rule: MetafileVectorFillRule::Alternate,
         current_pos: EmfPoint { x: 0, y: 0 },
+        clip: None,
       },
       saved: Vec::new(),
       fills: Vec::new(),
+      drawing: None,
     }
   }
 
@@ -286,14 +384,15 @@ impl VectorInterpreter {
   fn emit_polygons(&mut self, polygons: &[Vec<EmfPoint>]) -> bool {
     // Polygon and PolyPolygon both stroke their contours after filling. A
     // visible pen therefore makes a fill-only PDF scene incomplete.
-    if self.graphics.pen != VectorPen::Null {
+    if self.drawing.is_none() && self.graphics.pen != VectorPen::Null {
       return false;
     }
-    let color = match self.graphics.brush {
-      VectorBrush::Solid(color) => color,
-      VectorBrush::Null => return true,
-      VectorBrush::Unsupported => return false,
-    };
+    if self.graphics.brush == VectorBrush::Unsupported {
+      return false;
+    }
+    if self.drawing.is_none() && self.graphics.brush == VectorBrush::Null {
+      return true;
+    }
     let mut subpaths = Vec::with_capacity(polygons.len());
     for polygon in polygons {
       if polygon.len() < 2 {
@@ -301,20 +400,144 @@ impl VectorInterpreter {
       }
       let mut mapped = Vec::with_capacity(polygon.len());
       for point in polygon {
-        let Some(point) = self.graphics.mapping.map_point(*point) else {
+        let point = if self.drawing.is_some() {
+          self
+            .graphics
+            .mapping
+            .map_device_point(*point, self.graphics.pen != VectorPen::Null)
+        } else {
+          self.graphics.mapping.map_point(*point)
+        };
+        let Some(point) = point else {
           return false;
         };
         mapped.push(point);
       }
       subpaths.push(mapped);
     }
-    if !subpaths.is_empty() {
-      self.fills.push(MetafileVectorFill {
-        subpaths,
+    self.emit_mapped_polygons(subpaths)
+  }
+
+  fn emit_mapped_polygons(&mut self, subpaths: Vec<Vec<MetafileVectorPoint>>) -> bool {
+    if subpaths.is_empty() {
+      return true;
+    }
+    if self.drawing.is_none() {
+      if let VectorBrush::Solid(color) = self.graphics.brush {
+        self.fills.push(MetafileVectorFill {
+          subpaths,
+          color,
+          fill_rule: self.graphics.fill_rule,
+        });
+      }
+      return true;
+    }
+    if let VectorBrush::Solid(color) = self.graphics.brush {
+      let fill = MetafileVectorFill {
+        subpaths: subpaths.clone(),
         color,
         fill_rule: self.graphics.fill_rule,
-      });
+      };
+      if let Some(drawing) = &mut self.drawing {
+        drawing.push(MetafileVectorDraw::Fill {
+          fill,
+          clip: self.graphics.clip,
+        });
+      }
     }
+    self.emit_mapped_stroke(subpaths, true)
+  }
+
+  fn emit_mapped_stroke(&mut self, subpaths: Vec<Vec<MetafileVectorPoint>>, closed: bool) -> bool {
+    let color = match self.graphics.pen {
+      VectorPen::Null => return true,
+      VectorPen::SolidCosmetic(color) => color,
+      VectorPen::Unsupported => return false,
+    };
+    if self.graphics.binary_raster_operation != Some(WmfBinaryRasterOperation::CopyPen) {
+      return false;
+    }
+    let Some(drawing) = &mut self.drawing else {
+      return false;
+    };
+    drawing.push(MetafileVectorDraw::Stroke {
+      subpaths,
+      color,
+      width: [
+        1.0 / self.graphics.mapping.surface_width,
+        1.0 / self.graphics.mapping.surface_height,
+      ],
+      closed,
+      clip: self.graphics.clip,
+    });
+    true
+  }
+
+  fn emit_polyline(&mut self, points: &[EmfPoint]) -> bool {
+    if self.graphics.pen == VectorPen::Null || points.len() < 2 {
+      return true;
+    }
+    let Some(mapped) = points
+      .iter()
+      .map(|point| self.graphics.mapping.map_device_point(*point, true))
+      .collect::<Option<Vec<_>>>()
+    else {
+      return false;
+    };
+    self.emit_mapped_stroke(vec![mapped], false)
+  }
+
+  fn emit_rectangle(&mut self, rect: crate::types::RectL) -> bool {
+    if self.graphics.brush == VectorBrush::Unsupported {
+      return false;
+    }
+    let Some(right) = rect.right.checked_add(1) else {
+      return false;
+    };
+    let Some(bottom) = rect.bottom.checked_add(1) else {
+      return false;
+    };
+    let points = [
+      EmfPoint {
+        x: rect.left,
+        y: rect.top,
+      },
+      EmfPoint {
+        x: right,
+        y: rect.top,
+      },
+      EmfPoint {
+        x: right,
+        y: bottom,
+      },
+      EmfPoint {
+        x: rect.left,
+        y: bottom,
+      },
+    ];
+    let Some(mapped) = points
+      .into_iter()
+      .map(|point| self.graphics.mapping.map_point(point))
+      .collect::<Option<Vec<_>>>()
+    else {
+      return false;
+    };
+    self.emit_mapped_polygons(vec![mapped])
+  }
+
+  fn intersect_clip(&mut self, rect: crate::types::RectL) -> bool {
+    let Some(mut clip) = self.graphics.mapping.map_clip_rect(rect) else {
+      return false;
+    };
+    if let Some(previous) = self.graphics.clip {
+      clip = [
+        previous[0].max(clip[0]),
+        previous[1].max(clip[1]),
+        previous[2].min(clip[2]),
+        previous[3].min(clip[3]),
+      ];
+    }
+    self.graphics.clip = Some(clip);
     true
   }
 
@@ -345,6 +568,7 @@ fn begin_vector_emf_device_context(
     binary_raster_operation: Some(WmfBinaryRasterOperation::CopyPen),
     fill_rule: MetafileVectorFillRule::Alternate,
     current_pos: EmfPoint { x: 0, y: 0 },
+    clip: None,
   };
   bridge
 }
@@ -447,8 +671,19 @@ fn extract_emf_scene(
   data: &[u8],
   options: RenderOptions,
 ) -> Result<Option<MetafileVectorScene>, String> {
+  Ok(extract_emf_interpreter(data, options, false)?.map(VectorInterpreter::finish))
+}
+
+fn extract_emf_interpreter(
+  data: &[u8],
+  options: RenderOptions,
+  drawing: bool,
+) -> Result<Option<VectorInterpreter>, String> {
   let metafile = EmfMetafileRef::from_bytes(data).map_err(|error| error.to_string())?;
   let mut interpreter = VectorInterpreter::new(VectorMapping::emf(data)?);
+  if drawing {
+    interpreter.drawing = Some(Vec::new());
+  }
   let mut objects = HashMap::<u32, VectorObject>::new();
   let mut saw_eof = false;
   let mut saw_intersect_clip = false;
@@ -585,7 +820,7 @@ fn extract_emf_scene(
           Some(EmrPenLineStyle::Null) => VectorPen::Null,
           Some(EmrPenLineStyle::Solid)
             if value.pen_type_kind() == Some(EmrPenType::Cosmetic)
-              && value.width.x == 0
+              && (value.width.x == 0 || (drawing && value.width.x == 1))
               && value.width.y == 0
               && value.pen_reserved_bits() == 0 =>
           {
@@ -640,6 +875,8 @@ fn extract_emf_scene(
         let end = point_l(value.point);
         let supported = if interpreter.graphics.pen == VectorPen::Null {
           true
+        } else if drawing {
+          interpreter.emit_polyline(&[start, end])
         } else if options.suppress_solid_pattern_rects
           && emf_line_can_be_covered_by_patcopy(start, end, interpreter.graphics)
         {
@@ -650,6 +887,14 @@ fn extract_emf_scene(
         };
         interpreter.graphics.current_pos = end;
         supported
+      }
+      EmfRecordData::Polyline(value) if drawing => {
+        let points = value.points.into_iter().map(point_l).collect::<Vec<_>>();
+        interpreter.emit_polyline(&points)
+      }
+      EmfRecordData::Polyline16(value) if drawing => {
+        let points = value.points.into_iter().map(point_s).collect::<Vec<_>>();
+        interpreter.emit_polyline(&points)
       }
       EmfRecordData::Polyline(_) | EmfRecordData::Polyline16(_) => {
         interpreter.graphics.pen == VectorPen::Null
@@ -685,12 +930,19 @@ fn extract_emf_scene(
         let polygons = split_emf_polygons_s(&value.counts, &value.points);
         interpreter.emit_polygons(&polygons)
       }
+      EmfRecordData::Rectangle(value) if drawing => interpreter.emit_rectangle(value.bounds),
+      EmfRecordData::IntersectClipRect(value) if drawing => interpreter.intersect_clip(value.rect),
       EmfRecordData::IntersectClipRect(_) if decomposed_stream => {
         saw_intersect_clip = true;
         true
       }
       EmfRecordData::ExtSelectClipRgn(value) => {
-        value.region_data.is_empty() && value.region_mode_kind() == Some(EmrRegionMode::Copy)
+        let supported =
+          value.region_data.is_empty() && value.region_mode_kind() == Some(EmrRegionMode::Copy);
+        if supported {
+          interpreter.graphics.clip = None;
+        }
+        supported
       }
       EmfRecordData::ExtTextOutA(_)
       | EmfRecordData::ExtTextOutW(_)
@@ -766,7 +1018,7 @@ fn extract_emf_scene(
   if pending_line.is_some() || (saw_intersect_clip && !interpreter.fills.is_empty()) {
     return Ok(None);
   }
-  Ok(saw_eof.then(|| interpreter.finish()))
+  Ok(saw_eof.then_some(interpreter))
 }
 
 fn extract_wmf_scene(
