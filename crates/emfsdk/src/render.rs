@@ -19,9 +19,11 @@ use tiny_skia::{
 };
 
 mod area_raster;
+mod bitmap_picture;
 mod gdi_hinting;
 mod text_layer;
 
+pub use bitmap_picture::{MetafileBitmapPicture, extract_metafile_bitmap_picture_with_options};
 pub use gdi_hinting::GdiNaturalMetrics;
 
 use area_raster::rasterize_nonzero_path;
@@ -741,6 +743,114 @@ pub fn extract_metafile_bitmap_layers_with_options(
     return Vec::new();
   }
   extract_wmf_bitmap_layers(data, options.wmf_external_header)
+}
+
+/// Preserve a full-frame opaque WMF StretchDIB picture at its source resolution.
+///
+/// SRCCOPY replaces preceding paint. This accepts only one complete source
+/// bitmap covering the viewport, with no persistent clip, later paint,
+/// destination-dependent operation or embedded EMF. Other streams retain the
+/// ordinary metafile replay path.
+pub fn extract_metafile_full_bitmap_with_options(
+  data: &[u8],
+  options: RenderOptions,
+) -> Option<MetafileBitmapLayer> {
+  if options.suppress_bitmap_layers
+    || options.monochrome_dib_palette_override.is_some()
+    || !crate::wmf::looks_like_wmf(data)
+    || !matches!(crate::wmf::embedded_enhanced_metafile(data), Ok(None))
+  {
+    return None;
+  }
+  let metafile = WmfMetafileRef::from_bytes(data).ok()?;
+  let mut state = WmfSolidRectState::new(&metafile, options.wmf_external_header);
+  let mut bitmap = None;
+  for record in metafile.records() {
+    match record.parse_data().ok()? {
+      WmfRecordData::Eof(_) => break,
+      WmfRecordData::SaveDc => state.save(),
+      WmfRecordData::RestoreDc(_) => state.restore(),
+      WmfRecordData::SetWindowOrg(value) => {
+        state.window_org_x = i32::from(value.x);
+        state.window_org_y = i32::from(value.y);
+      }
+      WmfRecordData::SetWindowExt(value) => {
+        state.window_ext_x = nonzero_mapping_extent(i32::from(value.x));
+        state.window_ext_y = nonzero_mapping_extent(i32::from(value.y));
+      }
+      WmfRecordData::SetViewportOrg(value) => {
+        state.viewport_org_x = i32::from(value.x);
+        state.viewport_org_y = i32::from(value.y);
+      }
+      WmfRecordData::SetViewportExt(value) => {
+        state.viewport_ext_x = nonzero_mapping_extent(i32::from(value.x));
+        state.viewport_ext_y = nonzero_mapping_extent(i32::from(value.y));
+      }
+      WmfRecordData::OffsetWindowOrg(value) => {
+        state.window_org_x += i32::from(value.x);
+        state.window_org_y += i32::from(value.y);
+      }
+      WmfRecordData::OffsetViewportOrg(value) => {
+        state.viewport_org_x += i32::from(value.x);
+        state.viewport_org_y += i32::from(value.y);
+      }
+      WmfRecordData::ScaleWindowExt(value) => state.scale_window(value),
+      WmfRecordData::ScaleViewportExt(value) => state.scale_viewport(value),
+      WmfRecordData::StretchDib(value) => {
+        if bitmap.is_some()
+          || value.raster_operation_code() != WmfTernaryRasterOperationCode::SRCCOPY
+          || value.color_usage_kind() != Some(DibColorUsage::RgbColors)
+          || value.x_src != 0
+          || value.y_src != 0
+          || value.src_width <= 0
+          || value.src_height <= 0
+        {
+          return None;
+        }
+        let (x, y, width, height, flip_x, flip_y) = state.normalized_rect(
+          i32::from(value.x_dest),
+          i32::from(value.y_dest),
+          i32::from(value.dest_width),
+          i32::from(value.dest_height),
+        )?;
+        if (x, y, width, height) != (0.0, 0.0, 1.0, 1.0) || flip_x || flip_y {
+          return None;
+        }
+        bitmap = Some(value);
+      }
+      WmfRecordData::TextOut(_) | WmfRecordData::ExtTextOut(_) if bitmap.is_none() => {}
+      WmfRecordData::Escape(value)
+        if value.escape_function == crate::wmf::WmfMetafileEscape::MetaFile.raw() => {}
+      WmfRecordData::CreateFontIndirect(_)
+      | WmfRecordData::SelectObject(_)
+      | WmfRecordData::DeleteObject(_)
+      | WmfRecordData::SetBkMode(_)
+      | WmfRecordData::SetBkColor(_)
+      | WmfRecordData::SetTextColor(_)
+      | WmfRecordData::SetTextAlign(_)
+      | WmfRecordData::SetTextCharExtra(_)
+      | WmfRecordData::SetTextJustification(_)
+      | WmfRecordData::SetStretchBltMode(_) => {}
+      _ => return None,
+    }
+  }
+  let bitmap = bitmap?;
+  let source = packed_dib_to_rgb(&bitmap.dib, DibColorUsage::RgbColors)
+    .ok()
+    .flatten()?;
+  if source.width != bitmap.src_width as usize || source.height != bitmap.src_height as usize {
+    return None;
+  }
+  Some(MetafileBitmapLayer {
+    data: rgb_to_png(&source.rgb, source.width as u32, source.height as u32).ok()?,
+    content_type: "image/png",
+    x: 0.0,
+    y: 0.0,
+    width: 1.0,
+    height: 1.0,
+    flip_horizontal: false,
+    flip_vertical: false,
+  })
 }
 
 fn extract_emf_text_runs(data: &[u8], options: RenderOptions) -> Vec<MetafileTextRun> {
@@ -14238,6 +14348,120 @@ mod tests {
   }
 
   #[test]
+  fn wmf_full_bitmap_preserves_source_samples_after_covered_text() {
+    let mut file = WmfMetafile::from_bytes(&copy_bitmap_wmf()).unwrap();
+    file.records[0] = WmfRecordData::SetWindowExt(WmfPointRecord { x: 2, y: 1 })
+      .to_record()
+      .unwrap();
+    file.records[1] = WmfRecordData::StretchDib(crate::wmf::WmfStretchDibRecord {
+      raster_operation: WmfTernaryRasterOperationCode::SRCCOPY.canonical_raw(),
+      color_usage: DibColorUsage::RgbColors.wmf_raw(),
+      src_height: 1,
+      src_width: 2,
+      y_src: 0,
+      x_src: 0,
+      dest_height: 1,
+      dest_width: 2,
+      y_dest: 0,
+      x_dest: 0,
+      dib: two_pixel_color_dib(),
+    })
+    .to_record()
+    .unwrap();
+    // This paint is entirely overwritten by the opaque full-frame copy.
+    file.records.insert(
+      1,
+      WmfRecordData::ExtTextOut(crate::wmf::WmfExtTextOutRecord {
+        y: 0,
+        x: 0,
+        string_length: 1,
+        options: crate::wmf::WmfExtTextOutOptions::empty(),
+        rectangle: None,
+        string: vec![b'X'],
+        string_padding: vec![0],
+        dx: Vec::new(),
+        trailing_data: Vec::new(),
+      })
+      .to_record()
+      .unwrap(),
+    );
+    let bytes = file.to_bytes().unwrap();
+    let layer = extract_metafile_full_bitmap_with_options(
+      &bytes,
+      RenderOptions {
+        target_width_px: Some(80),
+        target_height_px: Some(40),
+        ..RenderOptions::default()
+      },
+    )
+    .unwrap();
+    let image = image::load_from_memory_with_format(&layer.data, image::ImageFormat::Png)
+      .unwrap()
+      .to_rgb8();
+    assert_eq!(image.dimensions(), (2, 1));
+    assert_eq!(image.get_pixel(0, 0).0, [255, 0, 0]);
+    assert_eq!(image.get_pixel(1, 0).0, [0, 255, 0]);
+
+    for change in 0..5 {
+      let mut other = file.clone();
+      match change {
+        0 => {
+          let text = other.records.remove(1);
+          other.records.insert(2, text);
+        }
+        1 => {
+          let WmfRecordData::StretchDib(mut value) = other.records[2].parse_data().unwrap() else {
+            panic!("bitmap")
+          };
+          value.dest_width = 1;
+          other.records[2] = WmfRecordData::StretchDib(value).to_record().unwrap();
+        }
+        2 => {
+          let WmfRecordData::StretchDib(mut value) = other.records[2].parse_data().unwrap() else {
+            panic!("bitmap")
+          };
+          value.raster_operation = WmfTernaryRasterOperationCode::SRCINVERT.canonical_raw();
+          other.records[2] = WmfRecordData::StretchDib(value).to_record().unwrap();
+        }
+        3 => {
+          let bitmap = other.records[2].clone();
+          other.records.insert(3, bitmap);
+        }
+        4 => other.records.insert(
+          2,
+          WmfRecordData::IntersectClipRect(crate::wmf::WmfRectRecord {
+            left: 0,
+            top: 0,
+            right: 1,
+            bottom: 1,
+          })
+          .to_record()
+          .unwrap(),
+        ),
+        _ => unreachable!(),
+      }
+      assert!(
+        extract_metafile_full_bitmap_with_options(
+          &other.to_bytes().unwrap(),
+          RenderOptions::default()
+        )
+        .is_none(),
+        "{change}"
+      );
+    }
+    assert!(
+      extract_metafile_full_bitmap_with_options(
+        &bytes,
+        RenderOptions {
+          suppress_bitmap_layers: true,
+          ..RenderOptions::default()
+        }
+      )
+      .is_none()
+    );
+  }
+
+  #[test]
   fn wmf_binary_mask_pair_can_be_lifted_as_a_native_bitmap_layer() {
     // Mask bits are black then white. SRCAND therefore clears the first
     // destination pixel and retains the second; the following SRCPAINT paints
@@ -16131,6 +16355,148 @@ mod tests {
     });
     let flags = EmfPlusRecordFlags::from_bits_retain(u16::from(dual));
     emf_plus_comment_record(vec![EmfPlusRecord::from_data(&data, flags).unwrap()])
+  }
+
+  #[test]
+  fn emf_plus_bitmap_picture_preserves_source_and_rejects_incomplete_paint() {
+    use crate::emfplus::{
+      EmfPlusBitmapObject, EmfPlusCompressedImageObject, EmfPlusDrawImagePointsData,
+      EmfPlusImageData, EmfPlusImageObject, EmfPlusObjectRecordData, EmfPlusU8PropertyData,
+    };
+    use crate::types::PointF;
+
+    let pixels = [255, 0, 0, 255, 0, 255, 0, 0];
+    let mut png = super::rgba_to_png(&pixels, 2, 1).unwrap();
+    png.resize(png.len().next_multiple_of(4), 0);
+    let bitmap = EmfPlusBitmapObject::from_typed_payload(
+      0,
+      0,
+      0,
+      0,
+      &EmfPlusBitmapPayload::Compressed(EmfPlusCompressedImageObject {
+        compressed_image_data: png.clone(),
+      }),
+    )
+    .unwrap();
+    let image = EmfPlusImageObject::from_typed_data(
+      EmfPlusGraphicsVersion::from_graphics_version(EmfPlusGraphicsVersionValue::Version1_1),
+      &EmfPlusImageData::Bitmap(bitmap),
+    )
+    .unwrap();
+    let object = emf_plus_record(EmfPlusRecordData::Object(
+      EmfPlusObjectRecordData::from_typed_data(0, &EmfPlusObjectData::Image(image)).unwrap(),
+    ));
+    let page = EmfPlusRecord::from_data(
+      &EmfPlusRecordData::SetPageTransform(EmfPlusSetPageTransformData { page_scale: 1.0 }),
+      EmfPlusRecordFlags::from_bits_retain(2),
+    )
+    .unwrap();
+    let draw = EmfPlusDrawImagePointsData {
+      image_id: 0,
+      apply_effect: false,
+      image_attributes_id: u32::MAX,
+      src_unit: 2,
+      src_rect: crate::types::RectF {
+        x: 0.0,
+        y: 0.0,
+        width: 2.0,
+        height: 1.0,
+      },
+      points: EmfPlusPointData::Float(vec![
+        PointF { x: 0.25, y: 0.5 },
+        PointF { x: 1.75, y: 0.5 },
+        PointF { x: 0.25, y: 1.5 },
+      ]),
+    };
+    let make = |mode, change| {
+      let mut value = draw.clone();
+      match change {
+        1 => value.src_rect.width = 1.0,
+        2 => value.apply_effect = true,
+        3 => {
+          if let EmfPlusPointData::Float(points) = &mut value.points {
+            points[1].y = 1.0;
+          }
+        }
+        _ => {}
+      }
+      let draw_record = emf_plus_record(EmfPlusRecordData::DrawImagePoints(value));
+      let mut records = vec![
+        emf_plus_header_comment(true),
+        emf_plus_comment_record(vec![
+          page.clone(),
+          object.clone(),
+          emf_plus_record(EmfPlusRecordData::SetPixelOffsetMode(
+            EmfPlusU8PropertyData {
+              value: mode,
+              reserved_flags: 0,
+            },
+          )),
+          draw_record.clone(),
+        ]),
+      ];
+      match change {
+        4 => records.push(emf_plus_comment_record(vec![draw_record])),
+        5 => {
+          records.push(emf_plus_comment_record(vec![emf_plus_record(
+            EmfPlusRecordData::GetDc,
+          )]));
+          records.push(set_pixel_record(0, 0, 0));
+        }
+        6 => records.push(emf_plus_comment_record(vec![emf_plus_record(
+          EmfPlusRecordData::ResetClip,
+        )])),
+        _ => {}
+      }
+      // Outside GetDC this classic fallback must not duplicate the image.
+      if change != 5 {
+        records.push(set_pixel_record(0, 0, 0));
+      }
+      if change != 7 {
+        records.push(emf_plus_comment_record(vec![emf_plus_record(
+          EmfPlusRecordData::Eof,
+        )]));
+      }
+      metafile_with_records(records)
+    };
+    for (mode, half) in [(0, false), (1, false), (2, true), (3, false), (4, true)] {
+      let data = make(mode, 0);
+      let picture = super::extract_metafile_bitmap_picture_with_options(
+        &data,
+        RenderOptions {
+          target_width_px: Some(1),
+          target_height_px: Some(1),
+          ..RenderOptions::default()
+        },
+      )
+      .unwrap();
+      assert_eq!(picture.source_size, [2, 1]);
+      assert_eq!(picture.half_pixel_offset, half);
+      assert_eq!(picture.bitmap.data, png);
+      let surface = super::emf_gdiplus_playback_geometry(&data).unwrap();
+      assert_eq!(picture.bitmap.width, 1.5 / surface.width as f32);
+      assert_eq!(picture.bitmap.height, 1.0 / surface.height as f32);
+      assert!(
+        super::extract_metafile_bitmap_picture_with_options(
+          &data,
+          RenderOptions {
+            suppress_bitmap_layers: true,
+            ..RenderOptions::default()
+          }
+        )
+        .is_none()
+      );
+    }
+    for change in 1..=7 {
+      assert!(
+        super::extract_metafile_bitmap_picture_with_options(
+          &make(4, change),
+          RenderOptions::default()
+        )
+        .is_none(),
+        "change {change}"
+      );
+    }
   }
 
   #[test]
