@@ -16,6 +16,31 @@ pub fn vdmx_vertical_device_metrics(
   ppem: u16,
   char_set: u8,
 ) -> Option<GdiVerticalDeviceMetrics> {
+  let (entries, start, end) = vdmx_entries(table, char_set)?;
+  if ppem < u16::from(start) || ppem > u16::from(end) {
+    return None;
+  }
+  for entry in entries.as_chunks::<6>().0 {
+    let entry_ppem = u16::from_be_bytes([entry[0], entry[1]]);
+    if entry_ppem > ppem {
+      break;
+    }
+    if entry_ppem == ppem {
+      let y_max = i32::from(i16::from_be_bytes([entry[2], entry[3]]));
+      let y_min = i32::from(i16::from_be_bytes([entry[4], entry[5]]));
+      if y_max <= 0 || y_min > 0 {
+        return None;
+      }
+      return Some(GdiVerticalDeviceMetrics {
+        ascent: y_max,
+        descent: y_min.saturating_abs(),
+      });
+    }
+  }
+  None
+}
+
+fn vdmx_entries(table: &[u8], char_set: u8) -> Option<(&[u8], u8, u8)> {
   const ANSI_CHARSET: u8 = 0;
   const HEADER_SIZE: usize = 6;
   const RATIO_SIZE: usize = 4;
@@ -70,31 +95,66 @@ pub fn vdmx_vertical_device_metrics(
   let record_count = usize::from(read_u16(group_offset)?);
   let start_ppem = *table.get(group_offset + 2)?;
   let end_ppem = *table.get(group_offset + 3)?;
-  if ppem < u16::from(start_ppem) || ppem > u16::from(end_ppem) {
-    return None;
-  }
   let entries_start = group_offset.checked_add(GROUP_HEADER_SIZE)?;
   let entries_end = entries_start.checked_add(record_count.checked_mul(ENTRY_SIZE)?)?;
   if entries_end > table.len() {
     return None;
   }
-  for index in 0..record_count {
-    let entry_offset = entries_start + index * ENTRY_SIZE;
-    let entry_ppem = read_u16(entry_offset)?;
-    if entry_ppem > ppem {
-      break;
+  Some((&table[entries_start..entries_end], start_ppem, end_ppem))
+}
+
+/// Positive LOGFONT height selects the first matching device cell or the
+/// preceding smaller entry. Above the table range the linear mapper applies.
+pub(crate) fn vdmx_character_height_for_cell(
+  table: &[u8],
+  height: i32,
+  char_set: u8,
+) -> Option<u16> {
+  let (entries, _, _) = vdmx_entries(table, char_set)?;
+  let mut previous = None;
+  for entry in entries.as_chunks::<6>().0 {
+    let ppem = u16::from_be_bytes([entry[0], entry[1]]);
+    let ascent = i32::from(i16::from_be_bytes([entry[2], entry[3]]));
+    let bottom = i32::from(i16::from_be_bytes([entry[4], entry[5]]));
+    if ascent <= 0 || bottom > 0 {
+      return None;
     }
-    if entry_ppem == ppem {
-      let y_max = i32::from(read_u16(entry_offset + 2)? as i16);
-      let y_min = i32::from(read_u16(entry_offset + 4)? as i16);
-      if y_max <= 0 || y_min > 0 {
-        return None;
-      }
-      return Some(GdiVerticalDeviceMetrics {
-        ascent: y_max,
-        descent: y_min.saturating_abs(),
-      });
+    match (ascent - bottom).cmp(&height) {
+      std::cmp::Ordering::Equal => return Some(ppem),
+      std::cmp::Ordering::Greater => return previous,
+      std::cmp::Ordering::Less => previous = Some(ppem),
     }
   }
   None
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn positive_cell_height_uses_hinted_boundaries_and_out_of_range_fallback() {
+    // One ANSI square-pixel group, including equal cell heights at two ppems.
+    let mut table = vec![0, 1, 0, 1, 0, 1, 1, 1, 1, 1, 0, 12, 0, 3, 8, 10];
+    for (ppem, top, bottom) in [(8u16, 10i16, -2i16), (9, 11, -2), (10, 11, -2)] {
+      table.extend_from_slice(&ppem.to_be_bytes());
+      table.extend_from_slice(&top.to_be_bytes());
+      table.extend_from_slice(&bottom.to_be_bytes());
+    }
+    assert_eq!(vdmx_character_height_for_cell(&table, 11, 0), None);
+    assert_eq!(vdmx_character_height_for_cell(&table, 12, 0), Some(8));
+    assert_eq!(vdmx_character_height_for_cell(&table, 13, 0), Some(9));
+    assert_eq!(vdmx_character_height_for_cell(&table, 14, 0), None);
+    assert_eq!(
+      vdmx_character_height_for_cell(&table[..table.len() - 1], 13, 0),
+      None
+    );
+    assert_eq!(
+      vdmx_vertical_device_metrics(&table, 9, 0),
+      Some(GdiVerticalDeviceMetrics {
+        ascent: 11,
+        descent: 2
+      })
+    );
+  }
 }

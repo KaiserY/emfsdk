@@ -1,0 +1,642 @@
+[
+  {
+    "glyph": "g0",
+    "index": 0,
+    "helper": 0,
+    "touched": false,
+    "touch_axis": "x",
+    "after_iup": false
+  },
+  {
+    "glyph": "g1",
+    "index": 1,
+    "helper": 0,
+    "touched": false,
+    "touch_axis": "x",
+    "after_iup": true
+  },
+  {
+    "glyph": "g2",
+    "index": 2,
+    "helper": 0,
+    "touched": true,
+    "touch_axis": "x",
+    "after_iup": false
+  },
+  {
+    "glyph": "g3",
+    "index": 3,
+    "helper": 0,
+    "touched": true,
+    "touch_axis": "x",
+    "after_iup": true
+  },
+  {
+    "glyph": "g4",
+    "index": 4,
+    "helper": 1,
+    "touched": false,
+    "touch_axis": "x",
+    "after_iup": false
+  },
+  {
+    "glyph": "g5",
+    "index": 5,
+    "helper": 1,
+    "touched": false,
+    "touch_axis": "x",
+    "after_iup": true
+  },
+  {
+    "glyph": "g6",
+    "index": 6,
+    "helper": 1,
+    "touched": true,
+    "touch_axis": "x",
+    "after_iup": false
+  },
+  {
+    "glyph": "g7",
+    "index": 7,
+    "helper": 1,
+    "touched": true,
+    "touch_axis": "x",
+    "after_iup": true
+  },
+  {
+    "glyph": "g8",
+    "index": 8,
+    "helper": 2,
+    "touched": false,
+    "touch_axis": "x",
+    "after_iup": false
+  },
+  {
+    "glyph": "g9",
+    "index": 9,
+    "helper": 2,
+    "touched": false,
+    "touch_axis": "x",
+    "after_iup": true
+  },
+  {
+    "glyph": "g10",
+    "index": 10,
+    "helper": 2,
+    "touched": true,
+    "touch_axis": "x",
+    "after_iup": false
+  },
+  {
+    "glyph": "g11",
+    "index": 11,
+    "helper": 2,
+    "touched": true,
+    "touch_axis": "x",
+    "after_iup": true
+  },
+  {
+    "glyph": "g12",
+    "index": 12,
+    "helper": 3,
+    "touched": false,
+    "touch_axis": "x",
+    "after_iup": false
+  },
+  {
+    "glyph": "g13",
+    "index": 13,
+    "helper": 3,
+    "touched": false,
+    "touch_axis": "x",
+    "after_iup": true
+  },
+  {
+    "glyph": "g14",
+    "index": 14,
+    "helper": 3,
+    "touched": true,
+    "touch_axis": "x",
+    "after_iup": false
+  },
+  {
+    "glyph": "g15",
+    "index": 15,
+    "helper": 3,
+    "touched": true,
+    "touch_axis": "x",
+    "after_iup": true
+  },
+  {
+    "glyph": "g16",
+    "index": 16,
+    "helper": 4,
+    "touched": false,
+    "touch_axis": "x",
+    "after_iup": false
+  },
+  {
+    "glyph": "g17",
+    "index": 17,
+    "helper": 4,
+    "touched": false,
+    "touch_axis": "x",
+    "after_iup": true
+  },
+  {
+    "glyph": "g18",
+    "index": 18,
+    "helper": 4,
+    "touched": true,
+    "touch_axis": "x",
+    "after_iup": false
+  },
+  {
+    "glyph": "g19",
+    "index": 19,
+    "helper": 4,
+    "touched": true,
+    "touch_axis": "x",
+    "after_iup": true
+  },
+  {
+    "glyph": "g20",
+    "index": 20,
+    "helper": 5,
+    "touched": false,
+    "touch_axis": "x",
+    "after_iup": false
+  },
+  {
+    "glyph": "g21",
+    "index": 21,
+    "helper": 5,
+    "touched": false,
+    "touch_axis": "x",
+    "after_iup": true
+  },
+  {
+    "glyph": "g22",
+    "index": 22,
+    "helper": 5,
+    "touched": true,
+    "touch_axis": "x",
+    "after_iup": false
+  },
+  {
+    "glyph": "g23",
+    "index": 23,
+    "helper": 5,
+    "touched": true,
+    "touch_axis": "x",
+    "after_iup": true
+  },
+  {
+    "glyph": "g24",
+    "index": 24,
+    "helper": 6,
+    "touched": false,
+    "touch_axis": "x",
+    "after_iup": false
+  },
+  {
+    "glyph": "g25",
+    "index": 25,
+    "helper": 6,
+    "touched": false,
+    "touch_axis": "x",
+    "after_iup": true
+  },
+  {
+    "glyph": "g26",
+    "index": 26,
+    "helper": 6,
+    "touched": true,
+    "touch_axis": "x",
+    "after_iup": false
+  },
+  {
+    "glyph": "g27",
+    "index": 27,
+    "helper": 6,
+    "touched": true,
+    "touch_axis": "x",
+    "after_iup": true
+  },
+  {
+    "glyph": "g28",
+    "index": 28,
+    "helper": 7,
+    "touched": false,
+    "touch_axis": "x",
+    "after_iup": false
+  },
+  {
+    "glyph": "g29",
+    "index": 29,
+    "helper": 7,
+    "touched": false,
+    "touch_axis": "x",
+    "after_iup": true
+  },
+  {
+    "glyph": "g30",
+    "index": 30,
+    "helper": 7,
+    "touched": true,
+    "touch_axis": "x",
+    "after_iup": false
+  },
+  {
+    "glyph": "g31",
+    "index": 31,
+    "helper": 7,
+    "touched": true,
+    "touch_axis": "x",
+    "after_iup": true
+  },
+  {
+    "glyph": "g32",
+    "index": 32,
+    "helper": 8,
+    "touched": false,
+    "touch_axis": "x",
+    "after_iup": false
+  },
+  {
+    "glyph": "g33",
+    "index": 33,
+    "helper": 8,
+    "touched": false,
+    "touch_axis": "x",
+    "after_iup": true
+  },
+  {
+    "glyph": "g34",
+    "index": 34,
+    "helper": 8,
+    "touched": true,
+    "touch_axis": "x",
+    "after_iup": false
+  },
+  {
+    "glyph": "g35",
+    "index": 35,
+    "helper": 8,
+    "touched": true,
+    "touch_axis": "x",
+    "after_iup": true
+  },
+  {
+    "glyph": "g36",
+    "index": 36,
+    "helper": 9,
+    "touched": false,
+    "touch_axis": "x",
+    "after_iup": false
+  },
+  {
+    "glyph": "g37",
+    "index": 37,
+    "helper": 9,
+    "touched": false,
+    "touch_axis": "x",
+    "after_iup": true
+  },
+  {
+    "glyph": "g38",
+    "index": 38,
+    "helper": 9,
+    "touched": true,
+    "touch_axis": "x",
+    "after_iup": false
+  },
+  {
+    "glyph": "g39",
+    "index": 39,
+    "helper": 9,
+    "touched": true,
+    "touch_axis": "x",
+    "after_iup": true
+  },
+  {
+    "glyph": "g40",
+    "index": 40,
+    "helper": 0,
+    "touched": false,
+    "touch_axis": "y",
+    "after_iup": false
+  },
+  {
+    "glyph": "g41",
+    "index": 41,
+    "helper": 0,
+    "touched": false,
+    "touch_axis": "y",
+    "after_iup": true
+  },
+  {
+    "glyph": "g42",
+    "index": 42,
+    "helper": 0,
+    "touched": true,
+    "touch_axis": "y",
+    "after_iup": false
+  },
+  {
+    "glyph": "g43",
+    "index": 43,
+    "helper": 0,
+    "touched": true,
+    "touch_axis": "y",
+    "after_iup": true
+  },
+  {
+    "glyph": "g44",
+    "index": 44,
+    "helper": 1,
+    "touched": false,
+    "touch_axis": "y",
+    "after_iup": false
+  },
+  {
+    "glyph": "g45",
+    "index": 45,
+    "helper": 1,
+    "touched": false,
+    "touch_axis": "y",
+    "after_iup": true
+  },
+  {
+    "glyph": "g46",
+    "index": 46,
+    "helper": 1,
+    "touched": true,
+    "touch_axis": "y",
+    "after_iup": false
+  },
+  {
+    "glyph": "g47",
+    "index": 47,
+    "helper": 1,
+    "touched": true,
+    "touch_axis": "y",
+    "after_iup": true
+  },
+  {
+    "glyph": "g48",
+    "index": 48,
+    "helper": 2,
+    "touched": false,
+    "touch_axis": "y",
+    "after_iup": false
+  },
+  {
+    "glyph": "g49",
+    "index": 49,
+    "helper": 2,
+    "touched": false,
+    "touch_axis": "y",
+    "after_iup": true
+  },
+  {
+    "glyph": "g50",
+    "index": 50,
+    "helper": 2,
+    "touched": true,
+    "touch_axis": "y",
+    "after_iup": false
+  },
+  {
+    "glyph": "g51",
+    "index": 51,
+    "helper": 2,
+    "touched": true,
+    "touch_axis": "y",
+    "after_iup": true
+  },
+  {
+    "glyph": "g52",
+    "index": 52,
+    "helper": 3,
+    "touched": false,
+    "touch_axis": "y",
+    "after_iup": false
+  },
+  {
+    "glyph": "g53",
+    "index": 53,
+    "helper": 3,
+    "touched": false,
+    "touch_axis": "y",
+    "after_iup": true
+  },
+  {
+    "glyph": "g54",
+    "index": 54,
+    "helper": 3,
+    "touched": true,
+    "touch_axis": "y",
+    "after_iup": false
+  },
+  {
+    "glyph": "g55",
+    "index": 55,
+    "helper": 3,
+    "touched": true,
+    "touch_axis": "y",
+    "after_iup": true
+  },
+  {
+    "glyph": "g56",
+    "index": 56,
+    "helper": 4,
+    "touched": false,
+    "touch_axis": "y",
+    "after_iup": false
+  },
+  {
+    "glyph": "g57",
+    "index": 57,
+    "helper": 4,
+    "touched": false,
+    "touch_axis": "y",
+    "after_iup": true
+  },
+  {
+    "glyph": "g58",
+    "index": 58,
+    "helper": 4,
+    "touched": true,
+    "touch_axis": "y",
+    "after_iup": false
+  },
+  {
+    "glyph": "g59",
+    "index": 59,
+    "helper": 4,
+    "touched": true,
+    "touch_axis": "y",
+    "after_iup": true
+  },
+  {
+    "glyph": "g60",
+    "index": 60,
+    "helper": 5,
+    "touched": false,
+    "touch_axis": "y",
+    "after_iup": false
+  },
+  {
+    "glyph": "g61",
+    "index": 61,
+    "helper": 5,
+    "touched": false,
+    "touch_axis": "y",
+    "after_iup": true
+  },
+  {
+    "glyph": "g62",
+    "index": 62,
+    "helper": 5,
+    "touched": true,
+    "touch_axis": "y",
+    "after_iup": false
+  },
+  {
+    "glyph": "g63",
+    "index": 63,
+    "helper": 5,
+    "touched": true,
+    "touch_axis": "y",
+    "after_iup": true
+  },
+  {
+    "glyph": "g64",
+    "index": 64,
+    "helper": 6,
+    "touched": false,
+    "touch_axis": "y",
+    "after_iup": false
+  },
+  {
+    "glyph": "g65",
+    "index": 65,
+    "helper": 6,
+    "touched": false,
+    "touch_axis": "y",
+    "after_iup": true
+  },
+  {
+    "glyph": "g66",
+    "index": 66,
+    "helper": 6,
+    "touched": true,
+    "touch_axis": "y",
+    "after_iup": false
+  },
+  {
+    "glyph": "g67",
+    "index": 67,
+    "helper": 6,
+    "touched": true,
+    "touch_axis": "y",
+    "after_iup": true
+  },
+  {
+    "glyph": "g68",
+    "index": 68,
+    "helper": 7,
+    "touched": false,
+    "touch_axis": "y",
+    "after_iup": false
+  },
+  {
+    "glyph": "g69",
+    "index": 69,
+    "helper": 7,
+    "touched": false,
+    "touch_axis": "y",
+    "after_iup": true
+  },
+  {
+    "glyph": "g70",
+    "index": 70,
+    "helper": 7,
+    "touched": true,
+    "touch_axis": "y",
+    "after_iup": false
+  },
+  {
+    "glyph": "g71",
+    "index": 71,
+    "helper": 7,
+    "touched": true,
+    "touch_axis": "y",
+    "after_iup": true
+  },
+  {
+    "glyph": "g72",
+    "index": 72,
+    "helper": 8,
+    "touched": false,
+    "touch_axis": "y",
+    "after_iup": false
+  },
+  {
+    "glyph": "g73",
+    "index": 73,
+    "helper": 8,
+    "touched": false,
+    "touch_axis": "y",
+    "after_iup": true
+  },
+  {
+    "glyph": "g74",
+    "index": 74,
+    "helper": 8,
+    "touched": true,
+    "touch_axis": "y",
+    "after_iup": false
+  },
+  {
+    "glyph": "g75",
+    "index": 75,
+    "helper": 8,
+    "touched": true,
+    "touch_axis": "y",
+    "after_iup": true
+  },
+  {
+    "glyph": "g76",
+    "index": 76,
+    "helper": 9,
+    "touched": false,
+    "touch_axis": "y",
+    "after_iup": false
+  },
+  {
+    "glyph": "g77",
+    "index": 77,
+    "helper": 9,
+    "touched": false,
+    "touch_axis": "y",
+    "after_iup": true
+  },
+  {
+    "glyph": "g78",
+    "index": 78,
+    "helper": 9,
+    "touched": true,
+    "touch_axis": "y",
+    "after_iup": false
+  },
+  {
+    "glyph": "g79",
+    "index": 79,
+    "helper": 9,
+    "touched": true,
+    "touch_axis": "y",
+    "after_iup": true
+  }
+]

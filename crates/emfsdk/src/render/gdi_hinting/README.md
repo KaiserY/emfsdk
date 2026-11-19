@@ -22,9 +22,15 @@ Differences from the upstream interpreter:
   Control-value programs and pure Y projections retain the physical grid.
   Fine-grid CVT cut-in and minimum distance are divided by 16 and 2 respectively.
 - Compatible unrounded MIRP and nonzero-distance MSIRP honor CVT cut-in.
-- A guarded inline-delta function identified by its bytecode retains X-axis
-  `SHPIX` moves under backward-compatible ClearType. Native font controls
-  support this TypeMan-style exception; the unguarded helper remains filtered.
+- Function-entry signatures identify the two documented size/range delta
+  helpers for X-axis `SHPIX` filtering. Guarded, prefixed and ordinary movement
+  functions retain their shifts; a wrapper calling a recognized helper does
+  not disable that helper's filtering. This includes the TypeMan-style guarded
+  exception without matching a font name or a single complete function body.
+  Forty owned programs cover both signatures, nested calls, no-op prefixes,
+  touched/untouched points and calls before/after IUP. Eighty native coordinate
+  readbacks cover compatible and natural-width modes; forty monochrome
+  controls independently confirm that every requested shift executes.
 - Compatible-width rendering runs the complete monochrome program first to
   obtain its F26.6 advance, including late phantom-point instructions. Before
   the first horizontal IUP, the fine-grid outline follows that advance through
@@ -105,3 +111,12 @@ freedom-vector independence, rounding ties, cut-in/minimum distance and
 bearing-anchored stems. All 724 coordinate comparisons run on every platform.
 Generators use only project-owned outlines and bytecode; no installed font
 data is required to regenerate these fixtures or run their tests.
+
+Recognized horizontal size/range delta functions also suppress SHPIX when a
+point was previously touched in Y. The ordinary SHPIX Y-touch exception must
+not re-enable a classified X delta. The inline-delta owned fixture now crosses
+X/Y touch, before/after IUP and compatible/natural widths: 160 portable checks,
+with 240 native observations including monochrome controls. The original 120
+native observations remain unchanged. Evidence: `/tmp/ooxmlsdk-tdf146802-20261030/native-y-touch-v5/`;
+GDB and staged native point readbacks isolate the source delta independently
+of final PDF comparison.

@@ -5474,6 +5474,11 @@ impl<'a> EmfPlusRecordRef<'a> {
           )?;
           Some(XForm::read_from(&mut reader)?)
         };
+        // MS-EMFPLUS 2.3.4.6 includes alignment in DataSize. An odd
+        // number of UTF-16 words leaves two bytes after the optional matrix.
+        if !glyph_count.is_multiple_of(2) && reader.read_u16()? != 0 {
+          return Err(Error::invalid(0, "nonzero EmfPlusDrawDriverString padding"));
+        }
         ensure_reader_end(
           &mut reader,
           self.data.len() as u64,
@@ -5760,6 +5765,9 @@ impl EmfPlusRecord {
           }
           if let Some(transform_matrix) = &value.transform_matrix {
             transform_matrix.write_to(&mut writer)?;
+          }
+          if !value.glyphs.len().is_multiple_of(2) {
+            writer.write_u16(0)?;
           }
         }
         EmfPlusRecordData::StrokeFillPath => {}
@@ -6157,7 +6165,7 @@ impl EmfPlusRecordData<'_> {
       Self::RotateWorldTransform(value) => value.sdk_size(),
       Self::SetPageTransform(value) => value.sdk_size(),
       Self::DrawDriverString(value) => {
-        16 + value.glyphs.len() as u64 * 2
+        16 + (value.glyphs.len() as u64 * 2).next_multiple_of(4)
           + value.expected_glyph_position_count() as u64 * 8
           + value.transform_matrix.as_ref().map_or(0, SdkSize::sdk_size)
       }
@@ -12093,6 +12101,27 @@ mod tests {
     oversized_draw_string.data[8..12].copy_from_slice(&1_000_000_u32.to_le_bytes());
     assert!(oversized_draw_string.parse_data().is_err());
 
+    for options in [
+      EmfPlusDriverStringOptionsFlags::CMAP_LOOKUP,
+      EmfPlusDriverStringOptionsFlags::REALIZED_ADVANCE,
+    ] {
+      let mut odd = EmfPlusDrawDriverStringData {
+        font_id: 2,
+        brush: EmfPlusBrushRef::ObjectId(1),
+        driver_string_options_flags: options.bits(),
+        glyphs: vec![65, 66, 67],
+        glyph_positions: vec![PointF { x: 0.25, y: 0.5 }],
+        transform_matrix: None,
+      };
+      odd.glyph_positions.resize(
+        odd.expected_glyph_position_count(),
+        PointF { x: 1.5, y: 2.5 },
+      );
+      assert_emf_plus_data_roundtrip(
+        EmfPlusRecordData::DrawDriverString(odd),
+        EmfPlusRecordFlags::empty(),
+      );
+    }
     let driver_string = EmfPlusRecordData::DrawDriverString(EmfPlusDrawDriverStringData {
       font_id: 6,
       brush: EmfPlusBrushRef::ObjectId(3),

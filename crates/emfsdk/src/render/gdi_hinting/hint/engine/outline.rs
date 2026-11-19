@@ -14,14 +14,14 @@ use super::{
   Engine, F26Dot6, HintErrorKind, OpResult, math,
 };
 
-// TypeMan's guarded inline-delta helper occurs in Tahoma, Arial, Verdana and
-// Segoe UI under different function numbers. The unguarded helper has the
-// same SHPIX body but does not receive the ClearType DiagEndCtrl exception.
+// GDI recognizes delta helpers by these two function-entry signatures, not
+// by their function number or the presence of SHPIX anywhere in the body.
+// Guarded, prefixed and ordinary movement helpers retain their X shifts.
+// Native controls cover both signatures, wrappers, no-op prefixes and
+// execution before/after IUP in compatible and natural-width modes.
 // See https://learn.microsoft.com/en-us/typography/cleartype/truetypecleartype
-const DIAG_END_CTRL_INLINE_DELTA: &[u8] = &[
-  0xb0, 0x02, 0x43, 0x54, 0x58, 0x4b, 0x53, 0x23, 0x4b, 0x51, 0x5a, 0x58, 0x38, 0x1b, 0x21, 0x21,
-  0x59, 0x1b, 0x21, 0x21, 0x21, 0x21, 0x59, 0x2d,
-];
+const RANGE_DELTA_SIGNATURE: &[u8] = &[0x4b, 0x53, 0x23, 0x4b, 0x51, 0x5a, 0x58, 0x38];
+const SIZE_DELTA_SIGNATURE: &[u8] = &[0x4b, 0x54, 0x58, 0x38];
 
 impl Engine<'_> {
   /// Flip point.
@@ -235,14 +235,25 @@ impl Engine<'_> {
   /// See <https://learn.microsoft.com/en-us/typography/opentype/spec/tt_instructions#shift-point-by-a-pixel-amount>
   /// and <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/truetype/ttinterp.c#L5366>
   pub(super) fn op_shpix(&mut self) -> OpResult {
+    let delta_function = self.program.call_stack.peek().and_then(|record| {
+      let definition = record.definition;
+      (definition.program() == Program::Font)
+        .then(|| self.program.bytecode[Program::Font as usize].get(definition.code_range()))
+        .flatten()
+        .map(|body| {
+          body.starts_with(RANGE_DELTA_SIGNATURE) || body.starts_with(SIZE_DELTA_SIGNATURE)
+        })
+    });
     let preserve_inline_delta = self.graphics.target.gdi
       && self.graphics.freedom_vector.x != 0
-      && self.program.call_stack.peek().is_some_and(|record| {
-        let definition = record.definition;
-        definition.program() == Program::Font
-          && self.program.bytecode[Program::Font as usize].get(definition.code_range())
-            == Some(DIAG_END_CTRL_INLINE_DELTA)
-      });
+      && delta_function == Some(false);
+    // Recognized horizontal delta helpers suppress their X move even when
+    // another instruction has touched the point in Y. That exception belongs
+    // to ordinary SHPIX, not to the helper classified as a delta function.
+    // Native X/Y-touched and pre/post-IUP controls establish this distinction.
+    let suppress_inline_delta = self.graphics.target.gdi
+      && self.graphics.freedom_axis == CoordAxis::X
+      && delta_function == Some(true);
     let gs = &mut self.graphics;
     let in_twilight = gs.zp0.is_twilight() || gs.zp1.is_twilight() || gs.zp2.is_twilight();
     let amount = self.value_stack.pop()?;
@@ -253,6 +264,9 @@ impl Engine<'_> {
     let did_iup = gs.did_iup_x && gs.did_iup_y;
     for _ in 0..count {
       let p = self.value_stack.pop_usize()?;
+      if gs.backward_compatibility && suppress_inline_delta {
+        continue;
+      }
       if gs.backward_compatibility && !preserve_inline_delta {
         if in_twilight
           || (!did_iup

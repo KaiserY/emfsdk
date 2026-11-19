@@ -1,4 +1,4 @@
-//! Complete EMF+ bitmap pictures, without rasterizing their playback surface.
+//! Complete EMF+ and opaque covering WMF bitmap pictures, without raster playback.
 
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -20,7 +20,12 @@ pub struct MetafileBitmapPicture {
   pub half_pixel_offset: bool,
 }
 
-/// Extract a complete EMF+ picture containing one unmodified compressed bitmap.
+/// Extract a complete EMF+ picture or one overscanning opaque full-source WMF bitmap.
+///
+/// A covering WMF SRCCOPY can extend beyond the viewport. Its returned source
+/// samples and normalized rectangle stay intact; callers clip to that viewport.
+/// Exact-viewport WMF sources retain the separate full-bitmap route and its
+/// established playback-frame placement, without allocating a second PNG here.
 ///
 /// The returned rectangle is normalized to the GDI+ metafile playback surface.
 /// Source pixels remain intact, including their alpha channel. This is not an
@@ -31,10 +36,14 @@ pub fn extract_metafile_bitmap_picture_with_options(
   data: &[u8],
   options: RenderOptions,
 ) -> Option<MetafileBitmapPicture> {
-  if !is_emf(data)
-    || options.suppress_bitmap_layers
-    || options.monochrome_dib_palette_override.is_some()
-  {
+  if !is_emf(data) {
+    return super::extract_wmf_bitmap_picture_with_options(
+      data,
+      options,
+      super::WmfBitmapViewport::Overscan,
+    );
+  }
+  if options.suppress_bitmap_layers || options.monochrome_dib_palette_override.is_some() {
     return None;
   }
   let file = EmfMetafileRef::from_bytes(data).ok()?;

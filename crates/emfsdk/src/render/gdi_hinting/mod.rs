@@ -445,6 +445,32 @@ mod tests {
   use super::*;
 
   #[test]
+  #[ignore]
+  fn dump_external_gdi_hint_points() {
+    use std::fmt::Write;
+    let data = std::fs::read(std::env::var("EMFSDK_HINT_FONT").unwrap()).unwrap();
+    let font = FontRef::new(&data).unwrap();
+    let ppem: f32 = std::env::var("EMFSDK_HINT_PPEM").unwrap().parse().unwrap();
+    let hinting = GdiHinting::new(&font, ppem, false, true).unwrap();
+    let mut output = String::new();
+    for glyph in std::env::var("EMFSDK_HINT_GLYPHS").unwrap().split(',') {
+      let glyph: u32 = glyph.parse().unwrap();
+      let hinted = hinting.hint_simple(&font, GlyphId::new(glyph)).unwrap();
+      for (index, point) in hinted.points.iter().enumerate() {
+        writeln!(
+          output,
+          "{glyph},{index},{},{},{}",
+          point.x.to_bits(),
+          point.y.to_bits(),
+          hinted.shift.to_bits()
+        )
+        .unwrap();
+      }
+    }
+    std::fs::write(std::env::var("EMFSDK_HINT_OUTPUT").unwrap(), output).unwrap();
+  }
+
+  #[test]
   fn natural_advances_match_directwrite() {
     let data: Arc<[u8]> = Arc::from(include_bytes!("../testdata/natural-advances.ttf").as_slice());
     let mut instances = HashMap::new();
@@ -560,6 +586,38 @@ mod tests {
       count += 1;
     }
     assert_eq!(count, 32);
+  }
+
+  #[test]
+  fn inline_delta_function_signatures_match_native_gdi() {
+    let face = FontRef::new(include_bytes!("../testdata/cleartype-inline-delta.ttf")).unwrap();
+    let mut count = 0;
+    for line in include_str!("../testdata/cleartype-inline-delta.txt")
+      .lines()
+      .filter(|line| !line.starts_with('#'))
+    {
+      let values: Vec<i32> = line
+        .split_whitespace()
+        .map(|value| value.parse().unwrap())
+        .collect();
+      let glyph = face
+        .charmap()
+        .map(char::from_u32(0xe000 + values[0] as u32).unwrap())
+        .unwrap();
+      let hinting = GdiHinting::new(&face, 64.0, false, values[1] == 5).unwrap();
+      let path = hinting.draw(&face, glyph).unwrap();
+      // Each owned program encodes its final X coordinate into a one-pixel
+      // vertical marker. The expected marker was read from native GDI pixels.
+      assert_eq!(
+        (path.bounds().bottom() * 64.0) as i32,
+        values[2] + 64,
+        "glyph {}, quality {}",
+        values[0],
+        values[1]
+      );
+      count += 1;
+    }
+    assert_eq!(count, 160);
   }
 
   #[test]
